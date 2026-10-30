@@ -1392,6 +1392,46 @@ static const struct qcom_pas_data sm8550_adsp_resource = {
 	.smem_host_id = 2,
 };
 
+/*
+ * SM8735 (tuna).  Every field was read out of the vendor's own
+ * qcom_q6v5_pas.ko, whose `tuna_adsp_resource` sits next to the sm8550 one:
+ *
+ *	crash_reason_smem 423, fw "adsp.mdt" + "adsp_dtb.mdt",
+ *	pas_id 1 / dtb_pas_id 0x24, minidump_id 5,
+ *	load_state "adsp", ssr "lpass", sysmon "adsp", ssctl 0x14,
+ *	smem host id 0, no proxy power domains.
+ *
+ * smem_host_id 0 is a value, not an omission: the vendor's cdsp entry is the
+ * one that carries 2, so sm8550's adsp entry (2) must not be borrowed.  It
+ * matters on the way down -- qcom_pas_stop() busts the remote's hwspinlock
+ * only when the id is set, and asking for a host SMEM partition that does not
+ * exist fails the stop, leaving the remoteproc "running" and un-restartable.
+ *
+ * auto_boot is false because the 20 MB firmware lives on the persistent root
+ * filesystem rather than in the initramfs, and the ADSP boot has to be
+ * something userspace asks for, so that it can also not ask; flip it to true
+ * once the image is in the initramfs.
+ *
+ * The absent proxy power domains are a real difference from sm8550, not an
+ * oversight: this SoC's factory device tree feeds the ADSP from two
+ * regulators instead (rpmh-regulator-lcxlvl/lmxlvl, "cx-supply"/"mx-supply"
+ * on its remoteproc node), and sm8550's table would have the driver look for
+ * "lcx"/"lmx" power domains this SoC does not have.
+ */
+static const struct qcom_pas_data tuna_adsp_resource = {
+	.crash_reason_smem = 423,
+	.firmware_name = "adsp.mdt",
+	.dtb_firmware_name = "adsp_dtb.mdt",
+	.pas_id = 1,
+	.dtb_pas_id = 0x24,
+	.minidump_id = 5,
+	.auto_boot = false,
+	.load_state = "adsp",
+	.ssr_name = "lpass",
+	.sysmon_name = "adsp",
+	.ssctl_id = 0x14,
+};
+
 static const struct qcom_pas_data sm8550_cdsp_resource = {
 	.crash_reason_smem = 601,
 	.firmware_name = "cdsp.mdt",
@@ -1647,6 +1687,7 @@ static const struct of_device_id qcom_pas_of_match[] = {
 	{ .compatible = "qcom,sm8650-cdsp-pas", .data = &sm8650_cdsp_resource },
 	{ .compatible = "qcom,sm8650-mpss-pas", .data = &sm8650_mpss_resource },
 	{ .compatible = "qcom,sm8750-mpss-pas", .data = &sm8750_mpss_resource },
+	{ .compatible = "qcom,tuna-adsp-pas", .data = &tuna_adsp_resource },
 	{ .compatible = "qcom,x1e80100-adsp-pas", .data = &x1e80100_adsp_resource },
 	{ .compatible = "qcom,x1e80100-cdsp-pas", .data = &x1e80100_cdsp_resource },
 	{ },
