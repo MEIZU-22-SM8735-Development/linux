@@ -626,3 +626,30 @@
 
 	};
 };
+
+/*
+ * PS_HOLD: the line the SoC holds high to keep its own rails up.  Writing 0 to
+ * it makes the PMIC drop them, and what the PMIC does next -- stay off or start
+ * again -- is decided by the PON's PBS block, which is why this node points at
+ * the PMIC's PON.
+ *
+ * A restart that is a real power cycle is the only one after which the panel
+ * comes back on this board (AGENTS.md rule 24): a warm reset leaves the display
+ * dark with everything reporting healthy.  The driver programs the PBS for a
+ * hard reset first, then releases PS_HOLD, and falls back to PSCI after 200 ms
+ * if the board is still alive.
+ *
+ * 0x0c264000 is the MPM PS_HOLD register at the same place as on sc8280xp and
+ * Lemans; this SoC's MPM block is at the same base (mpm2-sleep-counter at
+ * 0xc221000 in the vendor tree).  Gated by m2582,feature so a bad mapping can
+ * never be the reason a boot does not come back: with the production feature
+ * list not naming "pshold", nothing here is probed and reboot stays PSCI.
+ */
+&soc {
+	pm_pshold: restart@c264000 {
+		compatible = "qcom,pshold";
+		reg = <0 0x0c264000 0 0x4>;
+		qcom,pon = <&pmk8550_pon>;
+		m2582,feature = "pshold";
+	};
+};
