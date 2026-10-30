@@ -11,6 +11,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/devfreq.h>
+#include <linux/meizu-m2582.h>
 #include <linux/pm_domain.h>
 #include <linux/soc/qcom/llcc-qcom.h>
 
@@ -2390,8 +2391,8 @@ static uint32_t a6xx_get_rptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 	 * This is true only on an A6XX_GEN1 with GMU, has IFPC enabled and a super old SQE firmware
 	 * without 'whereami' support
 	 */
-	WARN_ONCE((to_adreno_gpu(gpu)->info->quirks & ADRENO_QUIRK_IFPC),
-		"Can't read CP_RB_RPTR register reliably\n");
+	WARN_ONCE(a6xx_gpu->ifpc,
+		  "Can't read CP_RB_RPTR register reliably\n");
 
 	return ring->memptrs->rptr = gpu_read(gpu, REG_A6XX_CP_RB_RPTR);
 }
@@ -2407,7 +2408,7 @@ static bool a6xx_progress(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 	 * Lets trust the hang detection in HW and lie to the caller that
 	 * there was progress.
 	 */
-	if (to_adreno_gpu(gpu)->info->quirks & ADRENO_QUIRK_IFPC)
+	if (to_a6xx_gpu(to_adreno_gpu(gpu))->ifpc)
 		return true;
 
 	cp_state = (struct msm_cp_state) {

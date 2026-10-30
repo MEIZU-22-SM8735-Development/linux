@@ -415,8 +415,17 @@ static void a8xx_patch_pwrup_reglist(struct msm_gpu *gpu)
 	int i;
 
 	lock->gpu_req = lock->cpu_req = lock->turn = 0;
+	/* The buffer is not zero-filled; every length is explicit. */
+	lock->ifpc_list_len = 0;
+	lock->preemption_list_len = 0;
+	lock->dynamic_list_len = 0;
 
-	reglist = adreno_gpu->info->a6xx->ifpc_reglist;
+	/*
+	 * The lists are only meaningful when IFPC is on: with it off the
+	 * firmware must see the same 0/0 lengths as before this board grew the
+	 * tables, so the baseline image keeps the exact CP init it had.
+	 */
+	reglist = a6xx_gpu->ifpc ? adreno_gpu->info->a6xx->ifpc_reglist : NULL;
 	if (reglist) {
 		lock->ifpc_list_len = reglist->count;
 
@@ -430,7 +439,7 @@ static void a8xx_patch_pwrup_reglist(struct msm_gpu *gpu)
 		}
 	}
 
-	reglist = adreno_gpu->info->a6xx->pwrup_reglist;
+	reglist = a6xx_gpu->ifpc ? adreno_gpu->info->a6xx->pwrup_reglist : NULL;
 	if (reglist) {
 		lock->preemption_list_len = reglist->count;
 
@@ -456,8 +465,16 @@ static void a8xx_patch_pwrup_reglist(struct msm_gpu *gpu)
 	 * stored as number for triplets in dynamic_list_len.
 	 */
 	dyn_pwrup_reglist = adreno_gpu->info->a6xx->dyn_pwrup_reglist;
-	if (!dyn_pwrup_reglist)
+	if (!dyn_pwrup_reglist) {
+		/*
+		 * The buffer is not zero-filled, and the CP reads these two
+		 * fields on every power collapse: leaving them untouched makes
+		 * the firmware walk a dynamic list that was never written.
+		 */
+		lock->dynamic_list_len = 0;
+		a6xx_gpu->dynamic_sel_reglist_offset = 0;
 		goto done;
+	}
 
 	for (u32 pipe_id = PIPE_BR; pipe_id <= PIPE_DDE_BV; pipe_id++) {
 		for (i = 0; i < dyn_pwrup_reglist->count; i++) {

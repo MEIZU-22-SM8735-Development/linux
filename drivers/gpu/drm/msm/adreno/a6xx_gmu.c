@@ -5,6 +5,7 @@
 #include <linux/clk.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/interconnect.h>
+#include <linux/meizu-m2582.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -66,12 +67,19 @@ static irqreturn_t a6xx_hfi_irq(int irq, void *data)
 
 	status = gmu_read(gmu, REG_A6XX_GMU_GMU2HOST_INTR_INFO);
 	/*
-	 * Clear only the bits this handler acts on: writing the whole status
-	 * back also clears the MSGQ bit that a6xx_hfi_wait_for_msg_interrupt()
-	 * may be waiting on.  BIT(2) means the firmware posted a record on its
-	 * debug queue, which the vendor drains from the same handler.
+	 * Clear everything the firmware reported.  This is the shape of the
+	 * image that renders on this board (build 1020-0001, cold boot:
+	 * kmscube at 120.4 fps, zero HFI timeouts, zero hangchecks) and of the
+	 * 10-07 build before it.
+	 *
+	 * The 10-18 rewrite cleared only 0x8006 so as not to race
+	 * a6xx_hfi_wait_for_msg_interrupt() for the MSGQ bit.  That concern is
+	 * real in principle, but the narrow clear was never part of a build
+	 * that rendered, while leaving any other status bit set keeps the
+	 * level-triggered line asserted and re-enters this handler.  The A/B
+	 * between the two is an open item (spec §120.5), not a settled one.
 	 */
-	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, 0x8006);
+	gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, status);
 	if (status & BIT(2))
 		a6xx_hfi_process_debug_queue(gmu);
 
@@ -182,13 +190,12 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
 			break;
 
 	/* If enabled, find the corresponding DDR bandwidth index */
-	if (info->bcms && gmu->nr_gpu_bws > 1) {
-		unsigned int bw = dev_pm_opp_get_bw(opp, true, 0);
+	if (info->bcms && gmu->nr_gpu_bws > 1 &&
+	    perf_index < GMU_MAX_GX_FREQS) {
+		unsigned int bw;
 
-		for (bw_index = 0; bw_index < gmu->nr_gpu_bws - 1; bw_index++) {
-			if (bw == gmu->gpu_bw_table[bw_index])
-				break;
-		}
+		bw_index = gmu->bw_index_by_perf[perf_index];
+		bw = gmu->gpu_bw_table[bw_index];
 
 		/* Vote AB as a fraction of the max bandwidth, starting from A750 */
 		if (bw && adreno_is_a750_family(adreno_gpu)) {
@@ -346,12 +353,20 @@ static int a6xx_gmu_start(struct a6xx_gmu *gmu)
 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, val,
 		(val & mask) == reset_val, 100, 10000);
 
-	if (ret)
+	if (ret) {
 		DRM_DEV_ERROR(gmu->dev, "GMU firmware initialization timed out\n");
+		return ret;
+	}
 
+	/*
+	 * Only a firmware that reached its init result counts as started: the
+	 * bit decides whether a later power collapse talks to the RSC at all,
+	 * and claiming a started firmware that never answered would make the
+	 * next suspend put a live RSC to sleep without a working GMU behind it.
+	 */
 	set_bit(GMU_STATUS_FW_START, &gmu->status);
 
-	return ret;
+	return 0;
 }
 
 static int a6xx_gmu_hfi_start(struct a6xx_gmu *gmu)
@@ -689,10 +704,23 @@ static void a6xx_rpmh_stop(struct a6xx_gmu *gmu)
 	u32 val;
 
 	/*
-	 * The vendor runs the RSC sleep handshake on every power collapse after
-	 * the first boot, not only before it.  GMU_STATUS_FW_START is this
-	 * tree's first-boot-done flag, so the gate is inverted: it is skipped
-	 * only until the firmware has started once.
+	 * Skip the handshake only until the firmware has started once, then run
+	 * it on every power collapse.
+	 *
+	 * This is the vendor's sequence and it is what the build that renders
+	 * on this board does: its log shows "rscc stop ok" at its first
+	 * collapse 3.06 s into boot, and at the next resume the wake has been
+	 * deferred to a6xx_gmu_fw_start with the sleep bit still set ("slept=1"
+	 * in that build's probe), i.e. the wake ran.  With upstream's gate --
+	 * which clears GMU_STATUS_FW_START on the first collapse and returns --
+	 * neither half ever runs after boot: PDC_SLEEP is never set, so
+	 * a6xx_rpmh_start() returns immediately and the RSC is never woken.
+	 *
+	 * Measured 2026-10-19 on the image that kept upstream's gate: the first
+	 * submission after the boot-time collapse dies in
+	 * a6xx_gmu_set_oob(GMU_OOB_GPU_SET) with the status stuck at BIT(2),
+	 * the CP never leaves rptr 0, and a8xx_recover() then fails with
+	 * "cx gdsc didn't collapse".
 	 */
 	if (!test_bit(GMU_STATUS_FW_START, &gmu->status))
 		return;
@@ -1040,7 +1068,14 @@ static int a6xx_gmu_fw_start(struct a6xx_gmu *gmu, unsigned int state)
 	if (adreno_is_a8xx(adreno_gpu)) {
 		gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_CLR, 0xffffffff);
 		gmu_write(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_CLR, 0xffffffff);
-		gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK, 0xffff8009);
+		/*
+		 * The value the image that renders on this board has, and the
+		 * one the 10-07 build had: mainline's ~A6XX_HFI_IRQ_MASK, read
+		 * back as 0xff7fffff.  The 10-18 rewrite's 0xffff8009 was part
+		 * of no image that ever rendered, so it is not restored here;
+		 * spec §120.5 records the A/B as open.
+		 */
+		gmu_write(gmu, REG_A6XX_GMU_GMU2HOST_INTR_MASK, 0xff7fffff);
 		gmu_write(gmu, REG_A6XX_GMU_AO_HOST_INTERRUPT_MASK, 0xffffffd6);
 		/* mask the records before the firmware posts its first one */
 		wmb();
@@ -1510,6 +1545,13 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 
 disable_irq:
 	disable_irq(gmu->gmu_irq);
+	/*
+	 * Do not leave a half-started GMU behind: halt the CM3 and stop the
+	 * HFI before the RSC is told to sleep, or the next resume finds a live
+	 * HFI attached to a firmware that never finished booting.
+	 */
+	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 1);
+	a6xx_hfi_stop(gmu);
 	a6xx_rpmh_stop(gmu);
 disable_clk:
 	clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
@@ -2070,6 +2112,49 @@ static int a6xx_gmu_build_bw_table(struct device *dev, unsigned long *bandwidths
 	return index;
 }
 
+/*
+ * Build the GPU bandwidth table from the chip's own level table instead of the
+ * OPP table.  The vendor's power levels carry a DDR vote per GPU frequency and
+ * the GMU firmware casts it; mainline normally reads it from opp-peak-kBps,
+ * which requires an interconnect path on the GPU node.  This board has none --
+ * the vendor does not vote from the AP either -- so the values live in the
+ * catalog, and the feature stays a boot-time switch.
+ *
+ * bw_index_by_perf[] is what a6xx_gmu_set_freq() needs: both arrays are indexed
+ * by the same ascending-frequency OPP order.
+ */
+static int a6xx_gmu_build_bw_table_levels(struct a6xx_gmu *gmu,
+					  const struct a6xx_info *info)
+{
+	int i, index = 0;
+	u32 last = 0;
+
+	/*
+	 * One bandwidth per GPU OPP entry: the mapping below is positional, so
+	 * a DT with a different number of OPPs must not be half-mapped.
+	 */
+	if (!info->bw_levels || info->nr_bw_levels + 1 != gmu->nr_gpu_freqs ||
+	    info->nr_bw_levels + 1 > GMU_MAX_GX_FREQS)
+		return 1;
+
+	/* Level 0 is "no vote". */
+	gmu->gpu_bw_table[index++] = 0;
+	gmu->bw_index_by_perf[0] = 0;
+
+	for (i = 0; i < info->nr_bw_levels; i++) {
+		u32 bw = info->bw_levels[i];
+
+		if (bw != last) {
+			gmu->gpu_bw_table[index++] = bw;
+			last = bw;
+		}
+
+		gmu->bw_index_by_perf[i + 1] = index - 1;
+	}
+
+	return index;
+}
+
 static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
 {
 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
@@ -2105,9 +2190,20 @@ static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
 	 * The GMU also handles GPU Interconnect Votes so build a list
 	 * of DDR bandwidths from the GPU OPP table
 	 */
-	if (info->bcms)
-		gmu->nr_gpu_bws = a6xx_gmu_build_bw_table(&gpu->pdev->dev,
-			gmu->gpu_bw_table, ARRAY_SIZE(gmu->gpu_bw_table));
+	if (info->bcms) {
+		if (of_machine_is_compatible("meizu,m2582")) {
+			if (m2582_feature_opt_in("gpubw"))
+				gmu->nr_gpu_bws = a6xx_gmu_build_bw_table_levels(gmu, info);
+		} else {
+			/*
+			 * Every other machine keeps the OPP-table path: this
+			 * board's catalog table is not a replacement for it.
+			 */
+			gmu->nr_gpu_bws = a6xx_gmu_build_bw_table(
+				&gpu->pdev->dev, gmu->gpu_bw_table,
+				ARRAY_SIZE(gmu->gpu_bw_table));
+		}
+	}
 
 	/* Build the list of RPMh votes that we'll send to the GMU */
 	return a6xx_gmu_rpmh_votes_init(gmu);
@@ -2451,8 +2547,19 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
 	if (ret)
 		return ret;
 
-	/* Set GMU idle level */
-	gmu->idle_level = (adreno_gpu->info->quirks & ADRENO_QUIRK_IFPC) ?
+	/*
+	 * Set the GMU idle level.  On this board IFPC is a boot-time opt-in
+	 * rather than a catalog quirk, because the collapse is what made the CX
+	 * domain unrecoverable until the RSC/sentinel fixes landed.  The flag is
+	 * kept on the instance: a6xx_progress() and a6xx_get_rptr() must not
+	 * touch GX registers once the firmware may have collapsed them.
+	 */
+	if (of_machine_is_compatible("meizu,m2582"))
+		a6xx_gpu->ifpc = m2582_feature_opt_in("gpuifpc");
+	else
+		a6xx_gpu->ifpc = adreno_gpu->info->quirks & ADRENO_QUIRK_IFPC;
+
+	gmu->idle_level = a6xx_gpu->ifpc ?
 		GMU_IDLE_STATE_IFPC : GMU_IDLE_STATE_ACTIVE;
 
 	pm_runtime_enable(gmu->dev);

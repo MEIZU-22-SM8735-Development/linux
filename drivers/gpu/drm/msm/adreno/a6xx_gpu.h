@@ -56,6 +56,14 @@ struct a6xx_info {
 	u32 gmu_cgc_mode;
 	u32 prim_fifo_threshold;
 	const struct a6xx_bcm *bcms;
+	/*
+	 * GPU DDR bandwidth per GPU OPP entry, in KBps, ordered by ascending
+	 * frequency.  The vendor keeps this in its power-level table and votes it
+	 * from the GMU; board code uses it when m2582.features=gpubw is given, so
+	 * the OPP table itself stays free of interconnect paths.
+	 */
+	const u32 *bw_levels;
+	u32 nr_bw_levels;
 };
 
 struct a6xx_gpu {
@@ -84,6 +92,13 @@ struct a6xx_gpu {
 	unsigned int preempt_level;
 	bool uses_gmem;
 	bool skip_save_restore;
+	/*
+	 * IFPC is on for this instance.  It is not a quirk bit because on this
+	 * board it is a boot-time opt-in (m2582.features=gpuifpc).  Every reader
+	 * has to agree with the GMU about whether the GX domain may have
+	 * collapsed, so the decision is made once, in a6xx_gmu_init().
+	 */
+	bool ifpc;
 
 	struct drm_gem_object *preempt_postamble_bo;
 	void *preempt_postamble_ptr;

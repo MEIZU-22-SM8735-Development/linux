@@ -103,6 +103,7 @@ struct a6xx_gmu {
 
 	int nr_gpu_bws;
 	unsigned long gpu_bw_table[GMU_MAX_GX_FREQS];
+	u8 bw_index_by_perf[GMU_MAX_GX_FREQS];
 	u32 gpu_ib_votes[GMU_MAX_GX_FREQS][GMU_MAX_BCMS];
 
 	int nr_gmu_freqs;

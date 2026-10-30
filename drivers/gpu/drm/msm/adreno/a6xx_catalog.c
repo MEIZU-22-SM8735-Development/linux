@@ -2375,6 +2375,71 @@ DECLARE_ADRENO_REGLIST_PIPE_LIST(a840_dyn_pwrup_reglist);
 /* GEN8_VSC_KMD_DBG_ECO_CNTL has no mainline name and is the one entry of the
  * vendor's list that is not transcribed here. */
 
+/*
+ * Power-collapse register lists for gen8_6_0, transcribed value for value from
+ * the vendor's msm_kgsl.ko (8.x family, chip 0x44030000):
+ *
+ *	a825_pwrup_reglist	.rodata gen8_pwrup_reglist,	 22 entries
+ *	a825_ifpc_reglist	.rodata gen8_ifpc_pwrup_reglist,	81 entries
+ *
+ * The vendor selects between these and the gen8_3_0 pair at runtime: the code
+ * at .text+0xd68 of gen8_start compares the GPU version against 0x00080300 and
+ * picks the 3.0 lists only on equality, so an 8.6.0 part uses the generic pair.
+ * Both arrays are lists of dword register offsets; the CP reads their current
+ * values at hw_init and restores them when the domain comes back, so no values
+ * belong here.
+ *
+ * a825_pwrup_reglist is the vendor's gen8_pwrup_reglist (the IFPC+preemption
+ * set) and a825_ifpc_reglist its gen8_ifpc_pwrup_reglist (the IFPC-only set).
+ * a8xx_patch_pwrup_reglist() uploads them only when IFPC is on, so an image
+ * without m2582.features=gpuifpc keeps the 0/0 list lengths the verified
+ * baseline had.
+ */
+static const u32 a825_pwrup_reglist_regs[] = {
+	0x00e01, 0x00e10, 0x00e12, 0x00e04, 0x00f01, 0x00f02,
+	0x00f08, 0x00f09, 0x00f0a, 0x00f0b, 0x00e16, 0x00e06,
+	0x00e07, 0x00e08, 0x00e09, 0x00e11, 0x00df0, 0x08f00,
+	0x0ae6b, 0x0ae10, 0x0ae11, 0x0ae6d,
+};
+DECLARE_ADRENO_REGLIST_LIST(a825_pwrup_reglist);
+
+static const u32 a825_ifpc_reglist_regs[] = {
+	0x00440, 0x0058f, 0x005ec,
+	/* SP */
+	0x0ae02, 0x0ae12, 0x0ae13, 0x0ae08, 0x0ae09, 0x0ae0a, 0x0ae0f,
+	0x0b604, 0x0b600, 0x0b602, 0x0b607, 0x0b608, 0x0b609, 0x0b60a,
+	0x0b60b, 0x0b60c, 0x0b60d, 0x0b60e, 0x0b60f, 0x0b610, 0x0b611,
+	0x0b612, 0x0b613, 0x0b614, 0x0b615, 0x0b616, 0x0b617, 0x0b618,
+	0x0b619,
+	/* UCHE */
+	0x00850, 0x00851, 0x00852, 0x00853, 0x00854, 0x00855, 0x00856,
+	0x00857, 0x00858, 0x00859, 0x0085a, 0x0085b, 0x0085c, 0x0085d,
+	0x0085e, 0x0085f, 0x00860, 0x00861, 0x00862, 0x00863, 0x00864,
+	0x00865, 0x00866, 0x00867, 0x00868, 0x00869, 0x0086a, 0x0086b,
+	0x0086c, 0x0086d, 0x0086e, 0x0086f, 0x00870, 0x00871, 0x00872,
+	0x00873, 0x00874, 0x00875, 0x00876, 0x00877, 0x00878, 0x00879,
+	0x0087a, 0x0087b, 0x0087c, 0x0087d, 0x0087e, 0x0088f, 0x008b6,
+};
+DECLARE_ADRENO_REGLIST_LIST(a825_ifpc_reglist);
+
+/*
+ * GPU DDR vote per power level, in KBps, ordered by ascending frequency -- the
+ * same order as the OPP table in the board DT.  The numbers are the vendor's:
+ * qcom,gpu-pwrlevels-0 gives each level a qcom,bus-freq index into
+ * qcom,bus-table-ddr, and that table holds (0, 781250, 2149902, 5285156,
+ * 6078314, 6667779, 8171875, 10691084, 12449218, 14398437, 16500000,
+ * 18597656).  Level by level that is 1150/1100/1050 MHz -> 18597656,
+ * 937/873 -> 16500000, 763 -> 12449218, 688/643/510 -> 8171875,
+ * 362 -> 5285156, 264 -> 781250.
+ *
+ * Only used when m2582.features=gpubw is given: the vote is the GMU's, so the
+ * GPU node carries no interconnect path and the OPP table stays untouched.
+ */
+static const u32 a825_bw_levels[] = {
+	781250, 5285156, 8171875, 8171875, 8171875, 12449218,
+	16500000, 16500000, 18597656, 18597656, 18597656,
+};
+
 static const struct adreno_reglist_pipe a825_nonctxt_regs[] = {
 	{ REG_A8XX_CP_SMMU_STREAM_ID_LPAC, 0x00000101, BIT(PIPE_NONE) },
 	{ REG_A8XX_GRAS_DBG_ECO_CNTL, 0x00000800, BIT(PIPE_BV) | BIT(PIPE_BR) },
@@ -2426,6 +2491,15 @@ static const struct adreno_reglist_pipe a825_nonctxt_regs[] = {
 	{ REG_A8XX_VFD_CB_BUSY_REQ_CNT, 0x00200020, BIT(PIPE_BV) | BIT(PIPE_BR) },
 	{ REG_A8XX_VFD_CB_LP_REQ_CNT, 0x00000020, BIT(PIPE_BV) | BIT(PIPE_BR) },
 	{ REG_A8XX_VPC_FLATSHADE_MODE_CNTL, 0x00000001, BIT(PIPE_BV) | BIT(PIPE_BR) },
+	/*
+	 * a8xx_nonctxt_config() walks this list until it meets a zero offset,
+	 * the way the a840 and a810 lists above end.  Without the sentinel the
+	 * walk reads whatever .rodata follows and writes those words to
+	 * (offset << 2) in the GPU's register window, so the first submission
+	 * takes a synchronous external abort inside a8xx_hw_init instead of
+	 * rendering.
+	 */
+	{ },
 };
 
 /* The vendor uses gen8_3_0_gbif_cx_regs for this part. */
@@ -2526,12 +2600,16 @@ static const struct adreno_info a8xx_gpus[] = {
 	.gmem = SZ_2M + SZ_256K + SZ_128K,
 	.inactive_period = DRM_MSM_INACTIVE_PERIOD,
 	/*
-	 * ADRENO_QUIRK_IFPC stays off: it sets idle_level to GMU_IDLE_STATE_IFPC,
-	 * a6xx_hfi_enable_ifpc() sends HFI_FEATURE_IFPC and the firmware collapses
-	 * the GPU by itself, which this board's CX domain does not survive.
-	 * ADRENO_QUIRK_PREEMPTION stays off too, keeping nr_rings at 1: four rings
-	 * make the CP preempt between them and consume the pwrup/ifpc/dyn_pwrup
-	 * lists this entry leaves NULL, so nothing renders.
+	 * ADRENO_QUIRK_IFPC is deliberately not part of .quirks: the bits are
+	 * const, and on this board IFPC is a boot-time opt-in
+	 * (m2582.features=gpuifpc) so that it can be brought up as one variable.
+	 * a6xx_gmu_init() turns it on for this machine by setting the
+	 * per-instance flag the rest of the driver reads.
+	 *
+	 * ADRENO_QUIRK_PREEMPTION stays off, keeping nr_rings at 1: four rings
+	 * make the CP preempt between them, and that path consumes the
+	 * dyn_pwrup_reglist this entry does not carry (the vendor's dyn list is
+	 * per-pipe and only needed with concurrent binning).
 	 */
 	.quirks = ADRENO_QUIRK_HAS_CACHED_COHERENT |
 		  ADRENO_QUIRK_HAS_HW_APRIV,
@@ -2539,6 +2617,10 @@ static const struct adreno_info a8xx_gpus[] = {
 	.zapfw = "gen80000_zap.mbn",
 	.a6xx = &(const struct a6xx_info) {
 		.nonctxt_reglist = a825_nonctxt_regs,
+		.pwrup_reglist = &a825_pwrup_reglist,
+		.ifpc_reglist = &a825_ifpc_reglist,
+		.bw_levels = a825_bw_levels,
+		.nr_bw_levels = ARRAY_SIZE(a825_bw_levels),
 		.protect = &a825_protect,
 		.gbif_cx = a825_gbif,
 		.max_slices = 2,	/* GEN8_6_0_NUM_PHYSICAL_SLICES */

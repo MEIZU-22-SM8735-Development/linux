@@ -225,40 +225,15 @@ static int gdsc_toggle_logic(struct gdsc *sc, enum gdsc_status status,
 		 * on the request before 0x9094 reports it, which can take longer
 		 * than STATUS_POLL_TIMEOUT_US -- so re-poll once.
 		 */
-		if (ret && sc->gds_hw_ctrl) {
-			pr_warn("%s enable timed out, Re-polling\n", sc->pd.name);
+		if (ret && sc->gds_hw_ctrl)
 			ret = gdsc_poll_status(sc, status);
-		}
-	}
-
-	/*
-	 * A CX power-up is asynchronous with respect to the RPMh
-	 * acknowledgment: the vendor waits up to 1250 ms on a completion for
-	 * this domain before it lets the next step start.  Keep asking for the
-	 * same budget before believing the status poll.
-	 */
-	if (ret && sc->gds_hw_ctrl && sc->pd.name &&
-	    !strcmp(sc->pd.name, "gpu_cc_cx_gdsc")) {
-		ktime_t t0 = ktime_get();
-		s64 budget = (status == GDSC_OFF) ? 1250000 : 1000000;
-		int ok;
-
-		do {
-			ok = gdsc_check_status(sc, status);
-			if (ok)
-				break;
-			usleep_range(1000, 2000);
-		} while (ktime_us_delta(ktime_get(), t0) < budget);
-
-		if (ok)
-			ret = 0;
 	}
 
 	/*
 	 * The vendor's own wake path never waits for this domain's status: it
 	 * enables the CX rail and goes straight on to the GMU clocks and the
-	 * firmware.  Do the same here, or the last phase of the power-up never
-	 * arrives while this function keeps gating on the status bit.
+	 * firmware.  Do the same here -- the status bit never comes good for
+	 * this domain on this SoC, so waiting on it only stalls the power-up.
 	 */
 	if (ret && status == GDSC_ON && sc->pd.name &&
 	    !strcmp(sc->pd.name, "gpu_cc_cx_gdsc"))
