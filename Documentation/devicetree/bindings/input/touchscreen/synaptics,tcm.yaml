@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/touchscreen/synaptics,tcm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Synaptics TouchComm (TCM) SPI touchscreen controller
+
+maintainers:
+  - Linux Meizu 22 project <98950213+14185638@users.noreply.github.com>
+
+description: |
+  Synaptics TouchComm (TCM) controllers speak a packetised command/report
+  protocol over SPI.  A report is requested by the host with a GET_REPORT
+  command and the controller signals its availability with a level low
+  interrupt line; reset is a GPIO that is asserted low.
+
+  The controller is powered from two rails, a digital one (vdd, 1.8 V) and an
+  analogue one (avdd, 2.7 V to 3.55 V).
+
+allOf:
+  - $ref: touchscreen.yaml#
+  - $ref: /schemas/input/input.yaml#
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: synaptics,tcm-spi
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+    description: Level low interrupt used by the controller to request service
+
+  reset-gpios:
+    maxItems: 1
+    description: Active low reset line
+
+  vdd-supply:
+    description: Digital (I/O) supply, 1.71 V to 1.95 V
+
+  avdd-supply:
+    description: Analogue supply, 2.7 V to 3.544 V
+
+  firmware-name:
+    maxItems: 1
+    description: |
+      Basename of the TouchComm firmware image.  Defaults to
+      "synaptics/firmware.img" when absent.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - vdd-supply
+  - avdd-supply
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        touchscreen@0 {
+            compatible = "synaptics,tcm-spi";
+            reg = <0>;
+            spi-max-frequency = <15000000>;
+            interrupt-parent = <&tlmm>;
+            interrupts = <176 IRQ_TYPE_LEVEL_LOW>;
+            reset-gpios = <&tlmm 189 GPIO_ACTIVE_LOW>;
+            vdd-supply = <&vreg_ldod1>;
+            avdd-supply = <&vreg_ldob22>;
+            firmware-name = "synaptics/firmware.img";
+            touchscreen-size-x = <1220>;
+            touchscreen-size-y = <2712>;
+        };
+    };
+
+...

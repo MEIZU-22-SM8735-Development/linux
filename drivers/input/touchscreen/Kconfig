@@ -1414,4 +1414,18 @@ config TOUCHSCREEN_HIMAX_HX83112B
 	  To compile this driver as a module, choose M here: the
 	  module will be called himax_hx83112b.
 
+config TOUCHSCREEN_SYNAPTICS_TCM
+	tristate "Synaptics TouchComm (TCM) SPI touchscreen"
+	depends on SPI
+	depends on OF
+	help
+	  Say Y here to enable support for Synaptics TouchComm (TCM)
+	  touchscreen controllers connected over SPI, such as the part
+	  used by the Meizu 22 (SM8735).
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called synaptics_tcm.
+
 endif
