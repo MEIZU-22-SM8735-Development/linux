@@ -585,6 +585,15 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
 	{ .compatible = "qcom,apq8074", .data = NULL, },
 	{ .compatible = "qcom,apq8084", .data = NULL, },
 	{ .compatible = "qcom,eliza", .data = sm8550_domains, },
+	/*
+	 * The Meizu 22's factory device tree names the ADSP charger domain
+	 * (qcom,protection-domain = "tms/servreg", "msm/adsp/charger_pd" on its
+	 * PMIC glink node), which is the domain set below; the ADSP also owns
+	 * the audio and sensor domains.  Without an entry here the mapper
+	 * prints "no support for the platform" and every PMIC service request
+	 * times out.
+	 */
+	{ .compatible = "qcom,tuna", .data = sm8550_domains, },
 	{ .compatible = "qcom,apq8096", .data = msm8996_domains, },
 	{ .compatible = "qcom,glymur", .data = glymur_domains, },
 	{ .compatible = "qcom,hawi", .data = kaanapali_domains, },
