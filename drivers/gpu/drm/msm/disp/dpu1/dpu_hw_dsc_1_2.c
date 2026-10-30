@@ -253,6 +253,18 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	if (m2582_feature_opt_in("flatswap"))
 		data = (dsc->flatness_max_qp & 0x1f) |
 		       ((dsc->flatness_min_qp & 0x1f) << 5);
+	else if (m2582_feature_opt_in("flatreg7"))
+		/*
+		 * m2582.features=flatreg7: diagnostic.  Write the encoder's
+		 * window as the pair it had before flat16 (7) while the PPS
+		 * keeps carrying 16/16, to see which copy this DDIC actually
+		 * runs on -- the PPS bytes it is sent, or the encoder's
+		 * shadow registers it can read back.  Clean output here means
+		 * the panel follows the registers; garble means the bits it
+		 * decodes come from the PPS and the fault is in what the
+		 * encoder emits.
+		 */
+		data = (7 & 0x1f) | ((7 & 0x1f) << 5);
 	else
 		data = (dsc->flatness_min_qp & 0x1f) |
 		       ((dsc->flatness_max_qp & 0x1f) << 5);

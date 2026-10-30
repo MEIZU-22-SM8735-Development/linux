@@ -2490,6 +2490,28 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 	 */
 	if (m2582_feature_opt_in("flat16"))
 		dsc->flatness_min_qp = dsc->flatness_max_qp;
+	/*
+	 * m2582.features=flatqp7: the decisive arm for why flat16 works.
+	 *
+	 * The DSC syntax carries one next_flatness_flag bit per three-pixel
+	 * group, and that bit exists only while the group's masterQp is inside
+	 * [flatness_min_qp, flatness_max_qp] -- a decision each side takes on
+	 * its own.  If both sides agree on the window's width, the flag exists
+	 * on both sides and all is well; the failure needs them to disagree,
+	 * which happens when the encoder clamps a flat group to one end of the
+	 * window and the decoder clamps it to the other.
+	 *
+	 * flat16 collapses the window to the single point 16.  Either the
+	 * encoder never reaches 16 (window unreachable, flag never sent) or it
+	 * does (window == the clamped QP, flag always sent); both are
+	 * self-consistent, which is why it is content-independent.  This arm
+	 * collapses the window to 7 instead.  Clean output means any single
+	 * point works and 16 is not special; garble means 16 only worked
+	 * because the encoder cannot reach it, and high-QP content would bring
+	 * the fault back.
+	 */
+	if (m2582_feature_opt_in("flatqp7"))
+		dsc->flatness_max_qp = dsc->flatness_min_qp;
 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
 	dsc->line_buf_depth = dsc->bits_per_component + 1;
 	/* m2582.features=lbd10: the reconstructed-line precision used by block
