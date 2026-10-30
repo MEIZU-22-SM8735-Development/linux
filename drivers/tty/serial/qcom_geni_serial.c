@@ -1194,15 +1194,38 @@ static int qcom_geni_serial_port_setup(struct uart_port *uport)
 	int ret;
 
 	proto = geni_se_read_proto(&port->se);
-	if (proto == GENI_SE_INVALID_PROTO) {
+	/*
+	 * M2582: same as the I2C driver -- see the comment there.  A stale but
+	 * valid protocol used to be a warning and nothing else, which left the
+	 * UART registered and non-functional.  Measured on this board: SE4
+	 * (a90000) comes out of the bootloader as SPI and SE5 (a94000) as I2C;
+	 * the Bluetooth UART is on SE14 (898000), where the bootloader leaves
+	 * UART mode behind for the vendor stack to use.
+	 *
+	 * Note what happens when this path is taken with proto == 0
+	 * (GENI_SE_NONE) or any other non-UART value and the firmware cannot be
+	 * loaded: geni_load_se_firmware() reads firmware-name off the *wrapper*
+	 * (qcom-geni-se.c:1558) and this board's wrapper has none, so it returns
+	 * -EINVAL before writing anything -- and the caller only warns and
+	 * carries on, programming FIFOs, watermarks and the baud divisor onto an
+	 * engine whose protocol was never established.
+	 */
+	if (proto != GENI_SE_UART) {
+		if (proto != GENI_SE_INVALID_PROTO)
+			dev_dbg(uport->dev, "reprogramming SE, stale proto %d\n", proto);
+
 		ret = geni_load_se_firmware(&port->se, GENI_SE_UART);
 		if (ret) {
-			dev_err(uport->dev, "UART firmware load failed ret: %d\n", ret);
-			return ret;
+			/*
+			 * Do not fail the port over this.  With no firmware-name
+			 * on the wrapper there is nothing to load and the call
+			 * returns -EINVAL, which is the normal state of affairs on
+			 * a platform whose bootloader programs the serial engines
+			 * itself -- and a registered-but-idle UART is still better
+			 * than no UART at all.
+			 */
+			dev_warn(uport->dev, "UART firmware load failed ret: %d\n", ret);
 		}
-	} else if (proto != GENI_SE_UART) {
-		dev_err(uport->dev, "Invalid FW loaded, proto: %d\n", proto);
-		return -ENXIO;
 	}
 
 	qcom_geni_serial_stop_rx(uport);
