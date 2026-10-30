@@ -21,6 +21,16 @@ properties:
   reg:
     maxItems: 1
 
+  qcom,pon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the PMIC PON node that owns the PBS.  Where the PS_HOLD
+      sequencing lives in that block (PMK8550 and its relatives), the reset
+      type has to be programmed before PS_HOLD is released, or the PMIC treats
+      the request as a shutdown.  With this present the driver programs a hard
+      reset; without it, its historical behaviour (release PS_HOLD, board powers
+      off) is unchanged.
+
 required:
   - compatible
   - reg
