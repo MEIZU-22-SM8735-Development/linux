@@ -305,11 +305,28 @@
 
 		power-domains = <&gcc GCC_USB3_PHY_GDSC>;
 
-		/* Shared with the eUSB2 PHY, as in the vendor DT. */
 		/*
-		 * M2582: same fix as the eUSB2 PHY -- vdda-phy is PMXR2230 L7 at
-		 * 1.8 V, not ldob3 at 0.88 V. vdda-pll (PMXR2230 L4, 1.2 V) was
-		 * already right.
+		 * M2582: ON-DEVICE RESULT (2026-10-18 21:40) -- the change below
+		 * was tried and the board did NOT come up: flashing the image
+		 * with vdda-phy = L4 (1.2 V) and vdda-pll = L3 (0.88 V) left the
+		 * phone with a black screen and no USB at all (no gadget, no
+		 * fastboot).  It had to be forced into fastboot by hand.
+		 *
+		 * The reasoning that produced it was tier 2 and looked strong
+		 * (the phone's own runtime tree gives the combo PHY
+		 * vdd = pmxr2230_l3 at 880 mV and core = pmxr2230_l4 at 1.2 V,
+		 * and the sibling boards pair vdda-phy with 1.2 V), which is
+		 * exactly why it is worth writing down that the board disagreed:
+		 * the vendor's names are transposed against mainline's, and
+		 * getting the pairing wrong here stops the board from booting at
+		 * all rather than just breaking DP.
+		 *
+		 * So the pairing is back to what booted before, and it must be
+		 * settled on hardware, not by matching names: the checklist's DP
+		 * step does exactly that -- read the PHY registers back after a
+		 * successful boot (the "PHY ignores every write" symptom is the
+		 * signal) and only then decide which rail belongs on which pin.
+		 * Do not re-apply the L4/L3 pairing without that measurement.
 		 */
 		vdda-phy-supply = <&vreg_ldob7>;
 		vdda-pll-supply = <&vreg_ldob4>;
@@ -333,19 +350,41 @@
 
 
 		/*
-		 * Without this the combo PHY cannot work out its orientation or
-		 * mode, logs "unable to determine orientation & mode from
-		 * data-lanes", leaves qmpphy_mode unset, and never brings up the
-		 * USB3 PIPE clock -- which is a clock DCTL.CSFTRST waits for, so
-		 * the DWC3 probe then fails with -110.
+		 * M2582: the DP sink is announced by the ADSP's altmode service and
+		 * by nothing else -- there is no Type-C port controller and no
+		 * retained-mode description in the factory tree (its qcom,altmode
+		 * and qcom,ucsi nodes are vendor-private compatibles that mainline
+		 * has no driver for).  pmic_glink_altmode.c resolves its mux and
+		 * orientation switch by fwnode, so the combo PHY has to publish
+		 * them: that registration is gated on exactly these two properties
+		 * (phy-qcom-qmp-combo.c:5390-5395 -> qmp_combo_typec_register()
+		 * :5045-5081).  CONFIG_TYPEC is on, so this takes the real path and
+		 * not the stub that would leave qmpphy_mode unset.
 		 *
-		 * qmp_combo_get_dt_usb3_orientation() looks up endpoint 1 of port 0
-		 * and matches its data-lanes against:
-		 *   usb3_data_lanes[] = { {2, NORMAL,  {1, 0}},
-		 *                         {2, REVERSE, {2, 3}} }
-		 * so <1 0> is TYPEC_ORIENTATION_NORMAL. Endpoint 0 (DP) is
-		 * deliberately not described, which leaves dp_orientation NONE and
-		 * makes the driver pick QMPPHY_MODE_USB3_ONLY.
+		 * Without them the data-lanes path below is used instead and the
+		 * mode is pinned to USB3_ONLY; with them, and no altmode event yet,
+		 * qmpphy_mode stays at its QMPPHY_MODE_USB3DP default
+		 * (phy-qcom-qmp-combo.c:5426), in which the USB3 PCS is brought out
+		 * of reset just as it is in USB3_ONLY (:4156-4180), so the boot-time
+		 * USB3 gadget path is unchanged.
+		 */
+		mode-switch;
+		orientation-switch;
+
+		/*
+		 * Three ports, as on every mainline board with this PHY
+		 * (sm8650.dtsi:5032-5087): port@0 out to the connector, port@1 USB3
+		 * SuperSpeed in, port@2 DP in.  Both links are load-bearing for DP:
+		 * port@0 -> connector port@1 is what drm_aux_bridge_probe() follows
+		 * to find the HPD bridge (aux-bridge.c:121), and port@2 <- DP port@1
+		 * is what gives the DP driver its next_bridge (dp_display.c:1026).
+		 * Without the second one DP still probes and trains, but HPD never
+		 * arrives and the connector stays disconnected.
+		 *
+		 * No data-lanes anywhere: the static lane mapping lives on port@0's
+		 * endpoints only (qcom,sc8280xp-qmp-usb43dp-phy.yaml:116-160) and is
+		 * mutually exclusive with the typec mux the two properties above
+		 * select; sm8650.dtsi declares none either.
 		 */
 		ports {
 			#address-cells = <1>;
@@ -353,12 +392,24 @@
 
 			port@0 {
 				reg = <0>;
-				#address-cells = <1>;
-				#size-cells = <0>;
 
-				usb_qmpphy_usb3_in: endpoint@1 {
-					reg = <1>;
-					data-lanes = <1 0>;
+				usb_qmpphy_out: endpoint {
+					remote-endpoint = <&pmic_glink_ss_in>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				usb_qmpphy_usb3_in: endpoint {
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+
+				usb_qmpphy_dp_in: endpoint {
+					remote-endpoint = <&mdss_dp0_out>;
 				};
 			};
 		};

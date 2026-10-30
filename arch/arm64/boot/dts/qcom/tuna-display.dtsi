@@ -1,5 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+/*
+ * The combo PHY's DP clock outputs are dispcc parents by name, not by index:
+ * dispcc-tuna.c:250-251 and :291 give the DPTX0 link/pixel clock sources the
+ * fw_names "dp0_phy_pll_link_clk" and "dp0_phy_pll_vco_div_clk", and
+ * clk_core_get() resolves an fw_name against this node's own clock-names
+ * (drivers/clk/clk.c:488-489).  The clkdev/global-name fallback cannot match
+ * the PHY's generated "88e8000.phy::link_clk" (phy-qcom-qmp-combo.c:4842), so
+ * both sources stay orphaned unless the two entries below are present.
+ */
+#include <dt-bindings/phy/phy-qcom-qmp.h>
+
 &soc {
 /*
  * dispcc is a sibling of mdss, not a child of it: mdss takes its clocks from
@@ -14,9 +25,12 @@
 		compatible = "qcom,tuna-dispcc";
 		reg = <0 0x0af00000 0 0x20000>;
 		clocks = <&bi_tcxo>, <&bi_tcxo_ao>, <&sleep_clk>,
-			 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>, <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>;
+			 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>, <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
+			 <&usb_qmpphy QMP_USB43DP_DP_LINK_CLK>,
+			 <&usb_qmpphy QMP_USB43DP_DP_VCO_DIV_CLK>;
 		clock-names = "bi_tcxo", "bi_tcxo_ao", "sleep_clk",
-			      "dsi0_phy_pll_out_byteclk", "dsi0_phy_pll_out_dsiclk";
+			      "dsi0_phy_pll_out_byteclk", "dsi0_phy_pll_out_dsiclk",
+			      "dp0_phy_pll_link_clk", "dp0_phy_pll_vco_div_clk";
 		power-domains = <&rpmhpd RPMHPD_MMCX>, <&rpmhpd RPMHPD_MX>;
 		required-opps = <&rpmhpd_opp_nom>, <&rpmhpd_opp_nom>;
 		#clock-cells = <1>;
@@ -134,10 +148,21 @@
 						data-lanes = <0 1 2 3>;
 
 						/*
-						 * The panel's own TE pin, TLMM 77 (the factory's qcom,panel-te-source = <0>):
-						 * the interface then paces itself against the panel.  It must be selected
-						 * from boot, because the tear-check registers are single-buffered and latch
-						 * only while VSYNC_COUNTER_EN is clear.
+						 * The panel's own TE pin (TLMM 77; the factory's
+						 * qcom,panel-te-source = <0>), so the interface
+						 * paces itself against the panel.  It has to be
+						 * selected from boot because the tear-check
+						 * registers are single-buffered and latch only
+						 * while VSYNC_COUNTER_EN is clear.
+						 *
+						 * "mdp_vsync_p" is the value the last working
+						 * configuration on this board used (2299 frames,
+						 * no timeouts).  "timer0" would select
+						 * DPU_VSYNC_SOURCE_WD_TIMER_0 instead, which arms
+						 * the watchdog timer from drm_mode_vrefresh() --
+						 * and that reports 184 Hz for this mode, because
+						 * msm_dsi derives the link rate from a synthetic
+						 * 627.126 MHz mode->clock.
 						 */
 						qcom,te-source = "mdp_vsync_p";
 					};

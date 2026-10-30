@@ -9,6 +9,11 @@
 #include "tuna-usb.dtsi"
 #include "tuna-i2c.dtsi"
 #include "meizu-m2582-i2c.dtsi"
+#include "meizu-m2582-touch.dtsi"
+/* dropped for the touch-only image (user priority): #include "meizu-m2582-bt.dtsi" */
+#include "meizu-m2582-adsp.dtsi"
+/* dropped for the touch-only image (user priority): #include "meizu-m2582-pcie.dtsi" */
+#include "meizu-m2582-dp.dtsi"
 /*
  * The PMK8550 sits on the SPMI bus declared in tuna.dtsi. This brings in the
  * PMIC node, its SDAM2 (whose restart-reason field the bootloader reads to pick
@@ -40,7 +45,15 @@
 #include "meizu-m2582-thermal.dtsi"
 
 / {
-	model = "Meizu 22 (M2582) — experimental Linux bring-up";
+	/*
+	 * ASCII only, deliberately: the em dash this used to contain is legal in
+	 * a device tree and dtc takes it, but dtschema's decoder rejects the DTB
+	 * before any validation runs ("Could not decode node / property model
+	 * ... UnicodeDecodeError: 'ascii' codec can't decode byte 0xe2"), so
+	 * every make dtbs_check run on this board died at the root node and
+	 * looked like a tooling problem rather than a board one.
+	 */
+	model = "Meizu 22 (M2582) experimental Linux bring-up";
 	compatible = "meizu,m2582", "qcom,tuna";
 	chassis-type = "handset";
 	/* Live socinfo: SM8735 1.1, foundry 1, QRD platform 1.0. */
@@ -512,4 +525,61 @@
  */
 &pmk8550_rtc {
 	allow-set-time;
+};
+
+/*
+ * SPMI address 6 is a PM8550VS on this board, not the PM8550VE that
+ * sm8750-pmics.dtsi declares there for the rest of the family.  The phone's own
+ * device tree says so twice: its qcom,pm8550vs@6 is enabled while its
+ * qcom,pm8550ve@6 is status = "disabled", and the Bluetooth node's chip enable
+ * is a GPIO of the VS instance.
+ *
+ * This has to come after that include: nodes at the same address merge, and for
+ * a property both declare, the later one wins.  Only the properties that differ
+ * are repeated -- the VS has six GPIOs where the VE has eight, and its GPIO
+ * block is a different device id.  The second label on each node keeps the
+ * included file's names working.
+ */
+&spmi_bus {
+	pm8550vs_g: pm8550ve_g: pmic@6 {
+		compatible = "qcom,pm8550vs", "qcom,spmi-pmic";
+
+		/*
+		 * The factory tree says this instance is a PM8550VS (its
+		 * pinctrl node is qcom,pm8550vs-gpio with six lines, and its
+		 * pmic-ecid names it pm8550vs_g), while the SoC file it
+		 * overrides assumed a PM8550VE with eight.  Leaving that node
+		 * in place puts two gpio drivers on one SPMI block, so it is
+		 * switched off here rather than left to race.
+		 */
+		status = "okay";
+
+		/* Its only consumer is the Bluetooth enable line. */
+		m2582,feature = "bt";
+
+		pm8550vs_g_gpios: pm8550ve_g_gpios: gpio@8800 {
+			compatible = "qcom,pm8550vs-gpio", "qcom,spmi-gpio";
+			gpio-ranges = <&pm8550vs_g_gpios 0 0 6>;
+
+			/*
+			 * Bluetooth enable.  The factory tree configures this pad
+			 * explicitly -- its bt_en state carries output-enable --
+			 * and that is what actually turns the output driver on
+			 * (PIN_CONFIG_OUTPUT_ENABLE, pinctrl-spmi-gpio.c:530-535).
+			 * gpio-ranges is decorative on a PMIC gpio (no
+			 * gpiochip->of_node), and without a named pinctrl state
+			 * the pad keeps its power-on default, so a consumer's
+			 * gpiod_set_value() would only move a register bit.
+			 */
+			bt_en_default: bt-en-default-state {
+				pins = "gpio4";
+				function = "normal";
+				power-source = <2>;
+				bias-disable;
+				input-disable;
+				output-enable;
+			};
+		};
+
+	};
 };

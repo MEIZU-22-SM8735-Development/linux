@@ -25,6 +25,7 @@ properties:
           - qcom,sm8650-cdsp-pas
           - qcom,sm8650-mpss-pas
           - qcom,sm8750-mpss-pas
+          - qcom,tuna-adsp-pas
           - qcom,x1e80100-adsp-pas
           - qcom,x1e80100-cdsp-pas
       - items:

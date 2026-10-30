@@ -107,4 +107,47 @@
 			qcom,init-voltage-level = <RPMH_REGULATOR_LEVEL_TURBO>;
 		};
 	};
+
+	/*
+	 * lcx.lvl and lmx.lvl, the two ARC resources behind the ADSP's low power
+	 * island rails (VDD_LPI_CX_LEVEL and VDD_LPI_MX_LEVEL).  The factory tree
+	 * names both: rpmh-regulator-lcxlvl is "lcx.lvl" over pm_v8's L2 and
+	 * rpmh-regulator-lmxlvl is "lmx.lvl" over pm_v6d's L2, each with
+	 * min = init = 0x10 (RETENTION) and max = 0xffff.  Both resources are in
+	 * the command DB with the same seven-entry level table as cx.lvl
+	 * (0x30030 "lcx.lvl", 0x30040 "lmx.lvl"), which is what makes the level
+	 * values below meaningful rather than nominal voltages.
+	 */
+	rpmh-regulator-lcxlvl {
+		compatible = "qcom,rpmh-arc-regulator";
+		qcom,resource-name = "lcx.lvl";
+
+		vreg_lcx_level: regulator-lcx-level {
+			/*
+			 * Switchable on its own: this rail is registered by the
+			 * regulator core whether or not the ADSP node is, so a
+			 * boot that gates the ADSP off still votes it -- and a
+			 * vote the firmware does not accept is what has stalled
+			 * the RSC on this board before.
+			 */
+			m2582,feature = "adsp-rails";
+			regulator-name = "lcx_level";
+			regulator-min-microvolt = <RPMH_REGULATOR_LEVEL_RETENTION>;
+			regulator-max-microvolt = <RPMH_REGULATOR_LEVEL_TURBO>;
+			qcom,init-voltage-level = <RPMH_REGULATOR_LEVEL_RETENTION>;
+		};
+	};
+
+	rpmh-regulator-lmxlvl {
+		compatible = "qcom,rpmh-arc-regulator";
+		qcom,resource-name = "lmx.lvl";
+
+		vreg_lmx_level: regulator-lmx-level {
+			m2582,feature = "adsp-rails";
+			regulator-name = "lmx_level";
+			regulator-min-microvolt = <RPMH_REGULATOR_LEVEL_RETENTION>;
+			regulator-max-microvolt = <RPMH_REGULATOR_LEVEL_TURBO>;
+			qcom,init-voltage-level = <RPMH_REGULATOR_LEVEL_RETENTION>;
+		};
+	};
 };

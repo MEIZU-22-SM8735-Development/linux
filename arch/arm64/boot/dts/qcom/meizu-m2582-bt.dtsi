@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include <dt-bindings/clock/qcom,rpmh.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/spmi/spmi.h>
+/*
+ * Bluetooth -- Meizu 22 (M2582 / SM8735)
+ *
+ * The controller is a WCN7750, whose Bluetooth half is an ordinary UART part
+ * that mainline's hci_qca already drives.  What follows is where it is and what
+ * has to be true before it answers; everything here is from the phone's own
+ * runtime device tree (artifacts/meizu22/android-live-ON/live-fdt.dts) rather
+ * than from the pre-overlay base DTB in vendor-ref/factory, which carries a
+ * different board's aliases and does not even contain a Bluetooth node.
+ *
+ * Where: SE14 of QUPV3 wrapper 2 (0x8c0000), at 0x898000.  The phone's own
+ * aliases say so directly --
+ *
+ *	hsuart0 = ".../qupv3_2_geni_se@8c0000/qcom,qup_uart@898000"
+ *
+ * -- and its node (qupv3_se14_4uart) is the only UART left enabled in that
+ * wrapper.  SE5 (0xa94000) is not a UART on this board at all: the aliases
+ * make it i2c5, and the runtime tree has a smart PA and a redriver on it.  An
+ * earlier version of this file put the Bluetooth on SE5 and was wrong.
+ *
+ * Pins: gpio40..43 as qup2_se6_l0..l3, which is what the runtime tree muxes
+ * them to.  The bias values are the vendor's own, per pin.
+ *
+ * Power: the chip enable is PM8550VS's GPIO 4, not a TLMM pad --
+ *
+ *	qcom,bt-reset-gpio = <&pm8550vs_g_gpios 4 0>
+ *
+ * -- and TLMM 35, which the vendor's btpower.ko also names, is the *WLAN*
+ * enable: that driver only reads it.  The coex handshake line is TLMM 80
+ * (wcn_sw_ctrl), which on this board the factory tree muxes for the *WLAN*
+ * side as cnss_wlan_sw_ctrl -- claiming it from the Bluetooth node made
+ * hci_qca fail its probe outright, so it is not claimed here.  btpower.ko's
+ * power-on order, read out of the module, is eight regulator enables and then
+ *
+ *	BT_EN low, msleep(50), BT_EN high, msleep(50),
+ *	SW_CTRL as input, read it
+ *
+ * Its one clock is RPMH RF_CLK1, and the vendor only enables that inside the
+ * firmware download -- not on this path.  The clock entry now exists in tuna's
+ * rpmh table, but the node does not claim it: this board's rf_clk1 is already
+ * running at 76.8 MHz (the vendor stack enables it), and claiming it would put
+ * a vote about 100 ms earlier than the vendor ever makes one, in the middle of
+ * the sequence that is under suspicion.  One new variable per image.
+ *
+ * The seven supplies the vendor lists cannot all be named here: it is the
+ * *rails* that are missing, not the PMICs (PMXR2230 and this VS instance are
+ * both declared).  hci_qca asks for them with regulator_bulk_get(), which hands
+ * back a dummy regulator for a supply the devicetree does not name, so the
+ * driver comes up and the rails stay where the bootloader left them -- the
+ * right order to do this in: get the part talking first, then model the rails
+ * once we know which of them it actually needs.
+ *
+ * Firmware: mainline builds the names itself from the ROM version and, for the
+ * NVM, the board id it reads off the part --
+ *
+ *	btqca.c: "qca/hmtbtfw%02x.tlv" and "qca/hmtnv%02x.bin" (+ board variants)
+ *	bluetooth.img: image/hmtbtfw20.tlv, image/hmtnv20.bin, image/hmtnv20_m2582.bin
+ *
+ * -- so there is deliberately no firmware-name property here.  The "_m2582"
+ * suffix is the vendor's own board selection (btpower.ko), not something
+ * mainline asks for; both NVM files are shipped so either name resolves.
+ */
+
+&qupv3_2 {
+	/*
+	 * SE14, the Bluetooth UART.  Mainline's wrapper-2 instance; the vendor's
+	 * node is the same block with the vendor's own clock-names ("se-clk"
+	 * only, index 0x65 = GCC_QUPV3_WRAP2_S6_CLK, which is what S6 means
+	 * here).  GIC SPI 461 is the first half of the vendor's
+	 * interrupts-extended = <&intc 0 0x1cd 4 ...>.
+	 */
+	uart14: serial@898000 {
+		compatible = "qcom,geni-uart";
+		reg = <0 0x00898000 0 0x4000>;
+		interrupts = <GIC_SPI 461 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&gcc GCC_QUPV3_WRAP2_S6_CLK>,
+			 <&gcc GCC_QUPV3_WRAP2_CORE_CLK>;
+		clock-names = "se", "core";
+		interconnects = <&clk_virt MASTER_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS
+				 &clk_virt SLAVE_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+				 &config_noc SLAVE_QUP_2 QCOM_ICC_TAG_ALWAYS>;
+		interconnect-names = "qup-core", "qup-config";
+		status = "disabled";
+	};
+};
+
+&tlmm {
+	qup2_uart14_cts: qup2-uart14-cts-state {
+		pins = "gpio40";
+		function = "qup2_se6_l0";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	qup2_uart14_rts: qup2-uart14-rts-state {
+		pins = "gpio41";
+		function = "qup2_se6_l1";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	/*
+	 * l2 and l3 carry the pull-up and the no-bias the vendor gives gpio42
+	 * and gpio43; which of the two is the receiver is the vendor's wiring,
+	 * not a mainline convention, so its bias is kept as it stands.
+	 */
+	qup2_uart14_tx: qup2-uart14-tx-state {
+		pins = "gpio42";
+		function = "qup2_se6_l2";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	qup2_uart14_rx: qup2-uart14-rx-state {
+		pins = "gpio43";
+		function = "qup2_se6_l3";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	/*
+	 * TLMM gpio80 is muxed to "wcn_sw_ctrl" for the WLAN chip's coexistence
+	 * line (the factory tree calls that group cnss_wlan_sw_ctrl), so its
+	 * pinctrl state belongs with the WLAN node, not here.
+	 */
+};
+
+&uart14 {
+	status = "okay";
+	/*
+	 * The gate is on the UART rather than on the child: this is the one part
+	 * of the Bluetooth path that can wedge the machine (the engine's
+	 * protocol is whatever the bootloader left behind, and this tree's
+	 * serial patch makes the driver keep a port it cannot reprogram), so it
+	 * has to be something a boot can leave out.
+	 */
+	m2582,feature = "bt-uart";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&qup2_uart14_cts>, <&qup2_uart14_rts>,
+		    <&qup2_uart14_tx>, <&qup2_uart14_rx>;
+
+	bluetooth {
+		compatible = "qcom,wcn7750-bt";
+
+		/* Its own switch: the UART alone proved safe, the driver did not. */
+		m2582,feature = "bt";
+
+		/*
+		 * Chip enable on the PMIC.  No swctrl-gpios: TLMM gpio80 is the
+		 * WLAN side's coexistence line (the factory tree muxes it to
+		 * "wcn_sw_ctrl" as cnss_wlan_sw_ctrl), not the Bluetooth
+		 * controller's, and claiming it here made hci_qca fail its probe
+		 * outright with -EINVAL.  The property is optional, so leaving it
+		 * out costs nothing until coexistence is set up on the WLAN side,
+		 * which is where it belongs.
+		 */
+		enable-gpios = <&pm8550vs_g_gpios 4 GPIO_ACTIVE_HIGH>;
+
+		/*
+		 * Naming this state is what makes the enable line real: it is
+		 * the only thing that applies the pad's configuration, and
+		 * output-enable inside it is what drives the pad.
+		 */
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_en_default>;
+
+		/*
+		 * Deliberately no clocks property, even though the factory tree
+		 * has clocks = <&rpmhcc 6> / clock-names = "bt_rf_clk1" and the
+		 * RPMH_RF_CLK1 entry now exists in tuna's rpmh clock table.
+		 *
+		 * Two reasons.  The clock is already running: the vendor stack
+		 * leaves rf_clk1 at 76.8 MHz with its hardware enable bit set
+		 * (clk_summary.txt:910, consumer soc:bt_kiwi), so this board is
+		 * not missing it.  And every RPMh clock is CLK_IS_CRITICAL
+		 * (clk-rpmh.c:1043), so clk_prepare_enable() never reaches the
+		 * driver's prepare at all -- it cannot change state.
+		 *
+		 * What declaring it WOULD do is move the vote into
+		 * qca_regulator_enable(), about 100 ms earlier than the vendor's
+		 * own driver ever enables it (it does that inside the firmware
+		 * download), which is precisely the step under suspicion.  One
+		 * new variable per image.
+		 */
+		/* clocks = <&rpmhcc RPMH_RF_CLK1>; */
+
+		/*
+		 * The controller's rails, each taken from the factory tree's own
+		 * names: qcom,bt-vdd-rfa2-supply is pmxr2230_s1 (1.9 V),
+		 * bt-vdd-rfa1 is pmxr2230_s2 (1.2 V), bt-vdd-rfaOp8 and
+		 * bt-vdd-aon are both pmxr2230_s3 (0.8 V), bt-vdd12-io is
+		 * pm_v6g_l2 and bt-vdd18-aon is pm_v6g_l3 on the PM8550VS.
+		 *
+		 * This is what makes the bring-up safe: hci_qca enables every
+		 * supply the node declares before it releases the controller from
+		 * reset.  With none declared it released reset on an unpowered
+		 * part, and that took the whole machine down.
+		 */
+		vddrfa1p9-supply = <&vreg_s1b>;
+		vddrfa1p2-supply = <&vreg_s2b>;
+		vddrfa0p8-supply = <&vreg_s3b>;
+		vddaon-supply = <&vreg_s3b>;
+		vddio-supply = <&vreg_l2g>;
+		vdddig-supply = <&vreg_l3g>;
+
+		/*
+		 * The WCN's power domain controller has to be programmed
+		 * through the AOP before this node's probe raises any of those
+		 * rails, and the vendor's own Bluetooth power driver is what
+		 * does it there: btpower.ko's bt_aop_pdc_reconfig
+		 * (.text+0x30ac) reads qcom,pdc_init_table and sends every
+		 * entry over QMP.  Mainline has no counterpart, so the node
+		 * below carries the table.
+		 *
+		 * This reference is what orders the two probes, and the
+		 * mechanism is worth spelling out because the obvious guess is
+		 * wrong: it is NOT fw_devlink (whose link creation runs in an
+		 * init-time pass, long before the UART driver creates this
+		 * serdev child).  It is serdev_drv_probe() calling
+		 * dev_pm_domain_attach() before the client's probe
+		 * (drivers/tty/serdev/core.c:398-408), with the generic power
+		 * domain core answering -EPROBE_DEFER while the provider is not
+		 * registered (drivers/pmdomain/core.c:3161).  So this device
+		 * does not probe until m2582_pdc has, and if m2582_pdc is
+		 * absent or gated off this device defers rather than probing
+		 * with the chip's domains undefined.
+		 *
+		 * Do not remove this line as "redundant": it is the only
+		 * ordering mechanism between two otherwise unrelated platform
+		 * drivers.
+		 */
+		power-domains = <&m2582_pdc>;
+
+		max-speed = <3000000>;
+	};
+};
+
+/*
+ * The WCN PDC init table, as the vendor's own device tree writes it.
+ *
+ * The phone's runtime tree carries two of them: this one, on the WLAN node
+ * (artifacts/meizu22/android-live-ON/live-fdt.dts:34673), and a three entry
+ * subset of it on the Bluetooth node (:34455).  The superset is used here
+ * because on Android cnss2 applies it at boot and btpower only adds the
+ * subset, while a Bluetooth-only boot of ours has applied neither.
+ *
+ * class "wlan_pdc" is the WCN's power domain controller.  The entries set the
+ * s3b supervision thresholds, release the memory-domain retention on s1g,
+ * l18b, b1b and l4k, set l2g.m dwnval, and finally enable the PDC.
+ *
+ * These strings are byte for byte the vendor's, including the leading space
+ * and the "ss:" field, which the vendor parses but does not put on the wire
+ * (its template is "{class: wlan_pdc, res: %s.%s, %s: %d}").  Keeping the
+ * declarative form here and rebuilding the wire form in the driver is what
+ * keeps this table traceable to the vendor's tree.
+ *
+ * m2582,feature gates it like the rest of the board file: a boot that does not
+ * ask for Bluetooth disables this node, and the Bluetooth node then defers
+ * instead of probing without its domains configured.
+ */
+/ {
+	m2582_pdc: pdc-init {
+		compatible = "meizu,m2582-pdc-init";
+		m2582,feature = "bt";
+
+		/* The AOP mailbox.  qmp_get() defers until aoss_qmp is up. */
+		qcom,qmp = <&aoss_qmp>;
+
+		qcom,pdc-init-table =
+			" {class: wlan_pdc, ss: rf, res: s3b.v, upval: 976}",
+			" {class: wlan_pdc, ss: rf, res: s3b.v, dwnval: 616}",
+			" {class: wlan_pdc, ss: rf, res: s1g.m, enable: 0}",
+			" {class: wlan_pdc, ss: rf, res: l18b.m, enable: 0}",
+			" {class: wlan_pdc, ss: rf, res: b1b.m, enable: 0}",
+			" {class: wlan_pdc, ss: rf, res: l4k.m, enable: 0}",
+			" {class: wlan_pdc, ss: rf, res: l2g.m, dwnval: 3}",
+			" {class: wlan_pdc, ss: bb, res: pdc, enable: 1}";
+
+		#power-domain-cells = <0>;
+	};
+};
+

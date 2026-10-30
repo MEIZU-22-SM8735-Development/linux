@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * M2582: the ADSP, and the charger/Type-C services that live on it.
+ *
+ * On this platform the battery is not on SPMI and not on the PMIC's ADC.  The
+ * charge state, the current and the fuel gauge are computed by the firmware
+ * running on the ADSP, and the AP reaches them over the PMIC GLINK service on
+ * the ADSP's glink edge ("tms/servreg", "msm/adsp/charger_pd" -- the factory
+ * tree names it as the protection domain of its qcom,qti-pmic-glink node).
+ * So the ADSP has to be running before any of that exists, which is the only
+ * reason this file covers both.
+ *
+ * The ADSP itself is declared in tuna.dtsi; what is board-specific is the two
+ * ARC level rails its low power island domains sit on, the region it is
+ * authenticated into, and where its firmware is.
+ */
+
+&remoteproc_adsp {
+	status = "okay";
+
+	/* The subsystem switch; see arch/arm64/kernel/meizu-m2582-features.c. */
+	m2582,feature = "adsp";
+
+	/*
+	 * The phone's own firmware, taken from the modem partition's image/
+	 * directory: adsp.mdt with its 53 segments and adsp_dtb.mdt with its
+	 * three.  It is on the persistent root rather than in the initramfs, so
+	 * the 20 MB never has to be reflashed -- which is also why auto_boot is
+	 * off in the driver's table for this SoC: the node probes at boot, but
+	 * nothing is loaded until userspace asks, by which time /lib/firmware is
+	 * there.
+	 */
+	firmware-name = "qcom/tuna/adsp.mdt", "qcom/tuna/adsp_dtb.mdt";
+
+	cx-supply = <&vreg_lcx_level>;
+	px-supply = <&vreg_lmx_level>;
+
+	memory-region = <&adsp_mem>, <&adsp_dtb_mem>;
+};
+
+/ {
+	/*
+	 * PMIC GLINK.  The compatible list is deliberate: the second entry is
+	 * what binds mainline's pmic_glink (its table has only the generic
+	 * "qcom,pmic-glink" for the ADSP transport, the SoC-specific ones are
+	 * the SOCCP transport), and the first is what the battery manager reads
+	 * off the parent to pick its register/attribute layout -- the SM8550
+	 * one, whose properties are the ones this firmware answers.
+	 */
+	pmic-glink {
+		compatible = "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
+
+		/* Its own switch: the ADSP can be up without the battery stack. */
+		m2582,feature = "battery";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/*
+		 * The only connector on this board, and the anchor of the DP HPD
+		 * chain. The ADSP's altmode service allocates a DRM bridge on this
+		 * node (pmic_glink_altmode.c:619) and notifies it when it sees a
+		 * DP sink (:376); the combo PHY's port@0 links to port@1 here, so
+		 * drm_aux_bridge_probe() (aux-bridge.c:121) finds that bridge and
+		 * the DP driver, whose next_bridge is the PHY's aux bridge
+		 * (dp_display.c:1026), finally gets HPD. Port@0 has no consumer
+		 * under mainline (USB_ROLE_SWITCH is off) but the usb-connector
+		 * binding requires it (usb-connector.yaml:210-211); port@2 (SBU)
+		 * is deliberately absent, this board has no SBU mux the kernel can
+		 * drive.
+		 *
+		 * This node is a child of pmic-glink, so it exists only when that
+		 * node does -- a DP bring-up boot needs the "battery" feature as
+		 * well as "dp" and the ADSP behind both.
+		 */
+		connector@0 {
+			compatible = "usb-c-connector";
+			reg = <0>;
+
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					pmic_glink_hs_in: endpoint {
+						remote-endpoint = <&usb_dwc3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+
+					pmic_glink_ss_in: endpoint {
+						remote-endpoint = <&usb_qmpphy_out>;
+					};
+				};
+			};
+		};
+	};
+};

@@ -104,17 +104,33 @@
 		status = "disabled";
 	};
 
-	i2c4: i2c@a90000 {
+	/*
+	 * SE4 is not an I2C bus on this board: the phone's own aliases make it
+	 * spi4 (spi@a90000), and that is where its touchscreen is -- a
+	 * Synaptics TCM part on chip select 0.  The runtime device tree has it
+	 * as SPI, and the bootloader leaves the engine programmed the same way.
+	 * The node itself is in meizu-m2582-touch.dtsi, beside the device on it,
+	 * because the pads and the supplies are board facts.
+	 */
+
+	/*
+	 * SE5.  Also not what an earlier note here claimed: the aliases make
+	 * this i2c5 (i2c@a94000), not the Bluetooth UART, and the runtime tree
+	 * has a smart PA and a redriver on it.  No device is declared on it yet
+	 * -- this is the bus, not a promise that something is on it.
+	 */
+	i2c5: i2c@a94000 {
 		compatible = "qcom,geni-i2c";
-		reg = <0 0x00a90000 0 0x4000>;
-		interrupts = <GIC_SPI 357 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&gcc GCC_QUPV3_WRAP1_S4_CLK>, <&gcc GCC_QUPV3_WRAP1_CORE_CLK>;
+		reg = <0 0x00a94000 0 0x4000>;
+		interrupts = <GIC_SPI 358 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&gcc GCC_QUPV3_WRAP1_S5_CLK>,
+			 <&gcc GCC_QUPV3_WRAP1_CORE_CLK>;
+		clock-names = "se", "core";
 		interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
 				 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
 				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
-		clock-names = "se", "core";
 		status = "disabled";
 	};
 

@@ -205,3 +205,9 @@
 		bias-pull-up;
 	};
 };
+
+/*
+ * The touchscreen is not on an I2C bus at all: SE4 is SPI on this board, and
+ * the part on it is a Synaptics TCM controller.  Both the bus and the device
+ * live in meizu-m2582-touch.dtsi.
+ */

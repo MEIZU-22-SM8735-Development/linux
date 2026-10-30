@@ -1,0 +1,732 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * M2582: PCIe0, its QMP PHY, and the WCN7750 that mainline's ath12k binds.
+ *
+ * The WiFi core on this phone is a PCIe endpoint, not the SNOC/icnss2 WPSS:
+ * the vendor's platform node is qcom,cnss-kiwi (cnss2 = MHI over PCIe), its
+ * wpss_pas sibling is status = "disabled", and the running Android enumerated
+ * the chip as 0000:01:00.0 behind 1c00000.pcie.  ath12k matches PCI ID
+ * 0x17cb:0x1107 directly, so no cnss2 port is needed -- only this host.
+ *
+ * Provenance of every number below is one of
+ *
+ *   live:N    artifacts/meizu22/android-live-ON/live-fdt.dts, the phone's own
+ *             runtime device tree (layer 2, the strongest source here)
+ *   <file>:N  an in-tree mainline driver, binding or sibling SoC description
+ *   tuna:N    vendor-ref/oneplus-dt/.../tuna-pcie.dtsi -- another vendor's
+ *             device tree for the *same* SoC, used only to cross-check a
+ *             property's spelling, never for a value (AGENTS.md 6.1)
+ *
+ * Nothing is taken from vendor-ref/factory/dtb_main.dts: that DTB is for the
+ * "Kera" board and has no node for this one.
+ *
+ * Known gaps, all of them reported rather than papered over:
+ *   - the nine vdd*-supply rails qcom,ath12k.yaml wants are not declared
+ *     anywhere in this tree, so wifi@0 carries none of them (see below).
+ *   - the PCIe PHY's own vdda-phy/vdda-pll are in the same position: the
+ *     vendor powers the PHY from its GDSC (tuna-pcie.dtsi:54) and names no
+ *     rail, and phy-qcom-qmp-pcie.c takes both with a non-optional bulk get
+ *     (:5101-5115, called at :5492), so they resolve to dummy regulators
+ *     (regulator/core.c:130-133, 2448-2458) and Linux never enables them.
+ *   - WLAN_EN is driven by the fixed regulator at the end of this file; it is
+ *     the only rail this board can raise without knowing the vendor's seven.
+ */
+
+#include <dt-bindings/clock/qcom,gcc-tuna.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/qcom,tuna.h>
+#include <dt-bindings/interconnect/qcom,icc.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/*
+ * The PCIe PHY's reference.
+ *
+ * The real gate is TCSR_PCIE_0_CLKREF_EN in the TCSR block, which the
+ * non-secure kernel must not touch -- probing that clock controller stalls the
+ * AXI bus (see the tcsrcc node in tuna.dtsi) -- so it is modelled as a fixed
+ * clock exactly like tcsr_usb3_clkref, and the bootloader has already opened
+ * the gate.  19.2 MHz is RPMH_CXO_CLK: sm8750.dtsi gives its tcsrcc node
+ * clocks = <&rpmhcc RPMH_CXO_CLK>, and RPMH_CXO_CLK is bi_tcxo here.  This sits
+ * at the root, not under /soc: a reg-less child of the soc@0 simple-bus is
+ * exactly the node shape that already produces the tree's nine simple_bus_reg
+ * warnings, and this must not add a tenth.
+ */
+/ {
+	tcsr_pcie_0_clkref: tcsr-pcie-0-clkref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <19200000>;
+	};
+
+	/*
+	 * WLAN_EN.  The vendor names this pin twice and both times it is TLMM 35
+	 * with flag 0, i.e. GPIO_ACTIVE_HIGH: wlan-en-gpio on the WiFi node
+	 * (live:34711) and qcom,wl-reset-gpio on the BT node of the same chip
+	 * (live:34480); its own pinctrl drives the pad output-high to enable and
+	 * biases it up (live:7557-7568).  Nothing in this tree raises it -- ath12k
+	 * has no gpio consumer -- so it is modelled the way mainline models such
+	 * enable lines (e.g. qcs615-ride.dts:68, sm6350-sony-xperia-lena-pdx213.dts:47):
+	 * a fixed regulator with no voltage of its own.  regulator-boot-on is what
+	 * makes fixed.c request the GPIO already high (the initial level comes
+	 * from that property alone: fixed.c:191-192, 295-296), and
+	 * regulator-always-on keeps the regulator core from releasing it in late
+	 * cleanup (core.c:6811).  It is
+	 * deliberately not referenced by wifi@0: it is not one of the nine ath12k
+	 * supplies and the driver has no consumer for it.
+	 */
+	wlan_en: regulator-wlan-en {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan_en";
+		gpio = <&tlmm 35 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
+
+		/* Same subsystem switch as the rest of this file. */
+		m2582,feature = "wifi";
+	};
+
+	/*
+	 * The WCN7750's power management unit, modelled the way every other
+	 * mainline board with this part does it (sm8650-qrd.dts:1015-1065 and
+	 * its siblings).  Two things hang off it:
+	 *
+	 *  - the seven board rails that feed the module, which is the whole
+	 *    reason the pwrseq framework exists: pwrseq-qcom-wcn.c:480-486
+	 *    bulk-gets all seven by name (vdd, vddio, vddio1p2, vddaon,
+	 *    vdddig, vddrfa1p2, vddrfa1p8 -- note that vddio1p2 is not in the
+	 *    binding's required list but the driver still asks for it, so it
+	 *    has to be here or probe fails with "Failed to get all
+	 *    regulators"), then enables them, asserts the BT enable line and
+	 *    waits before releasing it.
+	 *
+	 *  - the nine "ldo" nodes below, which are the module's *internal*
+	 *    PMU outputs.  They carry no compatible, so nothing binds to them
+	 *    and no regulator device is ever registered: their only job is to
+	 *    give wifi@0 something to point its nine mandatory vdd*-supply
+	 *    properties at.
+	 *
+	 * The input mapping is the phone's own, from qcom,pmu_vreg_map in the
+	 * vendor's WLAN node (live-fdt.dts:34675-34678), which names the
+	 * internal PMU rail each board rail feeds -- VDD095_PMU <- s1g,
+	 * VDD_PMU_AON_I and VDD095_MX_PMU <- s3b, VDD13_PMU_RFA_I <-> VDD13_PMU_PCIE_I
+	 * <- s2b, VDD19_PMU_RFA_I <-> VDD19_PMU_PCIE_I <- s1b -- plus the two
+	 * always-on IO rails on the VS instance.
+	 *
+	 * Deliberately no wlan-enable-gpios or bt-enable-gpios here, although
+	 * the binding allows both and the driver takes them optional: TLMM 35
+	 * is already owned by the wlan_en fixed regulator above (and the pwrseq
+	 * driver would not drive it anyway -- it takes it GPIOD_ASIS so as not
+	 * to toggle WLAN and drop the PCIe link, pwrseq-qcom-wcn.c:499-523),
+	 * and PM8550VS-G gpio 4 is owned by the bluetooth node's enable-gpios.
+	 * A second gpiod_get() on a claimed line returns -EBUSY
+	 * (gpiolib.c:2598), which would fail this node's probe and take its
+	 * sub-regulators with it.
+	 *
+	 * One consequence worth stating plainly, because it decides the design:
+	 * on this board *nothing consumes this pwrseq*.  ath12k has no
+	 * regulator or pwrseq consumer at all, and the only driver that would
+	 * ask for it is hci_qca, which takes the pwrseq path only when the
+	 * bluetooth node has no enable-gpios (hci_qca.c:2472-2530) -- and ours
+	 * has one.  So this node does not sequence anything at runtime; it is
+	 * the vendor's rail split written down, and the rails that actually
+	 * power the part are always-on in meizu-m2582-regulators.dtsi.
+	 */
+	wcn7850-pmu {
+		compatible = "qcom,wcn7850-pmu";
+
+		vddio-supply = <&vreg_l3g>;
+		vddio1p2-supply = <&vreg_l2g>;
+		vddaon-supply = <&vreg_s3b>;
+		vdddig-supply = <&vreg_s3b>;
+		vddrfa1p2-supply = <&vreg_s2b>;
+		vddrfa1p8-supply = <&vreg_s1b>;
+
+		/* Same subsystem switch as the rest of this file.  Properties
+		 * must precede subnodes, hence its place above regulators.
+		 */
+		m2582,feature = "wifi";
+
+		regulators {
+			vreg_pmu_rfa_cmn: ldo0 {
+				regulator-name = "vreg_pmu_rfa_cmn";
+			};
+
+			vreg_pmu_aon_0p59: ldo1 {
+				regulator-name = "vreg_pmu_aon_0p59";
+			};
+
+			vreg_pmu_wlcx_0p8: ldo2 {
+				regulator-name = "vreg_pmu_wlcx_0p8";
+			};
+
+			vreg_pmu_wlmx_0p85: ldo3 {
+				regulator-name = "vreg_pmu_wlmx_0p85";
+			};
+
+			vreg_pmu_btcmx_0p85: ldo4 {
+				regulator-name = "vreg_pmu_btcmx_0p85";
+			};
+
+			vreg_pmu_rfa_0p8: ldo5 {
+				regulator-name = "vreg_pmu_rfa_0p8";
+			};
+
+			vreg_pmu_rfa_1p2: ldo6 {
+				regulator-name = "vreg_pmu_rfa_1p2";
+			};
+
+			vreg_pmu_rfa_1p8: ldo7 {
+				regulator-name = "vreg_pmu_rfa_1p8";
+			};
+
+			vreg_pmu_pcie_0p9: ldo8 {
+				regulator-name = "vreg_pmu_pcie_0p9";
+			};
+
+			vreg_pmu_pcie_1p8: ldo9 {
+				regulator-name = "vreg_pmu_pcie_1p8";
+			};
+		};
+	};
+};
+
+/*
+ * MSI controller for the endpoint.
+ *
+ * live:1670 puts a GIC ITS at 0x17140000 (size 0x20000) inside the GIC node,
+ * and live:1110 maps the host's requester IDs onto it -- MSI is the only
+ * interrupt path the WiFi core has (live has no interrupts on the cnss node).
+ * tuna:41 writes the same msi-map.  Mainline needs the ITS as a node of its
+ * own; sm8650.dtsi:7238 is that shape, and its address is the same 0x17140000.
+ * #msi-cells = <1> is the vendor's own value (live:1674).
+ */
+&intc {
+	gic_its: msi-controller@17140000 {
+		compatible = "arm,gic-v3-its";
+		reg = <0 0x17140000 0 0x20000>;
+		msi-controller;
+		#msi-cells = <1>;
+
+		/* The subsystem switch; see arch/arm64/kernel/meizu-m2582-features.c. */
+		m2582,feature = "wifi";
+	};
+};
+
+&soc {
+	/*
+	 * The PCIe ANOC.  It is not in tuna.dtsi, but the vendor has it and the
+	 * driver for it is in this tree: live:8527 declares interconnect@16c0000
+	 * with reg <0x16c0000 0x11400> and compatible "qcom,tuna-pcie_anoc",
+	 * which drivers/interconnect/qcom/tuna.c:1717 binds as
+	 * qcom,tuna-pcie-anoc (tuna.c:1651 is the node table: MASTER_PCIE_0 ->
+	 * SLAVE_ANOC_PCIE_GEM_NOC).
+	 *
+	 * The two interface clocks are the vendor's (live:8531: gcc indices 6
+	 * and 15 = GCC_AGGRE_NOC_PCIE_AXI_CLK and GCC_CFG_NOC_PCIE_ANOC_AHB_CLK,
+	 * both implemented in gcc-tuna.c), but they are never enabled.  This
+	 * node's reg sits inside the GCC window (0x100000..0x2f4200,
+	 * tuna.dtsi:142), so icc-rpmh.c:314 fails the ioremap with -EBUSY and
+	 * jumps silently to skip_qos_config, skipping both the QoS programming
+	 * and the clk_bulk_get_all()/clk_bulk_prepare_enable() pair that would
+	 * turn the clocks on (:326, :210).  The provider still registers and
+	 * votes, so the consumers resolve; only QoS and the clocks are left to
+	 * the bootloader, as for every other tuna NoC inside that window.
+	 */
+	pcie_noc: interconnect@16c0000 {
+		compatible = "qcom,tuna-pcie-anoc";
+		reg = <0 0x016c0000 0 0x11400>;
+		#interconnect-cells = <2>;
+		qcom,bcm-voters = <&apps_bcm_voter>;
+		clocks = <&gcc GCC_AGGRE_NOC_PCIE_AXI_CLK>,
+			 <&gcc GCC_CFG_NOC_PCIE_ANOC_AHB_CLK>;
+		clock-names = "aggre_noc_pcie_axi", "cfg_noc_pcie_anoc_ahb";
+
+		m2582,feature = "wifi";
+	};
+
+	/*
+	 * The PCIe0 PHY.
+	 *
+	 * The vendor describes the PHY as a register window *inside* the host
+	 * node -- reg-names "parf","phy","dm_core",... with "phy" at
+	 * <0x1c06000 0x2000> (live:1100-1101, tuna:14-22) -- and never as a node
+	 * of its own.  It is nevertheless separate silicon at a separate
+	 * address, and mainline's pcie-qcom takes it through phys/phy-names
+	 * (pcie-qcom.c:1955, devm_phy_optional_get(dev, "pciephy")), so the node
+	 * has to exist.  It is not the USB3/DP combo PHY: that one is at
+	 * 0x88e8000 (tuna-usb.dtsi, usb_qmpphy) and has nothing to do with
+	 * PCIe0.
+	 *
+	 * Compatible: mainline has no SM8735/tuna PCIe PHY.  The choice between
+	 * the two gen3x2 siblings is settled by the vendor's own init table.  The
+	 * 115 (offset,value) pairs of live:1130 were matched against both
+	 * in-tree tables placed at their own offset maps:
+	 *
+	 *   sm8550_qmp_gen3x2_pciephy_cfg (qmp_pcie_offsets_v5, used by
+	 *     "qcom,sm8650-qmp-gen3x2-pcie-phy"): 105/109 driver writes identical
+	 *   sm8750_qmp_gen3x2_pciephy_cfg (qmp_pcie_offsets_v7): 38/123 identical
+	 *
+	 * so the PHY is the sm8550/sm8650 generation.  What settles the offset
+	 * map rather than just the values: the vendor writes 0x2dc = 0x05,
+	 * 0x388 = 0x77, 0x6a4 = 0x1e and 0x6f4 = 0x27, which are
+	 * REFGEN_REQ_CONFIG1, RX_SIGDET_LVL, EQ_CONFIG1 and RXEQEVAL_TIME at v5's
+	 * pcs base 0x200 and pcs_misc base 0x600, and at no other base.  The four
+	 * writes that do differ are the same register pair in both lanes (v5
+	 * offsets 0x180/0x194 and their +0x800 copies): the vendor programs 0x8f
+	 * where the in-tree table has 0x89.
+	 *
+	 * Clocks are sm8750.dtsi:5351-5360's five names, all of them resolvable
+	 * here: GCC_PCIE_0_AUX_CLK, GCC_PCIE_0_CFG_AHB_CLK,
+	 * GCC_PCIE_0_PHY_RCHNG_CLK and GCC_PCIE_0_PIPE_CLK are implemented in
+	 * gcc-tuna.c and enumerated in qcom,gcc-tuna.h, and "ref" is the TCSR
+	 * stub above.  100 MHz for the rchng clock is the only rate its table
+	 * offers (gcc-tuna.c:459-462) and matches the vendor's own Gen3 entry in
+	 * qcom,bw-scale (live:1117, 0x5f5e100).
+	 *
+	 * Reset 7 is the vendor's: live:1120-1121 resets <&gcc 4>, <&gcc 7> with
+	 * names "pcie_0_core_reset"/"pcie_0_phy_reset", and qcom,gcc-tuna.h:176-179
+	 * makes index 7 GCC_PCIE_0_PHY_BCR (4 is GCC_PCIE_0_BCR, on the host
+	 * below).  tuna:73-76 spells the same two out by name.
+	 *
+	 * Power: the PHY's switch is GCC's PHY GDSC, not a rail -- the vendor
+	 * feeds its "gdsc-phy-vdd-supply" from exactly that domain
+	 * (tuna-pcie.dtsi:54) and gives the domain the MX level as its parent
+	 * (live:14707-14716).  gcc-tuna.c now implements GCC_PCIE_0_PHY_GDSC at
+	 * 0x6c000, so attaching it here makes the kernel own the switch instead of
+	 * inheriting whatever the bootloader left.  This window at 0x1c06000 is
+	 * where the AXI-bus stalls came from, and an unpowered PHY domain is the
+	 * state least likely to survive a register access.  Same shape as
+	 * sm8750.dtsi:5368.
+	 */
+	pcie0_phy: phy@1c06000 {
+		compatible = "qcom,sm8650-qmp-gen3x2-pcie-phy";
+		reg = <0 0x01c06000 0 0x2000>;
+
+		clocks = <&gcc GCC_PCIE_0_AUX_CLK>,
+			 <&gcc GCC_PCIE_0_CFG_AHB_CLK>,
+			 <&tcsr_pcie_0_clkref>,
+			 <&gcc GCC_PCIE_0_PHY_RCHNG_CLK>,
+			 <&gcc GCC_PCIE_0_PIPE_CLK>;
+		clock-names = "aux",
+			      "cfg_ahb",
+			      "ref",
+			      "rchng",
+			      "pipe";
+
+		assigned-clocks = <&gcc GCC_PCIE_0_PHY_RCHNG_CLK>;
+		assigned-clock-rates = <100000000>;
+
+		resets = <&gcc GCC_PCIE_0_PHY_BCR>;
+		reset-names = "phy";
+
+		power-domains = <&gcc GCC_PCIE_0_PHY_GDSC>;
+
+		/*
+		 * The PHY's PIPE output.  The name is not free: gcc-tuna.c:246
+		 * looks its pipe mux parent up as fw_name "pcie_0_pipe_clk", and
+		 * the &gcc override below is what pairs that name with this node.
+		 * The PHY driver requires the property to exist at all
+		 * (phy-qcom-qmp-pcie.c:5186-5191).
+		 */
+		#clock-cells = <0>;
+		clock-output-names = "pcie_0_pipe_clk";
+		#phy-cells = <0>;
+
+		m2582,feature = "wifi";
+	};
+
+	/*
+	 * PCIe0, root complex 0.
+	 *
+	 * Register windows, their names and their order are the vendor's, with
+	 * the names mainline spells differently -- live:1100-1101's "dm_core" is
+	 * the DWC "dbi" window, "iatu" is "atu" and "conf" is "config" -- which
+	 * the identical sizes prove: the values below are <0x1c00000 0x3000>,
+	 * <0x40000000 0xf1d>, <0x40000f20 0xa8>, <0x40001000 0x1000>,
+	 * <0x40100000 0x100000>, <0x1c03000 0x1000>, and sm8750.dtsi:5202-5215
+	 * carries exactly that set for the same controller generation.  The
+	 * vendor's eighth window, "pcie_sm" at <0x1d07000 0x7000>, has no
+	 * mainline consumer and is left out; so is the "phy" window, which is
+	 * the PHY node above.
+	 *
+	 * Compatible: mainline has no SM8735 entry.  "qcom,pcie-sm8550" is the
+	 * documented fallback and pcie-qcom.c:2310 matches it to cfg_1_9_0; the
+	 * SoC-specific string in front of it is added to qcom,pcie-sm8550.yaml
+	 * with this board.  The controller is the same IP as sm8750's, whose
+	 * node (sm8750.dtsi:5200-5310) is the shape reference for everything
+	 * below that the vendor does not name.
+	 *
+	 * Clocks: the vendor node has no clocks at all (live:1097-1146 has no
+	 * clocks/clock-names, and neither does tuna:10-242 -- the vendor driver
+	 * enables them from its own tables), which is why the earlier survey
+	 * called this undetermined.  They are the eight gcc-tuna.c implements
+	 * for PCIe0, under the names pcie-qcom and the binding use
+	 * (sm8750.dtsi:5266-5288), and all eight exist in qcom,gcc-tuna.h.
+	 */
+	pcie0: pcie@1c00000 {
+		compatible = "qcom,pcie-sm8735", "qcom,pcie-sm8550";
+		device_type = "pci";
+
+		reg = <0 0x01c00000 0 0x3000>,
+		      <0 0x40000000 0 0xf1d>,
+		      <0 0x40000f20 0 0xa8>,
+		      <0 0x40001000 0 0x1000>,
+		      <0 0x40100000 0 0x100000>,
+		      <0 0x01c03000 0 0x1000>;
+		reg-names = "parf", "dbi", "elbi", "atu", "config", "mhi";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		/*
+		 * The vendor's two windows, identity-mapped: live:1105 gives
+		 * PCI 0x40200000 -> CPU 0x40200000, size 0x100000, and PCI
+		 * 0x40300000 -> CPU 0x40300000, size 0x3d00000.  Its own encoding
+		 * is one cell short -- <flags, pci-mid, pci-low, cpu, ?, size> --
+		 * because it omits the parent's second address cell; the form
+		 * below is the same mapping written for this parent
+		 * (soc@0 has #address-cells = <2>), which is also exactly how
+		 * sm8650.dtsi:3650-3651 and sm8750.dtsi:5218-5220 write theirs.
+		 */
+		ranges = <0x01000000 0x00 0x40200000 0x00 0x40200000 0x00 0x100000>,
+			 <0x02000000 0x00 0x40300000 0x00 0x40300000 0x00 0x3d00000>;
+		bus-range = <0x00 0xff>;
+		linux,pci-domain = <0>;
+
+		/*
+		 * Two lanes.  The vendor declares no num-lanes, but the PHY is a
+		 * two-lane part and its own init table programs both lanes --
+		 * live:1130 writes every tx/rx register twice, at 0x1000.. and at
+		 * its +0x800 twin.  Without the property the DWC core calls
+		 * dw_pcie_link_set_max_link_width() with 0 and logs "num-lanes 0:
+		 * invalid value" instead of programming the width
+		 * (pcie-designware.c:898-934, 1313).  sm8650.dtsi:3644 and
+		 * sm8750.dtsi:5231 set 2 for the same controller.
+		 *
+		 * max-link-speed is deliberately absent, as it is in the vendor
+		 * node and in sm8650/sm8750: the core then caches the hardware
+		 * capability and caps nothing (pcie-designware.c:857-860), so the
+		 * link trains as fast as the PHY and the endpoint agree on.
+		 */
+		num-lanes = <2>;
+
+		clocks = <&gcc GCC_PCIE_0_AUX_CLK>,
+			 <&gcc GCC_PCIE_0_CFG_AHB_CLK>,
+			 <&gcc GCC_PCIE_0_MSTR_AXI_CLK>,
+			 <&gcc GCC_PCIE_0_SLV_AXI_CLK>,
+			 <&gcc GCC_PCIE_0_SLV_Q2A_AXI_CLK>,
+			 <&gcc GCC_DDRSS_PCIE_SF_QTB_CLK>,
+			 <&gcc GCC_AGGRE_NOC_PCIE_AXI_CLK>,
+			 <&gcc GCC_CNOC_PCIE_SF_AXI_CLK>;
+		clock-names = "aux",
+			      "cfg",
+			      "bus_master",
+			      "bus_slave",
+			      "slave_q2a",
+			      "ddrss_sf_tbu",
+			      "noc_aggr",
+			      "cnoc_sf_axi";
+
+		resets = <&gcc GCC_PCIE_0_BCR>;
+		reset-names = "pci";
+
+		/*
+		 * The controller's own switch.  The vendor's node is
+		 * gcc_pcie_0_gdsc at 0x16b004 with the CX level as its parent
+		 * (live:14694-14703); gcc-tuna.c implements it at 0x6b004, and the
+		 * parent rail is already voted through this clock controller's own
+		 * power-domains (tuna.dtsi:149-150).  Without the domain the core
+		 * and the PHY run on the bootloader's leftovers.  Same shape as
+		 * sm8750.dtsi:5289.
+		 */
+		power-domains = <&gcc GCC_PCIE_0_GDSC>;
+
+		/*
+		 * The runtime DT's own path, by its own names -- live:1118-1119
+		 * "icc_path" between pcie_noc master 0xfa3 and mc_virt slave
+		 * 0x11a0, which qcom,tuna.h:161-162 identifies as
+		 * MASTER_PCIE_0_PCIE_CRM_HW_0 / SLAVE_EBI1_PCIE_CRM_HW_0 and
+		 * tuna:70-71 spells out.  Mainline's driver asks for two paths by
+		 * name and fails the probe if a name it asks for is missing
+		 * (of_icc_get() returns -ENODATA, pcie-qcom.c:1627-1633), so
+		 * either both are declared or neither is; the second one is
+		 * sm8750.dtsi:5290-5293's CPU path, whose endpoints
+		 * MASTER_APPSS_PROC and SLAVE_PCIE_0 both resolve in this tree's
+		 * tuna.c (1490, 1508).
+		 */
+		interconnects = <&pcie_noc MASTER_PCIE_0 QCOM_ICC_TAG_ALWAYS
+				 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+				 &cnoc_main SLAVE_PCIE_0 QCOM_ICC_TAG_ALWAYS>;
+		interconnect-names = "pcie-mem", "cpu-pcie";
+
+		/*
+		 * Stream IDs for the endpoint: the vendor's mapping verbatim
+		 * (live:1122-1123, tuna:80-81), the same 0x1400/0x1401 pair every
+		 * sm8550-generation board uses.  live's qcom,smmu-sid-base is a
+		 * vendor-driver property with the same value and no mainline
+		 * consumer.
+		 */
+		iommu-map = <0x0   &apps_smmu 0x1400 0x1>,
+			    <0x100 &apps_smmu 0x1401 0x1>;
+
+		/*
+		 * MSI.  0x1400/0x1401 are the same stream IDs the vendor maps
+		 * (live:1110) and 0x36 is its gic_its.  There is no msi-map-mask
+		 * here because the vendor declares none: the RID must match
+		 * exactly, which it does -- the endpoint is bus 1, device 0,
+		 * function 0, so its requester ID is 0x100, the second entry.
+		 */
+		msi-map = <0x0   &gic_its 0x1400 0x1>,
+			  <0x100 &gic_its 0x1401 0x1>;
+
+		/*
+		 * Interrupts.  The vendor has exactly five (live:1108-1109):
+		 * SPI 140 named "int_global_int" and SPI 149..152 named
+		 * "int_a".."int_d" -- the four legacy INTx lines.  Mainline's own
+		 * pcie-qcom reads no interrupt at all in this tree; the INTx
+		 * lines are translated through interrupt-map, and SPI 140 is the
+		 * global one.  The msi0..msi7 interrupts sm8750.dtsi lists
+		 * (SPI 141..148) are the controller's internal MSI block, which is
+		 * bypassed when msi-map is present -- pcie-designware-host.c:596-599
+		 * sets use_imsi_rx = false on exactly that property -- so they are
+		 * not invented here, having no source in the runtime DT.
+		 *
+		 * Each interrupt-map entry carries the parent's #address-cells (2)
+		 * as well as its #interrupt-cells (3) after the phandle; both the
+		 * kernel (of_irq_parse_imap_parent(), drivers/of/irq.c:127-150) and
+		 * dtc consume that many cells, and the GIC specifier is the last
+		 * three.  The two zeros are that address, as in sm8750.dtsi:5247.
+		 */
+		interrupts = <GIC_SPI 140 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "global";
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 0x7>;
+		interrupt-map = <0 0 0 1 &intc 0 0 GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH>,
+				<0 0 0 2 &intc 0 0 GIC_SPI 150 IRQ_TYPE_LEVEL_HIGH>,
+				<0 0 0 3 &intc 0 0 GIC_SPI 151 IRQ_TYPE_LEVEL_HIGH>,
+				<0 0 0 4 &intc 0 0 GIC_SPI 152 IRQ_TYPE_LEVEL_HIGH>;
+
+		dma-coherent;
+
+		/*
+		 * PERST# and WAKE# are on the host node in the vendor tree
+		 * (live:1111-1112: TLMM 33 and 81, both flag 0), which mainline
+		 * deprecates in favour of the root port's own properties
+		 * (qcom,pcie-common.yaml:81-93).  They are therefore declared on
+		 * the root port below, where the driver looks for them
+		 * (pcie-qcom.c:1919, qcom_pcie_parse_perst()).
+		 */
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&pcie0_perst_default>, <&pcie0_clkreq_default>,
+			    <&pcie0_wake_default>;
+		pinctrl-1 = <&pcie0_perst_default>, <&pcie0_clkreq_sleep>,
+			    <&pcie0_wake_default>;
+
+		/* The subsystem switch; see arch/arm64/kernel/meizu-m2582-features.c. */
+		m2582,feature = "wifi";
+
+		/*
+		 * The root port.  device_type = "pci" is what makes the driver
+		 * find it (pcie-qcom.c:1922), and its own properties are the
+		 * modern home for the two GPIOs the vendor puts on the host.
+		 *
+		 * reset-gpios is GPIO 33, ACTIVE_LOW, although the vendor writes
+		 * flag 0: PERST# is active low, the vendor's own pinctrl state
+		 * holds the pad with bias-pull-down (live:6210) so the net idles
+		 * asserted, and mainline asserts by writing logical 1
+		 * (pcie-qcom.c:295).  sm8750-mtp.dts:1123 is the same translation
+		 * for the same controller: the vendor's sun-pcie.dtsi:44 says
+		 * perst-gpio = <&tlmm 102 GPIO_ACTIVE_HIGH> and upstream says
+		 * reset-gpios = <&tlmm 102 GPIO_ACTIVE_LOW>.
+		 *
+		 * wake-gpios is GPIO 81 and stays ACTIVE_HIGH, matching both the
+		 * vendor's flag and sm8750-mtp.dts:1122.
+		 */
+		pcieport0: pcie@0 {
+			device_type = "pci";
+			reg = <0x0 0x0 0x0 0x0 0x0>;
+			bus-range = <0x01 0xff>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			/*
+			 * phys belongs here, not on the host: the driver looks it
+			 * up on this node (pcie-qcom.c:1884) and only falls back
+			 * to the host's "pciephy" binding when that fails, in
+			 * which case reset-gpios below is never even read.  Same
+			 * shape as sm8750.dtsi:5341 / sm8750-mtp.dts:1121-1123.
+			 */
+			phys = <&pcie0_phy>;
+
+			wake-gpios = <&tlmm 81 GPIO_ACTIVE_HIGH>;
+			reset-gpios = <&tlmm 33 GPIO_ACTIVE_LOW>;
+
+			/*
+			 * The WCN7750 itself.  reg is bus 1 / device 0 / function 0
+			 * -- the address the running Android enumerated
+			 * (".../1c00000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0",
+			 * dmesg-full-ON.txt:860) -- in the 5-cell PCI form the
+			 * binding documents (qcom,ath12k.yaml:88).
+			 *
+			 * The nine vdd*-supply rails the binding requires are NOT
+			 * here: none of the seven vendor rails this board uses
+			 * (live:34681-34694: vdd-wlan -> S1G, -io -> L3G, -io12 ->
+			 * L2G, -dig -> S3B, -rfa1 -> S1B, -rfa2 -> S2B, -ant-share
+			 * -> L6K) is declared in meizu-m2582-regulators.dtsi, and
+			 * the vendor's seven names are not mainline's nine (there
+			 * is no vdddig upstream, and no vddpcie0p9/vddpcie1p8
+			 * split), so no phandle can be given without inventing one.
+			 * ath12k itself has no regulator consumer at all -- no
+			 * devm_regulator* call exists in
+			 * drivers/net/wireless/ath/ath12k/ -- so the supplies are
+			 * schema annotation only and their absence cannot stop the
+			 * probe.
+			 *
+			 * The vendor's GPIOs are recorded here because they have no
+			 * mainline home and are the first thing anyone porting
+			 * cnss2 or writing a pwrseq driver will need: WLAN enable is
+			 * TLMM 35, the coex handshake is TLMM 80 (SW_CTRL) and TLMM
+			 * 34 (WLAN_SW_CTRL), the BT enable is PM8550VS-G GPIO 4
+			 * (live:34709-34713).  Nothing reads these properties
+			 * today; they are not part of qcom,ath12k.yaml.  Consequence
+			 * for bring-up: nothing in this tree ever raises WLAN_EN, so
+			 * the endpoint only powers up if the bootloader left the
+			 * line high.
+			 */
+			wifi@0 {
+				compatible = "pci17cb,1107";
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+				/*
+				 * The nine supplies qcom,ath12k.yaml makes
+				 * mandatory.  They are the WCN7750's *internal*
+				 * PMU outputs, so their handles can only come
+				 * from the wcn7850-pmu node above, not from a
+				 * board rail.
+				 *
+				 * ath12k never reads them -- no devm_regulator*
+				 * call exists anywhere under
+				 * drivers/net/wireless/ath/ath12k/ -- and the
+				 * ldo nodes in that PMU node have no compatible
+				 * for a provider to bind to either, so no
+				 * regulator device is ever registered for them
+				 * and even a hypothetical consumer would get
+				 * -EPROBE_DEFER rather than a rail it could
+				 * enable.  They are declared because the binding
+				 * requires them and because they are the only
+				 * place the vendor's own rail split is written
+				 * down; they do not power anything.
+				 *
+				 * What powers the part is the three board rails
+				 * (meizu-m2582-regulators.dtsi, always-on) plus
+				 * the wlan_en regulator above.
+				 */
+				vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;
+				vddaon-supply = <&vreg_pmu_aon_0p59>;
+				vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
+				vddwlmx-supply = <&vreg_pmu_wlmx_0p85>;
+				vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+				vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+				vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
+				vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+				vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
+
+				/*
+				 * The vendor's GPIOs have no mainline home and
+				 * are NOT properties of this binding
+				 * (qcom,ath12k.yaml ends with
+				 * additionalProperties: false), so they are
+				 * recorded here as a comment rather than as
+				 * properties; anything that needs them later
+				 * (a cnss2 port, a pwrseq consumer) has to add
+				 * them to its own node.
+				 *
+				 *	WLAN enable	TLMM 35, active high
+				 *	coex handshake	TLMM 80 (SW_CTRL)
+				 *			TLMM 34 (WLAN_SW_CTRL)
+				 *	BT enable	PM8550VS-G gpio 4
+				 *
+				 * They are deliberately not claimed by the
+				 * wcn7850-pmu node either: the WLAN line is
+				 * already owned by the wlan_en fixed regulator
+				 * above (which is what actually raises it, and
+				 * the pwrseq driver would leave it alone anyway
+				 * -- it takes it GPIOD_ASIS on purpose,
+				 * pwrseq-qcom-wcn.c:499-523), and the BT line is
+				 * owned by the bluetooth node's enable-gpios.  A
+				 * second gpiod_get() on either would fail with
+				 * -EBUSY (gpiolib.c:2598) and take the PMU node's
+				 * probe down with it.
+				 */
+			};
+		};
+	};
+};
+
+/*
+ * The PHY's PIPE clock reaches the controller through GCC's
+ * gcc_pcie_0_pipe_clk mux, and gcc-tuna.c:246 looks that mux's first parent up
+ * by fw_name "pcie_0_pipe_clk" -- so the name has to appear in this node's
+ * clock-names with the PHY as its provider, or the mux selects nothing and the
+ * controller has no PIPE clock to train with.  That is the same shape the UFS
+ * PHY already uses here (tuna.dtsi:143-144 lists <&ufsphy_mem 0..2>), and it is
+ * safe with respect to probe order: CCF resolves a parent_data fw_name lazily
+ * and orphans the clock rather than failing the provider
+ * (drivers/clk/clk.c:509-533, clk_core_populate_parent_map()), so GCC still
+ * probes before the PHY does.
+ *
+ * The six existing entries are repeated verbatim; a DT property cannot be
+ * appended to.  Nothing else in the tree overrides this node.
+ */
+&gcc {
+	clocks = <&bi_tcxo>, <&sleep_clk>,
+		 <&ufsphy_mem 0>, <&ufsphy_mem 1>, <&ufsphy_mem 2>,
+		 <&usb3_phy_wrapper_clk>,
+		 <&pcie0_phy>;
+	clock-names = "bi_tcxo", "sleep_clk", "ufs_phy_rx_symbol_0_clk",
+		      "ufs_phy_rx_symbol_1_clk", "ufs_phy_tx_symbol_0_clk",
+		      "usb3_phy_wrapper_gcc_usb30_pipe_clk",
+		      "pcie_0_pipe_clk";
+};
+
+/*
+ * The four pad states the vendor gives the controller (live:6204-6264), with
+ * the same pins, functions, drive strengths and biases.  gpio33 is PERST#,
+ * gpio81 is WAKE#, and gpio118 is CLKREQ# -- the vendor names the function
+ * pcie0_clk_req_n, which pinctrl-tuna.c:2117 defines for that pin; the sleep
+ * state hands it back to plain gpio with the pad pulled up and readable,
+ * exactly as the vendor does.  bias-pull-down on PERST# is what holds the
+ * endpoint in reset while the host is not driving the line.
+ */
+&tlmm {
+	pcie0_perst_default: pcie0-perst-default-state {
+		pins = "gpio33";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	pcie0_clkreq_default: pcie0-clkreq-default-state {
+		pins = "gpio118";
+		function = "pcie0_clk_req_n";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	pcie0_clkreq_sleep: pcie0-clkreq-sleep-state {
+		pins = "gpio118";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	pcie0_wake_default: pcie0-wake-default-state {
+		pins = "gpio81";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};

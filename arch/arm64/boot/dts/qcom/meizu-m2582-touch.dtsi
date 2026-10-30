@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Touchscreen -- Meizu 22 (M2582 / SM8735)
+ *
+ * The part is a Synaptics TCM controller on SPI, not the ST FTS on I2C that an
+ * earlier attempt assumed.  Three independent sources say so, and they agree:
+ *
+ *  - the phone's runtime device tree (artifacts/meizu22/android-live-ON/
+ *    live-fdt.dts): spi@a90000 with a child at chip select 0 whose compatible
+ *    is "synaptics,tcm-spi";
+ *  - the running Android stack (artifacts/meizu22/android-peripherals-runtime
+ *    .txt): /sys/bus/spi/devices/spi4.0/of_node/compatible is that same string
+ *    and the driver bound to it is synaptics_tcm2_ts;
+ *  - the vendor kernel log of that boot: syna_tcm_* messages, and none from
+ *    any other touch driver.
+ *
+ * The overlay that selects it is the one for this board id (board-id <0x0b 1>,
+ * meizu,board-id <2 5>), and it explicitly disables the ST node -- which is why
+ * the ST part looked plausible: it is in the tree, it is just turned off, on a
+ * different board variant.
+ *
+ * The bus is SE4 of QUPV3 wrapper 1, which is the one engine on this board the
+ * bootloader already leaves programmed the way we need it: it comes out as SPI.
+ *
+ * Pads: gpio16..19 as qup1_se4_l0..l3 (miso, mosi, clk, cs) -- the numbers
+ * tuna-i2c.dtsi's header table already recorded for SE4.  An earlier version of
+ * the touch node claimed gpio36/37 for them; those belong to SE11.
+ *
+ * The reset line and the interrupt are gpio189 and gpio176, both from the
+ * runtime tree (the interrupt there is <&tlmm 0xb0 0x2008>, i.e. level low).
+ *
+ * mainline has no TCM driver yet -- this tree carries a ported one; see
+ * drivers/input/touchscreen/synaptics_tcm*.c.
+ *
+ * DMA: this bus cannot work without it.  The serial engine reports
+ * FIFO_IF_DISABLE in its GENI_IF_DISABLE_RO register, so spi-geni's fallback to
+ * FIFO mode programs an interface the hardware does not have, and the first
+ * transfer then times out -- measured on the board, not inferred: "FIFO mode
+ * disabled, but couldn't get DMA, fall back to FIFO mode", then two
+ * "SPI transfer timed out" and a -110 identify failure.  The three cells are
+ * the vendor's own, decoded from its dmas = <&gpi_dma1 0 4 1 0x40 2> on this
+ * node (live-fdt.dts:20814): channel (0 tx, 1 rx), the serial engine's index
+ * inside the wrapper -- 4, which is SE4 -- and the protocol, which mainline
+ * spells QCOM_GPI_SPI.  The provider, its channel mask and the wrapper's iommu
+ * stream are in tuna.dtsi.
+ */
+
+#include <dt-bindings/dma/qcom-gpi.h>
+
+&qupv3_1 {
+	spi4: spi@a90000 {
+		compatible = "qcom,geni-spi";
+		reg = <0 0x00a90000 0 0x4000>;
+		interrupts = <GIC_SPI 357 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&gcc GCC_QUPV3_WRAP1_S4_CLK>;
+		clock-names = "se";
+		interconnects = <&clk_virt MASTER_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS
+				 &clk_virt SLAVE_QUP_CORE_1 QCOM_ICC_TAG_ALWAYS>,
+				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
+		interconnect-names = "qup-core", "qup-config";
+		dmas = <&gpi_dma1 0 4 QCOM_GPI_SPI>,
+		       <&gpi_dma1 1 4 QCOM_GPI_SPI>;
+		dma-names = "tx", "rx";
+		status = "disabled";
+	};
+};
+
+/*
+ * The four pads are the values the vendor's own active state uses
+ * (drive-strength 6, no bias); its weaker pull-up variants are the sleep and
+ * init states, which mainline does not express as separate states here.
+ */
+&tlmm {
+	qup1_spi4_miso: qup1-spi4-miso-state {
+		pins = "gpio16";
+		function = "qup1_se4_l0";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	qup1_spi4_mosi: qup1-spi4-mosi-state {
+		pins = "gpio17";
+		function = "qup1_se4_l1";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	qup1_spi4_clk: qup1-spi4-clk-state {
+		pins = "gpio18";
+		function = "qup1_se4_l2";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	qup1_spi4_cs: qup1-spi4-cs-state {
+		pins = "gpio19";
+		function = "qup1_se4_l3";
+		drive-strength = <6>;
+		bias-disable;
+	};
+
+	ts_int_default: ts-int-default-state {
+		pins = "gpio176";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+		input-enable;
+	};
+
+	ts_reset_default: ts-reset-default-state {
+		pins = "gpio189";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+};
+
+&spi4 {
+	status = "okay";
+
+	/*
+	 * The gate is on the bus: what makes this subsystem risky is the serial
+	 * engine's protocol, and the bus driver's probe is what sets it.
+	 */
+	m2582,feature = "touch";
+
+	pinctrl-names = "default";
+	pinctrl-0 = <&qup1_spi4_miso>, <&qup1_spi4_mosi>,
+		    <&qup1_spi4_clk>, <&qup1_spi4_cs>;
+
+	touchscreen@0 {
+		compatible = "synaptics,tcm-spi";
+		reg = <0>;
+
+		spi-max-frequency = <15000000>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <176 IRQ_TYPE_LEVEL_LOW>;
+
+		reset-gpios = <&tlmm 189 GPIO_ACTIVE_LOW>;
+
+		vdd-supply = <&vreg_ldod1>;
+		avdd-supply = <&vreg_ldob22>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&ts_int_default>, <&ts_reset_default>;
+
+		/* The vendor's firmware image, from the factory vendor.img. */
+		firmware-name = "synaptics/firmware.img";
+	};
+};

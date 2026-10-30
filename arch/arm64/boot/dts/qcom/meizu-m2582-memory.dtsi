@@ -37,6 +37,7 @@
 			ftrace-size = <0>;
 			mem-type = <0>;
 		};
+
 		m2582-marker@bffffe000 {
 			reg = <0x0b 0xffffe000 0x0 0x1000>;
 			no-map;
@@ -86,9 +87,37 @@
 			reg = <0x0 0x81cf4000 0x0 0x1000>;
 			no-map;
 		};
-		smem-region@81d00000 {
+		/*
+		 * SMEM, shared with the ADSP and the modem.  It needs the TCSR
+		 * mutex block (hwlock 3) as much as it needs the window: without
+		 * the locks the other side cannot take its turn, and the smem
+		 * driver refuses to probe at all ("failed to get hwlock").
+		 */
+		smem: smem@81d00000 {
+			compatible = "qcom,smem";
 			reg = <0x0 0x81d00000 0x0 0x200000>;
 			no-map;
+			/*
+			 * No hwlocks here, deliberately.  The lock lives in the
+			 * TCSR mutex block, and taking lock 3 there takes this
+			 * board down: with the vendor's own stride (0x1000, as
+			 * its device tree states) the AXI bus stalls; with the
+			 * 0x80 variant it resets in a loop.  SMEM itself is fine
+			 * -- the same boot with the mutex provider absent comes
+			 * up normally.  The cost is that heap allocation is not
+			 * serialised with the ADSP, which the smem driver now
+			 * says out loud at probe.
+			 */
+
+			/*
+			 * Its own switch, separate from the rest of the ADSP:
+			 * reaching SMEM means taking the TCSR mutex, and the
+			 * TCSR block is the one this board has hung the AXI bus
+			 * on before (see the TCSRCC note in build_kernel.sh).
+			 * Keeping it separable is what lets a boot prove or
+			 * disprove that with one flash instead of a bisect.
+			 */
+			m2582,feature = "adsp-smem";
 		};
 		cpucp-scandump-region@82200000 {
 			reg = <0x0 0x82200000 0x0 0x180000>;
@@ -182,15 +211,21 @@
 			reg = <0x0 0x99d00000 0x0 0x80000>;
 			no-map;
 		};
-		q6-adsp-dtb-region@99d80000 {
+		/*
+		 * The two regions the ADSP is authenticated into: the firmware
+		 * itself (adspslpi, 50 MB) and the device tree blob the ADSP
+		 * side runs on (0x80000, loaded through its own PAS id).
+		 */
+		adsp_dtb_mem: q6-adsp-dtb-region@99d80000 {
 			reg = <0x0 0x99d80000 0x0 0x80000>;
 			no-map;
 		};
-		adspslpi-region@99e00000 {
+		adsp_mem: adspslpi-region@99e00000 {
 			reg = <0x0 0x99e00000 0x0 0x3200000>;
 			no-map;
 		};
-		wlan-msa-region@a6400000 {
+		/* The WLAN's MSA (firmware) region; see the WiFi node. */
+		wlan_msa_mem: wlan-msa-region@a6400000 {
 			reg = <0x0 0xa6400000 0x0 0xc00000>;
 			no-map;
 		};

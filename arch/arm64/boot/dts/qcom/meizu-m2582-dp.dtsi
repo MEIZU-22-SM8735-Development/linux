@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * M2582: DisplayPort output over the USB-C connector.
+ *
+ * The controller sits at 0x0af54000, the same block mainline drives as
+ * qcom,sm8650-dp, and there is no separate DP PHY on this board: DP is the
+ * second half of the USB3/DP combo QMP PHY that tuna-usb.dtsi already has.
+ * What the board adds on top of that is the AUX/SBU steering, which is three
+ * TLMM pins rather than an I2C part (live-fdt.dts:33561-33609).
+ *
+ * Values come from the running device tree of this handset
+ * (artifacts/meizu22/android-live-ON/live-fdt.dts); vendor-ref/factory is a
+ * different board's base DTB and is not a source for anything here.
+ */
+#include <dt-bindings/phy/phy-qcom-qmp.h>
+
+/*
+ * DPU/DP link. The DPU does not look up the controller by name: it walks its
+ * own ports' remote endpoints and pulls the remote node in as a DRM component
+ * (msm_drv.c:912-956 add_mdp_components()). Which interface it then drives
+ * comes from the catalog entry, not the port number -- tuna's intf_0 is
+ * already INTF_DP / MSM_DP_CONTROLLER_0 (dpu_12_3_tuna.h:298-306). port@2 for
+ * intf0 mirrors sm8650.dtsi:5664-5670.
+ */
+&mdss_mdp {
+	ports {
+		port@2 {
+			reg = <2>;
+
+			dpu_intf0_out: endpoint {
+				remote-endpoint = <&mdss_dp0_in>;
+			};
+		};
+	};
+};
+
+/*
+ * USB2 side of the connector. The factory tree has the same endpoint on the
+ * ssusb node (live-fdt.dts:20501, aliased as usb_port0 at :36285); the
+ * usb-connector binding requires a port@0 on a connector that has ports, and
+ * this is the only HS bus this board has. Nothing consumes it under mainline
+ * (CONFIG_USB_ROLE_SWITCH is off), it is here to complete the connector.
+ */
+&usb {
+	port {
+		usb_dwc3_hs: endpoint {
+			remote-endpoint = <&pmic_glink_hs_in>;
+		};
+	};
+};
+
+&mdss {
+	mdss_dp0: displayport-controller@af54000 {
+		compatible = "qcom,tuna-dp";
+
+		/*
+		 * The five windows the vendor names dp_ahb..dp_p1
+		 * (live-fdt.dts:33596-33597). Seven of its twelve entries are not
+		 * listed on purpose: dp_phy/dp_ln_tx0/dp_ln_tx1/dp_pll/usb3_dp_com
+		 * all live inside the combo PHY's own window (tuna-usb.dtsi:191) and
+		 * hdcp_physical/gdsc have no mainline counterpart. Mainline maps only
+		 * the first four (dp_display.c:1090-1125) and no reg-names, which
+		 * the binding does not allow anyway (dp-controller.yaml:351).
+		 */
+		reg = <0 0x0af54000 0 0x104>,	/* dp_ahb */
+		      <0 0x0af54200 0 0x0c0>,	/* dp_aux */
+		      <0 0x0af55000 0 0x770>,	/* dp_link */
+		      <0 0x0af56000 0 0x09c>,	/* dp_p0 */
+		      <0 0x0af57000 0 0x09c>;	/* dp_p1 */
+
+		/*
+		 * hwirq 12 of the MDSS interrupt domain: the factory node asks its
+		 * parent for <0x0c 0x00> (live-fdt.dts:33594-33595), the domain is
+		 * one cell wide (tuna-display.dtsi:63-64) and sm8650 uses the same
+		 * number (sm8650.dtsi:5881). Hence interrupts-extended, not the
+		 * two-cell "interrupts" form.
+		 */
+		interrupts-extended = <&mdss 12>;
+
+		/*
+		 * The factory names thirteen clocks (live-fdt.dts:33591-33592);
+		 * eight of them are dispcc cells that decode exactly onto
+		 * qcom,dispcc-tuna.h and six onto the names below --
+		 * core_aux_clk=19, link_clk=22, link_iface_clk=25,
+		 * strm0_pixel_clk=26, strm1_pixel_clk=28 (:29-38), plus the AHB
+		 * clock for core_iface. The *_src cells are the assigned-clocks.
+		 * The rest (rpmh_cxo, tcsr ref, gcc pipe) are the combo PHY's own
+		 * clocks, not the controller's.
+		 */
+		clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
+			 <&dispcc DISP_CC_MDSS_DPTX0_AUX_CLK>,
+			 <&dispcc DISP_CC_MDSS_DPTX0_LINK_CLK>,
+			 <&dispcc DISP_CC_MDSS_DPTX0_LINK_INTF_CLK>,
+			 <&dispcc DISP_CC_MDSS_DPTX0_PIXEL0_CLK>,
+			 <&dispcc DISP_CC_MDSS_DPTX0_PIXEL1_CLK>;
+		clock-names = "core_iface", "core_aux", "ctrl_link",
+			      "ctrl_link_iface", "stream_pixel", "stream_1_pixel";
+
+		/*
+		 * The link and pixel clock sources take their parent from the combo
+		 * PHY's DP PLL, which is where the vendor's separate sde_dp_pll
+		 * node went: mainline has no driver for "qcom,dp-pll-4nm-v1.1"
+		 * (live-fdt.dts:33555-33559), the PHY exports the same two clocks
+		 * as cells 1 and 2 (phy-qcom-qmp.h:13-14) and dispcc carries them
+		 * by name (tuna-display.dtsi:27-33).
+		 */
+		assigned-clocks = <&dispcc DISP_CC_MDSS_DPTX0_LINK_CLK_SRC>,
+				  <&dispcc DISP_CC_MDSS_DPTX0_PIXEL0_CLK_SRC>,
+				  <&dispcc DISP_CC_MDSS_DPTX0_PIXEL1_CLK_SRC>;
+		assigned-clock-parents = <&usb_qmpphy QMP_USB43DP_DP_LINK_CLK>,
+					 <&usb_qmpphy QMP_USB43DP_DP_VCO_DIV_CLK>,
+					 <&usb_qmpphy QMP_USB43DP_DP_VCO_DIV_CLK>;
+
+		/*
+		 * Optional to probe but not to behave correctly: without a table
+		 * dev_pm_opp_set_rate() is a no-op (dp_ctrl.c:2736-2739) and the
+		 * MMCX vote never follows the link rate. The four rates are the DP
+		 * link rates; the corners are the ones this board's rpmhpd table
+		 * actually defines (tuna.dtsi:676-683) -- the factory tree states
+		 * no levels at all and sm8650's low_svs_d1 corner does not exist
+		 * here.
+		 */
+		operating-points-v2 = <&dp_opp_table>;
+
+		/*
+		 * The rest of the factory node's supplies are the PHY's, already
+		 * held there: vdda-0p9/vdda-1p2 land on PMXR2230 L4 and the
+		 * usb3 GDSC is the PHY's power domain (tuna-usb.dtsi:306-315). The
+		 * DP driver itself takes no regulator at all, and vdda-0p9-supply /
+		 * vdda-1p2-supply are deprecated in the binding
+		 * (dp-controller.yaml:143-146).
+		 */
+		power-domains = <&rpmhpd RPMHPD_MMCX>;
+
+		/* QMP_USB43DP_DP_PHY = 1; the PHY node is tuna-usb.dtsi:189. */
+		phys = <&usb_qmpphy QMP_USB43DP_DP_PHY>;
+		phy-names = "dp";
+
+		/* Required for a non-eDP compatible (dp-controller.yaml:205-226). */
+		#sound-dai-cells = <0>;
+
+		/*
+		 * The board's AUX switch, to the extent mainline can express it:
+		 * the factory drives TLMM 130 (aux-en, active low) and TLMM 79
+		 * (the USB-C debug-UART / D+/D- mux) as its mdss_dp_active state
+		 * (live-fdt.dts:7491-7537), which is what these two states do.
+		 * The third pin, TLMM 149, is a plain GPIO in the factory tree
+		 * (qcom,aux-sel-gpio, live-fdt.dts:33608-33609) and mainline parses
+		 * neither that property nor qcom,dp-gpio-aux-switch, so it stays in
+		 * its reset state; see artifacts/meizu22/dp-implementation-report.md.
+		 */
+		pinctrl-names = "default";
+		pinctrl-0 = <&dp_aux_enable>, <&dp_uart_disable>;
+
+		/*
+		 * The subsystem switch; see arch/arm64/kernel/meizu-m2582-features.c.
+		 * Only this node is gated, so a boot without the feature leaves the
+		 * panel, the combo PHY and USB3 exactly as they were.
+		 */
+		m2582,feature = "dp";
+		status = "okay";
+
+		dp_opp_table: opp-table {
+			compatible = "operating-points-v2";
+
+			opp-162000000 {
+				opp-hz = /bits/ 64 <162000000>;
+				required-opps = <&rpmhpd_opp_low>;
+			};
+
+			opp-270000000 {
+				opp-hz = /bits/ 64 <270000000>;
+				required-opps = <&rpmhpd_opp_svs>;
+			};
+
+			opp-540000000 {
+				opp-hz = /bits/ 64 <540000000>;
+				required-opps = <&rpmhpd_opp_svs_l1>;
+			};
+
+			opp-810000000 {
+				opp-hz = /bits/ 64 <810000000>;
+				required-opps = <&rpmhpd_opp_nom>;
+			};
+		};
+
+		/*
+		 * port@0 is the DPU link, port@1 goes to the combo PHY's DP port
+		 * and carries the lane count dp_link.c reads from endpoint 0 of
+		 * port 1 (dp_link.c:1300-1307). The PHY's port@0 completes the
+		 * chain to the connector's HPD bridge (tuna-usb.dtsi:376-398).
+		 */
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				mdss_dp0_in: endpoint {
+					remote-endpoint = <&dpu_intf0_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				mdss_dp0_out: endpoint {
+					data-lanes = <0 1 2 3>;
+					remote-endpoint = <&usb_qmpphy_dp_in>;
+				};
+			};
+		};
+	};
+};
+
+&tlmm {
+	/* Factory mdss_dp_active, part 1: TLMM 79 high, debug UART off. */
+	dp_uart_disable: dp-uart-disable-state {
+		pins = "gpio79";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-high;
+	};
+
+	/* Factory mdss_dp_active, part 2: TLMM 130 low, AUX path enabled. */
+	dp_aux_enable: dp-aux-enable-state {
+		pins = "gpio130";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+};

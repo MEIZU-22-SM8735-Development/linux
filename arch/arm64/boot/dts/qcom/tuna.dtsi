@@ -9,6 +9,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/interconnect/qcom,tuna.h>
+#include <dt-bindings/mailbox/qcom-ipcc.h>
 #include <dt-bindings/phy/phy-qcom-qmp.h>
 #include <dt-bindings/interconnect/qcom,icc.h>
 #include <dt-bindings/power/qcom,rpmhpd.h>
@@ -175,6 +176,167 @@
 			mboxes = <&ipcc_mproc 0 0>;
 			#power-domain-cells = <1>;
 			#clock-cells = <0>;
+		};
+
+		/*
+		 * The TCSR mutex block, whose locks are what makes SMEM readable by
+		 * more than one processor at a time -- the smem node below names one
+		 * of them.  The factory tree splits this into a bare "syscon" node
+		 * plus a qcom,tcsr-mutex node pointing at it, which is the vendor
+		 * kernel's idiom; the window is the same 0x1f40000/0x20000 that other
+		 * SoCs of this generation use, so the mainline form with reg is used
+		 * here.
+		 */
+		tcsr_mutex: hwlock@1f40000 {
+			/*
+			 * Never enabled: nothing may touch this block until what
+			 * makes it reachable is understood.  Measured, with SMEM
+			 * as the only consumer:
+			 *
+			 *   stride 0x1000 (the generic value, and the one the
+			 *   factory tree states through its syscon window
+			 *   <&tcsr_mutex_block 0x00 0x1000>) -> AXI bus stall,
+			 *   no USB, hard power cycle needed
+			 *   stride 0x80  (qcom,msm8226-tcsr-mutex) -> reset loop
+			 *   no provider   (SMEM alone)                -> boots
+			 *
+			 * So the layout is not the question; the block is simply
+			 * not reachable from this kernel the way it is from the
+			 * vendor's.  SMEM therefore runs without its hwlock for
+			 * now -- see meizu-m2582-memory.dtsi and the note in
+			 * drivers/soc/qcom/smem.c.
+			 */
+			compatible = "qcom,tcsr-mutex";
+			reg = <0 0x01f40000 0 0x20000>;
+			#hwlock-cells = <1>;
+
+		/*
+		 * Its own switch, separate from SMEM's: the hwspinlock driver
+		 * touches no register at probe, but SMEM's probe takes lock 3,
+		 * and taking it is the first access to this block.  Keeping the
+		 * two separable is what lets a boot say which of them stalls.
+		 */
+		m2582,feature = "adsp-mutex";
+		};
+
+		/*
+		 * SMP2P, one node per remote processor.  The ADSP one carries the
+		 * "master-kernel"/"slave-kernel" entries the ADSP's remoteproc uses
+		 * for its handshake and stop acknowledgement.  qcom,smem = <443>,
+		 * <429> and client 3 / signal 2 on the IPCC are the factory tree's
+		 * values (its interrupt specifier is written as <3 2 1>).
+		 */
+		smp2p_adsp: smp2p-adsp {
+			compatible = "qcom,smp2p";
+
+			/*
+			 * Its own switch, not "adsp": the on-device bisect hangs
+			 * on the full ADSP set even with the TCSR mutex left out,
+			 * so the pieces have to be separable to find out which.
+			 */
+			m2582,feature = "adsp-smp2p";
+
+			interrupts-extended = <&ipcc_mproc IPCC_CLIENT_LPASS
+					       IPCC_MPROC_SIGNAL_SMP2P
+					       IRQ_TYPE_EDGE_RISING>;
+			mboxes = <&ipcc_mproc IPCC_CLIENT_LPASS
+				  IPCC_MPROC_SIGNAL_SMP2P>;
+
+			qcom,smem = <443>, <429>;
+			qcom,local-pid = <0>;
+			qcom,remote-pid = <2>;
+
+			smp2p_adsp_out: master-kernel {
+				qcom,entry-name = "master-kernel";
+				#qcom,smem-state-cells = <1>;
+			};
+
+			smp2p_adsp_in: slave-kernel {
+				qcom,entry-name = "slave-kernel";
+				interrupt-controller;
+				#interrupt-cells = <2>;
+			};
+		};
+
+		/*
+		 * The ADSP itself.  Address, interface identifier and the interrupt
+		 * map are the device's own runtime device tree (its node is
+		 * remoteproc-adsp@03000000, compatible "qcom,tuna-adsp-pas", with the
+		 * watchdog on PDC interrupt 6 and the other five on the SMP2P
+		 * slave-kernel entries 0, 2, 1, 3 and 7 in that order).
+		 *
+		 * Where the factory tree supplies the LPI CX and MX rails as
+		 * regulators (cx-supply/mx-supply, reg-names "cx"/"mx"), the board
+		 * file does the same; mainline's PAS driver calls the second one
+		 * "px".  There are no power domains here on purpose: the vendor's own
+		 * resource table for this SoC carries no proxy power domain names,
+		 * and its device tree votes the two ARC level rails instead.
+		 *
+		 * Disabled by default: the board enables it, and the firmware it
+		 * loads is not in the initramfs.
+		 */
+		remoteproc_adsp: remoteproc@3000000 {
+			compatible = "qcom,tuna-adsp-pas";
+			reg = <0 0x03000000 0 0x10000>;
+
+			interrupts-extended = <&pdc 6 IRQ_TYPE_EDGE_RISING>,
+					      <&smp2p_adsp_in 0 IRQ_TYPE_EDGE_RISING>,
+					      <&smp2p_adsp_in 2 IRQ_TYPE_EDGE_RISING>,
+					      <&smp2p_adsp_in 1 IRQ_TYPE_EDGE_RISING>,
+					      <&smp2p_adsp_in 3 IRQ_TYPE_EDGE_RISING>,
+					      <&smp2p_adsp_in 7 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "wdog", "fatal", "handover", "ready",
+					  "stop-ack", "shutdown-ack";
+
+			clocks = <&rpmhcc RPMH_CXO_CLK>;
+			clock-names = "xo";
+
+			qcom,qmp = <&aoss_qmp>;
+
+			qcom,smem-states = <&smp2p_adsp_out 0>;
+			qcom,smem-state-names = "stop";
+
+			status = "disabled";
+
+			remoteproc_adsp_glink: glink-edge {
+				interrupts-extended = <&ipcc_mproc IPCC_CLIENT_LPASS
+						       IPCC_MPROC_SIGNAL_GLINK_QMP
+						       IRQ_TYPE_EDGE_RISING>;
+				mboxes = <&ipcc_mproc IPCC_CLIENT_LPASS
+					  IPCC_MPROC_SIGNAL_GLINK_QMP>;
+
+				label = "lpass";
+				qcom,remote-pid = <2>;
+
+				/*
+				 * The two channels the charger and the Type-C
+				 * port manager ride on.  Naming them here is what
+				 * gives the rpmsg devices they turn into a device
+				 * node; the channel names themselves come from the
+				 * ADSP.
+				 */
+				/*
+				 * The protection-domain mapper answers the ADSP's
+				 * service lookups over IPCRTR.  Without this channel
+				 * the PMIC services are announced but never granted:
+				 * reading the battery's capacity comes back EAGAIN.
+				 * Channel name and intents are the factory tree's.
+				 */
+				ipcrtr: glink-channel {
+					qcom,glink-channels = "IPCRTR";
+					qcom,intents = <0x800 0x05
+							0x2000 0x03
+							0x4400 0x02>;
+				};
+
+				pmic_glink_rpmsg: pmic-glink-rpmsg {
+					qcom,glink-channels = "PMIC_RTR_ADSP_APPS";
+				};
+
+				pmic_glink_log_rpmsg: pmic-glink-log-rpmsg {
+					qcom,glink-channels = "PMIC_LOGS_ADSP_APPS";
+				};
+			};
 		};
 
 		/*
@@ -405,6 +567,70 @@
 			ranges;
 		};
 
+		/*
+		 * GPI DMA for QUPV3 wrapper 1, the one the touchscreen's SPI bus
+		 * (SE4) belongs to.  It is not optional on this board: the serial
+		 * engines report FIFO_IF_DISABLE in GENI_IF_DISABLE_RO, so the
+		 * FIFO interface does not exist and every transfer has to go
+		 * through the GPI.  Without this node spi-geni warns
+		 * "FIFO mode disabled, but couldn't get DMA, fall back to FIFO
+		 * mode" and then times out on the first transfer -- measured, not
+		 * inferred.
+		 *
+		 * Every value is the phone's own, from its runtime device tree
+		 * (artifacts/meizu22/android-live-ON/live-fdt.dts:20570-20586,
+		 * gpi-dma@a00000): window 0xa00000+0x60000, twelve GPIIs, twelve
+		 * interrupts, iommu stream 0xb6, EE offset 0x10000.  Each of them
+		 * is also what sm8650.dtsi:2850-2874 carries for the same block --
+		 * and that is the point of the pair of sources: the vendor says
+		 * what this board uses, the sibling SoC says which mainline
+		 * compatible and property names express it.
+		 *
+		 * "qcom,sm6350-gpi-dma" is what supplies the 0x10000 EE offset
+		 * (gpi.c:2300, gpi.c:2193 subtracts it), and the vendor declares
+		 * exactly that value as qcom,gpi-ee-offset.
+		 *
+		 * The channel mask is the vendor's qcom,gpii-mask, not sm8650's:
+		 * it says which GPII instances this firmware lets the APPS EE use
+		 * (0x1e -- one through four), and its sibling qcom,static-gpii-mask
+		 * <1> is the GPII reserved for a static EE, which is why bit 0 is
+		 * clear here.  gpi_of_dma_xlate() picks the first free instance in
+		 * the mask, so a mask that omits the instance the firmware
+		 * reserved elsewhere costs a channel, not a register write.
+		 *
+		 * No feature gate and no status property: gpi_probe() ioremaps the
+		 * window, requests the interrupts and registers with dmaengine
+		 * without reading or writing a single register (gpi.c:2167-2290),
+		 * so an unused GPI DMA controller is inert, and both the
+		 * touchscreen now and the I2C buses later need the same provider.
+		 */
+		gpi_dma1: dma-controller@a00000 {
+			compatible = "qcom,sm8650-gpi-dma", "qcom,sm6350-gpi-dma";
+			reg = <0 0x00a00000 0 0x60000>;
+
+			interrupts = <GIC_SPI 279 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 280 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 281 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 282 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 283 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 284 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 293 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 294 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 295 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 296 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 297 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 298 IRQ_TYPE_LEVEL_HIGH>;
+
+			dma-channels = <12>;
+			dma-channel-mask = <0x1e>;
+			#dma-cells = <3>;
+
+			iommus = <&apps_smmu 0xb6 0>;
+			dma-coherent;
+
+			status = "okay";
+		};
+
 		qupv3_1: geniqup@ac0000 {
 			compatible = "qcom,geni-se-qup";
 			reg = <0 0x00ac0000 0 0x2000>;
@@ -413,6 +639,21 @@
 			#address-cells = <2>;
 			#size-cells = <2>;
 			ranges;
+
+			/*
+			 * The wrapper is the DMA master for its serial engines:
+			 * spi-geni maps its buffers with the *parent* device
+			 * (spi-geni-qcom.c:1103, spi->dma_map_dev = dev->parent),
+			 * so this is the stream id those mappings are made under,
+			 * and without it they would be raw physical addresses that
+			 * the GPI -- which reaches memory through its own stream id
+			 * above -- cannot follow.
+			 *
+			 * 0xa3 is the vendor's own value for this wrapper
+			 * (live-fdt.dts:20600) and sm8650.dtsi:2890's.
+			 */
+			iommus = <&apps_smmu 0xa3 0>;
+			dma-coherent;
 
 			uart7: serial@a9c000 {
 				compatible = "qcom,geni-debug-uart";

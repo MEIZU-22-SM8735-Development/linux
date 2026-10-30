@@ -30,6 +30,7 @@ properties:
           - qcom,sdm845-dp
           - qcom,sm8350-dp
           - qcom,sm8650-dp
+          - qcom,tuna-dp
           - qcom,x1e80100-dp
 
       - items:
