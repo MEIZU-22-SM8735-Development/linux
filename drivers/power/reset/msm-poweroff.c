@@ -125,24 +125,39 @@ static int msm_restart_probe(struct platform_device *pdev)
 	 */
 	pon = of_parse_phandle(pdev->dev.of_node, "qcom,pon", 0);
 	if (pon) {
-		struct platform_device *pmic;
+		struct platform_device *pon_pdev;
 		u32 pbs[2];
 
 		if (!of_property_read_u32_array(pon, "reg", pbs, 2))
 			ps->pbs_base = pbs[1];
 
-		pmic = of_find_device_by_node(of_get_parent(pon));
-		if (pmic)
-			ps->pon_regmap = dev_get_regmap(&pmic->dev, NULL);
+		/*
+		 * The PON is a platform device whose parent is the SPMI PMIC
+		 * device, and that parent owns the regmap.  Looking the parent
+		 * up with of_find_device_by_node() does not work: it searches
+		 * the platform bus only, and an SPMI device is not on it --
+		 * which is why this driver sat in the deferred-probe list
+		 * forever on the first attempt.
+		 */
+		pon_pdev = of_find_device_by_node(pon);
+		if (pon_pdev) {
+			struct device *pmic = pon_pdev->dev.parent;
+
+			if (pmic)
+				ps->pon_regmap = dev_get_regmap(pmic, NULL);
+			put_device(&pon_pdev->dev);
+		}
 		of_node_put(pon);
 
 		/*
-		 * The PON's parent is the SPMI PMIC device, which probes on its
-		 * own schedule.  Defer rather than silently fall back to the
-		 * power-off-only path.
+		 * Defer rather than silently fall back to the power-off-only
+		 * path: releasing PS_HOLD without a configured PBS type is the
+		 * case Qualcomm's driver warns "hangs on performing reset".
 		 */
-		if (!ps->pon_regmap)
+		if (!ps->pon_regmap) {
+			dev_info(&pdev->dev, "PMIC regmap not there yet; deferring\n");
 			return -EPROBE_DEFER;
+		}
 	}
 
 	if (!ps->pon_regmap) {
