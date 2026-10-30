@@ -882,6 +882,17 @@ static const struct clk_rpmh_desc clk_rpmh_qcs615 = {
 static struct clk_hw *tuna_rpmh_clocks[] = {
 	[RPMH_CXO_CLK] = &clk_rpmh_bi_tcxo_div2.hw,
 	[RPMH_CXO_CLK_A] = &clk_rpmh_bi_tcxo_div2_ao.hw,
+	/*
+	 * The Bluetooth controller's RF reference.  The factory tree gives its
+	 * bluetooth node clocks = <&rpmhcc 6> with clock-names = "bt_rf_clk1",
+	 * and index 6 is RPMH_RF_CLK1; mainline's hci_qca asks the node for a
+	 * single (optional) clock and uses it as the controller's susclk, so
+	 * without this entry it releases the part from reset with no RF
+	 * reference at all.  The resource this votes on, "rfclka1", is in the
+	 * board's command DB, which is what makes the vote safe.
+	 */
+	[RPMH_RF_CLK1] = &clk_rpmh_rf_clk1_a.hw,
+	[RPMH_RF_CLK1_A] = &clk_rpmh_rf_clk1_a_ao.hw,
 	[RPMH_LN_BB_CLK1] = &clk_rpmh_clk6_a2.hw,
 	[RPMH_LN_BB_CLK1_A] = &clk_rpmh_clk6_a2_ao.hw,
 	[RPMH_LN_BB_CLK2] = &clk_rpmh_clk7_a2.hw,
