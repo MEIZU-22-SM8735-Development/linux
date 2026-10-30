@@ -11,6 +11,7 @@
 #include <linux/debugfs.h>
 #include <linux/kthread.h>
 #include <linux/seq_file.h>
+#include <linux/meizu-m2582.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_crtc.h>
@@ -215,6 +216,10 @@ struct dpu_encoder_virt {
 
 	/* DSC configuration */
 	struct drm_dsc_config *dsc;
+
+	/* dscstatic: retain the full-frame config between commits. */
+	bool dsc_config_valid;
+	struct drm_dsc_config dsc_last_config;
 };
 
 #define to_dpu_encoder_virt(x) container_of(x, struct dpu_encoder_virt, base)
@@ -1319,6 +1324,7 @@ void dpu_encoder_virt_runtime_resume(struct drm_encoder *drm_enc)
 	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
 
 	mutex_lock(&dpu_enc->enc_lock);
+	dpu_enc->dsc_config_valid = false;
 
 	if (!dpu_enc->enabled)
 		goto out;
@@ -1343,6 +1349,7 @@ static void dpu_encoder_virt_atomic_enable(struct drm_encoder *drm_enc,
 
 	dpu_enc = to_dpu_encoder_virt(drm_enc);
 	dpu_enc->dsc = dpu_encoder_get_dsc_config(drm_enc);
+	dpu_enc->dsc_config_valid = false;
 
 	atomic_set(&dpu_enc->frame_done_timeout_cnt, 0);
 
@@ -2036,10 +2043,13 @@ static void dpu_encoder_dsc_pipe_cfg(struct dpu_hw_ctl *ctl,
 				     struct dpu_hw_pingpong *hw_pp,
 				     struct drm_dsc_config *dsc,
 				     u32 common_mode,
-				     u32 initial_lines)
+				     u32 initial_lines,
+				     u32 slices_per_enc)
 {
+	/* the vendor's order: configure the encoder, then its thresholds */
 	if (hw_dsc->ops.dsc_config)
-		hw_dsc->ops.dsc_config(hw_dsc, dsc, common_mode, initial_lines);
+		hw_dsc->ops.dsc_config(hw_dsc, dsc, common_mode, initial_lines,
+				       slices_per_enc);
 
 	if (hw_dsc->ops.dsc_config_thresh)
 		hw_dsc->ops.dsc_config_thresh(hw_dsc, dsc);
@@ -2081,23 +2091,75 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 	}
 
 	dsc_common_mode = 0;
-	if (num_dsc > 1)
-		dsc_common_mode |= DSC_MODE_SPLIT_PANEL;
-	if (dpu_encoder_use_dsc_merge(enc_master->parent))
-		dsc_common_mode |= DSC_MODE_MULTIPLEX;
+
 	if (enc_master->intf_mode == INTF_MODE_VIDEO)
 		dsc_common_mode |= DSC_MODE_VIDEO;
 
-	num_active_ss = dsc->slice_count;
-	if (dsc_common_mode & DSC_MODE_MULTIPLEX)
-		num_active_ss = dsc->slice_count / 2;
+	/*
+	 * This panel's full-frame two-DSC path needs both topology bits: with
+	 * them DSC_CMN_MAIN_CNF is 0x83 and DSC_CFG 0x3001, while clearing them
+	 * leaves the half-panel shape (0x80 / 0x0001), which stopped the panel
+	 * scanning (about 4 fps versus 92).  The opt-out is m2582.disable=updsc;
+	 * m2582.features=mode1/mode2/mode3 isolates the individual bits.
+	 */
+	if (!m2582_feature_opt_out("updsc")) {
+		if (num_dsc > 1)
+			dsc_common_mode |= DSC_MODE_SPLIT_PANEL;
+		if (dpu_encoder_use_dsc_merge(enc_master->parent))
+			dsc_common_mode |= DSC_MODE_MULTIPLEX;
+	}
+	if (m2582_feature_opt_in("mode1"))
+		dsc_common_mode |= DSC_MODE_SPLIT_PANEL;
+	if (m2582_feature_opt_in("mode2"))
+		dsc_common_mode |= DSC_MODE_MULTIPLEX;
+	if (m2582_feature_opt_in("mode3"))
+		dsc_common_mode |= DSC_MODE_SPLIT_PANEL | DSC_MODE_MULTIPLEX;
+
+	/*
+	 * One slice per encoder: the factory reads DSC_CMN_MAIN_CNF's
+	 * slice_per_enc field as 1, and both encoders' ENC_DF_CTRL carry
+	 * initial_lines 3, which is what one active slice per encoder gives.
+	 */
+	if (!m2582_feature_opt_out("updsc")) {
+		num_active_ss = dsc->slice_count;
+		if (dsc_common_mode & DSC_MODE_MULTIPLEX)
+			num_active_ss = dsc->slice_count / 2;
+	} else {
+		num_active_ss = num_dsc ? dsc->slice_count / num_dsc : dsc->slice_count;
+	}
+	if (!num_active_ss)
+		num_active_ss = 1;
 
 	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, num_active_ss,
 							  dsc_common_mode);
 
+	/*
+	 * "dscswap": bind each encoder to the other ping-pong.  Only for the A/B:
+	 * if the damaged half follows the binding, the DSC->PPB mapping is the
+	 * problem and this is the wrong way round; if nothing changes, the
+	 * mapping is right and the fault is inside one encoder's output.
+	 */
 	for (i = 0; i < num_dsc; i++)
-		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
-					 dsc, dsc_common_mode, initial_lines);
+		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i],
+					 m2582_feature_opt_in("dscswap") ?
+						hw_pp[num_dsc - 1 - i] : hw_pp[i],
+					 dsc, dsc_common_mode, initial_lines,
+					 num_active_ss);
+
+	/*
+	 * "ppbfifo": size the ping-pong latency buffer to the factory's depth,
+	 * four lines of the mode (1200*4/num_dsc) split across the pipes.  In
+	 * command mode the interface consumes the compressed frame in bursts
+	 * while the mixer produces pixels steadily, and this FIFO absorbs the
+	 * difference; at reset it is zero deep.  Off by default because the
+	 * configuration measured working on this board (120.5 fps, no timeouts)
+	 * did not write it and inherited the bootloader's value.
+	 */
+	if (m2582_feature_opt_in("ppbfifo"))
+		for (i = 0; i < num_dsc; i++)
+			if (hw_pp[i]->ops.set_ppb_fifo_size)
+				hw_pp[i]->ops.set_ppb_fifo_size(hw_pp[i],
+					DIV_ROUND_UP(dsc->pic_width * 4, num_dsc));
 }
 
 /**
@@ -2139,8 +2201,24 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
 		}
 	}
 
-	if (dpu_enc->dsc)
-		dpu_encoder_prep_dsc(dpu_enc, dpu_enc->dsc);
+	/*
+	 * m2582.features=dscstatic: the factory's msm_drm.ko skips DSC
+	 * configuration when the connector ROI is unchanged; this mainline path
+	 * always uses a fixed full-frame ROI, so the cache isolates the DSC
+	 * write/flush cadence from the PPS contents and the topology.  A modeset,
+	 * runtime resume or hardware reset invalidates it, as does any change to
+	 * the model.
+	 */
+	if (dpu_enc->dsc) {
+		if (!m2582_feature_opt_in("dscstatic") || needs_hw_reset ||
+		    !dpu_enc->dsc_config_valid ||
+		    memcmp(&dpu_enc->dsc_last_config, dpu_enc->dsc,
+			   sizeof(*dpu_enc->dsc))) {
+			dpu_encoder_prep_dsc(dpu_enc, dpu_enc->dsc);
+			dpu_enc->dsc_last_config = *dpu_enc->dsc;
+			dpu_enc->dsc_config_valid = true;
+		}
+	}
 }
 
 /**
@@ -2189,7 +2267,7 @@ void dpu_encoder_start_frame_done_timer(struct drm_encoder *drm_enc)
 	 * for the first frame after a cold boot.
 	 */
 	if (fps >= 24)
-		timeout_ms = 84;
+		timeout_ms = 220;	/* two 10 Hz ADFR floor periods */
 	else
 		timeout_ms = DPU_ENCODER_FRAME_DONE_TIMEOUT_FRAMES * 1000 /
 				max(fps, 1);

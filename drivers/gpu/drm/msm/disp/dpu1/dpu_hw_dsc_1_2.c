@@ -12,6 +12,7 @@
 #include "dpu_hw_catalog.h"
 #include "dpu_hwio.h"
 #include "dpu_hw_mdss.h"
+#include <linux/meizu-m2582.h>
 #include "dpu_hw_dsc.h"
 
 #define DSC_CMN_MAIN_CNF           0x00
@@ -57,12 +58,19 @@
 #define DSC_CFG                    0x04
 #define DSC_DATA_IN_SWAP           0x08
 #define DSC_CLK_CTRL               0x0C
+#define DSC_4HS_MERGE_EN           0x10
+#define DSC_4HS_MERGE_CFG          0x14
 
 static int _dsc_calc_output_buf_max_addr(struct dpu_hw_dsc *hw_dsc, int num_softslice)
 {
 	int max_addr = 2400 / num_softslice;
 
-	if (hw_dsc->caps->features & BIT(DPU_DSC_NATIVE_42x_EN))
+	/* m2582.features=ob2399: drop the native-42x halving.  The capability bit
+	 * is a catalog guess for this SoC; if the part does not actually have it
+	 * the encoder's output buffer is twice as large as we think, and lines
+	 * that need more data are the ones that suffer when it is not. */
+	if ((hw_dsc->caps->features & BIT(DPU_DSC_NATIVE_42x_EN)) &&
+	    !m2582_feature_opt_in("ob2399"))
 		max_addr /= 2;
 
 	return max_addr - 1;
@@ -87,7 +95,8 @@ static void dpu_hw_dsc_disable_1_2(struct dpu_hw_dsc *hw_dsc)
 static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 				  struct drm_dsc_config *dsc,
 				  u32 mode,
-				  u32 initial_lines)
+				  u32 initial_lines,
+				  u32 slices_per_enc)
 {
 	struct dpu_hw_blk_reg_map *hw;
 	const struct dpu_dsc_sub_blks *sblk;
@@ -100,7 +109,6 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 		return;
 
 	hw = &hw_dsc->hw;
-
 	sblk = hw_dsc->caps->sblk;
 
 	if (mode & DSC_MODE_SPLIT_PANEL)
@@ -109,9 +117,14 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	if (mode & DSC_MODE_MULTIPLEX)
 		data |= BIT(1);
 
-	num_active_slice_per_enc = dsc->slice_count;
-	if (mode & DSC_MODE_MULTIPLEX)
-		num_active_slice_per_enc = dsc->slice_count / 2;
+	/*
+	 * slices_per_enc is what the factory programs: one slice per encoder,
+	 * i.e. dsc->slice_count / (encoders in the pipeline).  Upstream derived
+	 * it as dsc->slice_count and halved it under DSC_MODE_MULTIPLEX, which
+	 * is why the mode bit had to be set to reach DSC_CMN_MAIN_CNF 0x80; the
+	 * factory reaches 0x80 with no mode bit and ENC_DF_CTRL 0x12bc1003.
+	 */
+	num_active_slice_per_enc = slices_per_enc;
 
 	data |= (num_active_slice_per_enc & 0x3) << 7;
 
@@ -130,17 +143,27 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	 * corrupted output.
 	 */
 	if ((hw_dsc->caps->features & BIT(DPU_DSC_FULL_ICH_PREC)) &&
-	    dsc->bits_per_component > 8)
+	    dsc->bits_per_component > 8 &&
+	    !m2582_feature_opt_in("noich"))
 		data |= BIT(12);
 
 	/*
-	 * ENC_DF_CTRL[10:11] force the ICH reset position.  The factory only
-	 * sets them for a partial update whose slice_count is greater than one
-	 * and whose slice_width equals the picture width
-	 * (_dce_dsc_ich_reset_override_needed in sde_encoder_dce.c); this panel
-	 * drives two slices per line, so the hardware's own choice is the one
-	 * the decoder expects and the bits stay clear.
+	 * ENC_DF_CTRL[11:10] are the ICH reset override.  The factory ORs in
+	 * 0xC00 only when _dce_dsc_ich_reset_override_needed() holds
+	 * (half_panel_pu && slice_count > 1 && slice_width == pic_width), i.e.
+	 * a half-panel partial update; its live full-frame value for this
+	 * 1200x2670 panel is 0x12bc1003, bits[11:10] clear.  The bits move where
+	 * the hardware resets ICH: end of slice line with merge or two soft
+	 * slices, end of slice with one soft slice and no merge -- this panel is
+	 * the latter.  Default is the factory's; ich1/ich2/ich3 walk the field.
 	 */
+	if (m2582_feature_opt_in("ich1"))
+		data |= 0x1 << 10;
+	else if (m2582_feature_opt_in("ich2"))
+		data |= 0x2 << 10;
+	else if (m2582_feature_opt_in("ich3"))
+		data |= 0x3 << 10;
+
 	data |= (_dsc_calc_output_buf_max_addr(hw_dsc, num_active_slice_per_enc) << 18);
 
 	DPU_REG_WRITE(hw, sblk->enc.base + ENC_DF_CTRL, data);
@@ -220,9 +243,20 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	DPU_REG_WRITE(hw, sblk->enc.base + DSC_RC_OFFSETS_4, data);
 
 	det_thresh_flatness = drm_dsc_flatness_det_thresh(dsc);
-	data = (dsc->flatness_min_qp & 0x1f) |
-		((dsc->flatness_max_qp & 0x1f) << 5) |
-		((det_thresh_flatness & 0xff) << 10);
+	/*
+	 * m2582.features=flatswap: diagnostic.  The PPS carries flatness_min_qp
+	 * and flatness_max_qp in that order, but the two five-bit fields cannot
+	 * be told apart from the factory disassembly.  Flatness is only consulted
+	 * while the encoder quantises, so an inverted pair is invisible at 10 bpp
+	 * and fatal at 8 bpp.
+	 */
+	if (m2582_feature_opt_in("flatswap"))
+		data = (dsc->flatness_max_qp & 0x1f) |
+		       ((dsc->flatness_min_qp & 0x1f) << 5);
+	else
+		data = (dsc->flatness_min_qp & 0x1f) |
+		       ((dsc->flatness_max_qp & 0x1f) << 5);
+	data |= (det_thresh_flatness & 0xff) << 10;
 
 	DPU_REG_WRITE(hw, sblk->enc.base + DSC_FLATNESS_QP, data);
 
@@ -261,6 +295,22 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 		data |= BIT(17);
 
 	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_CFG, data);
+
+	/* The factory's barrier (dsb st after the DSC_CFG write) sits here. */
+	wmb();
+
+	/*
+	 * DSC_4HS_MERGE_CFG/EN (ctl +0x14/+0x10).  The factory's
+	 * sde_hw_dsc_4hs_config() writes both on every configuration; this
+	 * panel drives two encoders on one interface, not four, so both get
+	 * zero.  Upstream never writes them, leaving whatever the bootloader
+	 * programmed for the splash -- they decide how the two encoders' output
+	 * is merged for the interface, so a stale value is not harmless.
+	 */
+	if (!m2582_feature_opt_in("no4hs")) {
+		DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_CFG, 0);
+		DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_EN, 0);
+	}
 }
 
 static void dpu_hw_dsc_config_thresh_1_2(struct dpu_hw_dsc *hw_dsc,

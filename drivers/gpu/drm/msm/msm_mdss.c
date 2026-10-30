@@ -11,6 +11,7 @@
 #include <linux/irqchip.h>
 #include <linux/irqdesc.h>
 #include <linux/irqchip/chained_irq.h>
+#include <linux/meizu-m2582.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -319,13 +320,28 @@ static int msm_mdss_reset(struct device *dev)
 				     "failed to acquire mdss reset\n");
 	}
 
-	reset_control_assert(reset);
 	/*
-	 * Tests indicate that reset has to be held for some period of time,
-	 * make it one frame in a typical system
+	 * M2582: the factory's device tree carries no MDSS reset, so its driver
+	 * inherits whatever the bootloader left programmed and only overwrites
+	 * what its own catalog knows.  Two blocks are in that category and have
+	 * no upstream counterpart at all: the MDSS uidle block (the vendor's
+	 * driver programs it from sde_hw_uidle.c) and the per-pipe system-cache
+	 * client (SSPP_SYS_CACHE_MODE, fed by the LLCC_DISP use case).  Resetting
+	 * the core returns both to their reset values -- disabled, which is the
+	 * safe state -- but it also throws away anything else the bootloader set
+	 * up that this driver never writes.  Keep upstream's reset as the default
+	 * and let the board opt out with m2582.features=noreset, which is what
+	 * the vendor's own stack effectively does.
 	 */
-	msleep(20);
-	reset_control_deassert(reset);
+	if (!m2582_feature_opt_in("noreset")) {
+		reset_control_assert(reset);
+		/*
+		 * Tests indicate that reset has to be held for some period of
+		 * time, make it one frame in a typical system
+		 */
+		msleep(20);
+		reset_control_deassert(reset);
+	}
 
 	reset_control_put(reset);
 
@@ -478,6 +494,9 @@ static int mdss_probe(struct platform_device *pdev)
 		return PTR_ERR(mdss);
 
 	platform_set_drvdata(pdev, mdss);
+
+#ifdef CONFIG_DEBUG_FS
+#endif
 
 	/*
 	 * MDP5/DPU based devices don't have a flat hierarchy. There is a top

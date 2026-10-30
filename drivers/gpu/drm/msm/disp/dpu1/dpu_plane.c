@@ -26,6 +26,7 @@
 #include "dpu_trace.h"
 #include "dpu_crtc.h"
 #include "dpu_vbif.h"
+#include <linux/meizu-m2582.h>
 #include "dpu_plane.h"
 
 #define DPU_DEBUG_PLANE(pl, fmt, ...) DRM_DEBUG_ATOMIC("plane%d " fmt,\
@@ -1091,6 +1092,17 @@ static bool dpu_plane_try_multirect_parallel(struct dpu_sw_pipe *pipe, struct dp
 					     uint32_t max_linewidth)
 {
 	r_pipe->sspp = NULL;
+
+	/*
+	 * m2582.features=twosspp: carry each half of the 1200-wide line on its
+	 * own source pipe, the way the factory composes this panel -- its event
+	 * log has one SSPP per plane with multirect=0 (DMA3/DMA1/VIG1), i.e. two
+	 * fetch pipes and two QoS/xin clients, where this driver puts both halves
+	 * on REC0/REC1 of one SSPP and shares one line buffer.  Returning false
+	 * makes the caller reserve a second SSPP and leave both pipes RECT_SOLO.
+	 */
+	if (m2582_feature_opt_in("twosspp"))
+		return false;
 
 	pipe->multirect_index = DPU_SSPP_RECT_SOLO;
 	pipe->multirect_mode = DPU_SSPP_MULTIRECT_NONE;

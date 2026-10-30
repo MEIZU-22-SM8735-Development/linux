@@ -4,6 +4,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/meizu-m2582.h>
 
 #include <drm/drm_managed.h>
 
@@ -603,6 +604,11 @@ static void dpu_hw_ctl_intf_cfg_v1(struct dpu_hw_ctl *ctx,
 	if (cfg->cwb)
 		cwb_active |= cfg->cwb;
 
+	/*
+	 * CTL_DSC_ACTIVE: the vendor sets it too, from
+	 * sde_hw_ctl_update_intf_cfg (msm_drm.ko 0x106004); only its
+	 * sde_hw_ctl_intf_cfg_v1 leaves the register alone.
+	 */
 	if (cfg->dsc)
 		dsc_active |= cfg->dsc;
 

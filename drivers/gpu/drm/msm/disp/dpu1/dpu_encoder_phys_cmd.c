@@ -12,6 +12,7 @@
 #include "dpu_core_irq.h"
 #include "dpu_formats.h"
 #include "dpu_trace.h"
+#include <linux/meizu-m2582.h>
 #include "disp/msm_disp_snapshot.h"
 
 #include <drm/drm_managed.h>
@@ -39,10 +40,20 @@
 #define DEFAULT_TEARCHECK_SYNC_THRESH_START	4
 #define DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE	4
 
-/* M2582 panel scans at 120 Hz; see dpu_encoder_phys_cmd_tearcheck_config() */
-#define M2582_PANEL_FPS				120
+/*
+ * The panel's real scan rate.  drm_mode_vrefresh() cannot supply it: msm_dsi
+ * derives the DSI link rate from mode->clock, which is a synthetic 627.126 MHz,
+ * so vrefresh reports ~184 Hz for both of the factory's modes.  The rate is
+ * carried in the mode name by the panel driver for the same reason.
+ */
+static unsigned int m2582_panel_fps(const struct drm_display_mode *mode)
+{
+	return strstr(mode->name, "-90") ? 90 : 120;
+}
 
 static void dpu_encoder_phys_cmd_enable_te(struct dpu_encoder_phys *phys_enc);
+static void _dpu_encoder_phys_cmd_connect_te(struct dpu_encoder_phys *phys_enc,
+					    bool enable);
 
 static bool dpu_encoder_phys_cmd_is_master(struct dpu_encoder_phys *phys_enc)
 {
@@ -142,6 +153,43 @@ static void dpu_encoder_phys_cmd_ctl_start_irq(void *arg)
 	DPU_ATRACE_END("ctl_start_irq");
 }
 
+/*
+ * m2582.features=ppboth: a widebus pair is two ping-pongs feeding one
+ * interface, and this driver registers and waits on the first one's done only.
+ * If the pair reports completion from the second ping-pong -- or if the first
+ * one's done edge is not the one that marks the frame as consumed -- then the
+ * kickoff is released one slice early for one half, which is the shape of the
+ * damage this board shows in a single 600-wide column.
+ *
+ * The handler deliberately only releases the wait and decrements the pending
+ * count; the frame-done event stays with the first ping-pong so a frame cannot
+ * be reported twice.
+ */
+static void m2582_pp2_done_irq(void *arg)
+{
+	struct dpu_encoder_phys *phys_enc = arg;
+
+	atomic_add_unless(&phys_enc->pending_kickoff_cnt, -1, 0);
+	wake_up_all(&phys_enc->pending_kickoff_wq);
+}
+
+/* the ping-pong paired with this encoder's, if any */
+static u32 m2582_pp2_intr(struct dpu_encoder_phys *phys_enc)
+{
+	const struct dpu_pingpong_cfg *pp;
+
+	if (!m2582_feature_opt_in("ppboth") || !phys_enc->dpu_kms ||
+	    !phys_enc->hw_pp)
+		return 0;
+
+	for (pp = phys_enc->dpu_kms->catalog->pingpong;
+	     pp && pp->id != PINGPONG_NONE; pp++)
+		if (pp->id == phys_enc->hw_pp->idx + 1)
+			return pp->intr_done;
+
+	return 0;
+}
+
 static void dpu_encoder_phys_cmd_underrun_irq(void *arg)
 {
 	struct dpu_encoder_phys *phys_enc = arg;
@@ -157,6 +205,7 @@ static void dpu_encoder_phys_cmd_atomic_mode_set(
 	phys_enc->irq[INTR_IDX_CTL_START] = phys_enc->hw_ctl->caps->intr_start;
 
 	phys_enc->irq[INTR_IDX_PINGPONG] = phys_enc->hw_pp->caps->intr_done;
+	phys_enc->irq[INTR_IDX_PINGPONG2] = m2582_pp2_intr(phys_enc);
 
 	if (phys_enc->has_intf_te)
 		phys_enc->irq[INTR_IDX_RDPTR] = phys_enc->hw_intf->cap->intr_tear_rd_ptr;
@@ -238,14 +287,71 @@ static int _dpu_encoder_phys_cmd_wait_for_idle(
 	wait_info.atomic_cnt = &phys_enc->pending_kickoff_cnt;
 	wait_info.timeout_ms = KICKOFF_TIMEOUT_MS;
 
-	ret = dpu_encoder_helper_wait_for_irq(phys_enc,
-			phys_enc->irq[INTR_IDX_PINGPONG],
-			dpu_encoder_phys_cmd_pp_tx_done_irq,
-			&wait_info);
+	/*
+	 * m2582.features=noppwait: do not gate the next kickoff on the ping-pong
+	 * done interrupt.
+	 *
+	 * Measured on this board (image grpall-1025-1725): across 300+ interrupt
+	 * dispatches the MDP core's own interrupt group never asserts a single
+	 * bit -- grp0 status_or=00000000 with en_or=04000100, i.e. ping-pong done
+	 * is enabled but the hardware never raises it -- while the only bit that
+	 * does fire is grp1 bit 9, ctl_start, once per kickoff.  So the ping-pong
+	 * done interrupt this wait is written against cannot arrive, and every
+	 * frame after the first times out.
+	 *
+	 * So this gate is skipped entirely.  Pacing then comes from the
+	 * post-kickoff commit-done wait, which uses the ctl_start interrupt --
+	 * the one interrupt this board does deliver once per frame, and the same
+	 * edge the factory's ctl_done/scheduler path is built on.
+	 */
+	if (m2582_feature_opt_in("noppwait")) {
+		ret = 0;
+	} else if (m2582_feature_opt_in("rdptrwait") &&
+		   phys_enc->irq[INTR_IDX_RDPTR]) {
+		/*
+		 * m2582.features=rdptrwait: pace on the interface's read-pointer
+		 * event instead of the ping-pong done one.
+		 *
+		 * Ping-pong done (MDP interrupt group 0) never asserts on this
+		 * board, so the wait above can only time out -- and the frame then
+		 * gets armed while the DDIC is still reading the previous one,
+		 * which is what a picture that tears differently every frame looks
+		 * like.  The interface's read-pointer interrupt does fire, and it
+		 * is the event that actually means "the panel has taken this
+		 * line/frame": it is the same one mainline uses for vblank.
+		 */
+		struct dpu_encoder_wait_info vb;
+
+		vb.wq = &cmd_enc->pending_vblank_wq;
+		vb.atomic_cnt = &cmd_enc->pending_vblank_cnt;
+		vb.timeout_ms = KICKOFF_TIMEOUT_MS;
+
+		atomic_add_unless(&cmd_enc->pending_vblank_cnt, 1,
+				  INT_MAX);
+		ret = dpu_encoder_helper_wait_for_irq(phys_enc,
+				phys_enc->irq[INTR_IDX_RDPTR],
+				dpu_encoder_phys_cmd_te_rd_ptr_irq, &vb);
+	} else {
+		ret = dpu_encoder_helper_wait_for_irq(phys_enc,
+				phys_enc->irq[INTR_IDX_PINGPONG],
+				dpu_encoder_phys_cmd_pp_tx_done_irq,
+				&wait_info);
+	}
 	if (ret == -ETIMEDOUT)
 		_dpu_encoder_phys_cmd_handle_ppdone_timeout(phys_enc);
 	else if (!ret)
 		cmd_enc->pp_timeout_report_cnt = 0;
+
+	/*
+	 * m2582.features=noidlewait: on this board the ping-pong done interrupt
+	 * fires for the first frame and then never again, so upstream's gate
+	 * (timeout makes the commit fail, and every following commit then times
+	 * out too) drops all but a few frames.  The flag kicks the frame off
+	 * anyway and leaves the wait as a statistic, which separates "the panel
+	 * is fed out of order" from anything downstream of the interface.
+	 */
+	if (ret == -ETIMEDOUT && m2582_feature_opt_in("noidlewait"))
+		return 0;
 
 	return ret;
 }
@@ -327,6 +433,10 @@ static void dpu_encoder_phys_cmd_irq_enable(struct dpu_encoder_phys *phys_enc)
 				       phys_enc->irq[INTR_IDX_UNDERRUN],
 				       dpu_encoder_phys_cmd_underrun_irq,
 				       phys_enc);
+	if (phys_enc->irq[INTR_IDX_PINGPONG2])
+		dpu_core_irq_register_callback(phys_enc->dpu_kms,
+					       phys_enc->irq[INTR_IDX_PINGPONG2],
+					       m2582_pp2_done_irq, phys_enc);
 	dpu_encoder_phys_cmd_control_vblank_irq(phys_enc, true);
 
 	if (dpu_encoder_phys_cmd_is_master(phys_enc) && phys_enc->irq[INTR_IDX_CTL_START])
@@ -348,6 +458,9 @@ static void dpu_encoder_phys_cmd_irq_disable(struct dpu_encoder_phys *phys_enc)
 
 	dpu_core_irq_unregister_callback(phys_enc->dpu_kms, phys_enc->irq[INTR_IDX_UNDERRUN]);
 	dpu_encoder_phys_cmd_control_vblank_irq(phys_enc, false);
+	if (phys_enc->irq[INTR_IDX_PINGPONG2])
+		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
+						 phys_enc->irq[INTR_IDX_PINGPONG2]);
 	dpu_core_irq_unregister_callback(phys_enc->dpu_kms, phys_enc->irq[INTR_IDX_PINGPONG]);
 }
 
@@ -403,22 +516,63 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 	/*
 	 * M2582: drm_mode_vrefresh() divides mode->clock by htotal*vtotal, and
 	 * msm_dsi derives the DSI link rate from that same mode->clock, so it
-	 * reports ~184 Hz for this 120 Hz panel. The tear-check counter divides
-	 * the MDP vsync clock down to the panel's *line* rate, so it has to work
-	 * from the rate the panel actually scans at.
+	 * reports ~184 Hz for either of this panel's modes. The tear-check
+	 * counter divides the MDP vsync clock down to the panel's *line* rate,
+	 * so it has to work from the rate and the line count the panel really
+	 * scans.  The factory's own numbers for this panel are vsync clock
+	 * 19.2 MHz, vtotal 2736, 120 Hz, i.e. 58 (its event log records
+	 * "0 1 124f800 ab0 78" for exactly those four values).
 	 */
-	tc_cfg.vsync_count = vsync_hz / (mode->vtotal * M2582_PANEL_FPS);
+	/*
+	 * drm_mode_vrefresh() is unusable for this panel: msm_dsi derives the DSI
+	 * link rate from mode->clock, which is a synthetic 627.126 MHz so vrefresh
+	 * reports ~184 Hz, and the tear-check counter has to run at the rate the
+	 * panel actually scans at (19.2 MHz / (2736 * 120) = 58).
+	 */
+	/*
+	 * Use the mode's own vtotal: the line rate is constant across the two
+	 * rates this panel supports (2736 * 120 == 3648 * 90 == 328320), so
+	 * dividing by the mode's vtotal times its real refresh rate gives 58 for
+	 * both, while hardcoding the 120 Hz vtotal gives 77 at 90 Hz.
+	 */
+	tc_cfg.vsync_count = vsync_hz / (mode->vtotal * m2582_panel_fps(mode));
 
 	/*
-	 * M2582: hw_vsync_mode is BIT(20) of INTF_TEAR_SYNC_CONFIG_VSYNC, the
-	 * vendor's connect_external_te: advance the write pointer on the panel's
-	 * TE pulse.  The factory drives this panel with hw_vsync_mode = 1 and
-	 * sync_cfg_height = 0xFFF0 (near maximum suppresses the block's own TE
-	 * generation), and _dpu_encoder_phys_cmd_connect_te() re-enables the
-	 * external TE after every kickoff to avoid a premature autorefresh.
+	 * hw_vsync_mode selects the tear-check's sync source: the interface's TE
+	 * pulse (1) instead of the MDP's own vsync (0).  A command-mode panel has
+	 * no free-running scanout to hide a wrong source, the tear block latches
+	 * only while VSYNC_COUNTER_EN is clear, and with mode 0 the counters stop
+	 * advancing -- which leaves the CTL start unconsumed and the ping-pong
+	 * never reporting done.
+	 *
+	 * With these values INTF_TEAR_SYNC_CONFIG_VSYNC reads 0x0018003a:
+	 * BIT(19) counter enable, BIT(20) hw_vsync_mode, 0x3a = 58.  That is the
+	 * state this board was measured working in (120.5 fps, no timeouts).
+	 *
 	 */
-	tc_cfg.hw_vsync_mode = 1;
-	tc_cfg.sync_cfg_height = 0xFFF0;
+	tc_cfg.hw_vsync_mode = m2582_feature_opt_in("tevm0") ? 0 : 1;
+	/*
+	 * m2582.features=tevm0 restores the vendor's value.
+	 *
+	 * sde_encoder_phys_cmd_tearcheck_config() (the SM8735 vendor source) sets
+	 * hw_vsync_mode = 0 -- "enable external TE after kickoff to avoid
+	 * premature autorefresh" -- and every other field of this block is
+	 * identical between the two drivers: vsync_count, sync_cfg_height
+	 * 0xFFFFFFF0 for a 32-bit TE path, start_pos and vsync_init_val =
+	 * vdisplay, rd_ptr_irq = vdisplay + 1, wr_ptr_irq = 1,
+	 * sync_threshold_start/continue, and TEAR_DETECT_CTRL = vsync_init_val +
+	 * 0x14.  This bit is therefore the only difference left in the whole
+	 * frame-start mechanism, which is why it is an arm and not a comment:
+	 * 1 is what makes the interface run on this board, 0 is what the factory
+	 * runs.
+	 */
+	/*
+	 * 32-bit field: this SoC's tear block latches 0xfffffff0 (read back on
+	 * this board), and the vendor picks 0xFFFFFFF0 whenever the TE path is
+	 * 32-bit, which hw_rev 0xc0030000 is.  0xFFF0 is not the same value --
+	 * it saturates at 65520 lines, about 24 frames at this vtotal.
+	 */
+	tc_cfg.sync_cfg_height = 0xFFFFFFF0;
 	tc_cfg.vsync_init_val = mode->vdisplay;
 	tc_cfg.sync_threshold_start = DEFAULT_TEARCHECK_SYNC_THRESH_START;
 	tc_cfg.sync_threshold_continue = DEFAULT_TEARCHECK_SYNC_THRESH_CONTINUE;
@@ -488,7 +642,24 @@ static void dpu_encoder_phys_cmd_setup_timing_engine(
 	}
 
 	/*
-	 * A free-running timing generator keeps the tear-check block from
+	 * m2582.features=vendorintf: the factory's kernel never programs the
+	 * interface timing generator from its command-mode encoder at all --
+	 * enable_timing is only ever called from its video encoder -- so it
+	 * inherits whatever the bootloader left.  DisplayDxe disassembly has a
+	 * path that writes 0x1801011 to an INTF timing-engine register, but the
+	 * active DSI0 instance/value is not captured; the saved vendor 0x35000
+	 * read is DP0, not DSI0.  Forcing the block off is therefore a mainline
+	 * write that may differ from DSI0's inherited state, but that difference
+	 * still needs an active DSI0 readback.
+	 * m2582.features=nointften: this one write, isolated from the rest of
+	 * the vendorintf bundle, so it can be A/B'd on its own.  With the write
+	 * in place, mainline INTF1 +0x000 reads back 0.  Off by default.
+	 */
+	if (m2582_feature_opt_in("vendorintf") ||
+	    m2582_feature_opt_in("nointften"))
+		return;
+
+	/* A free-running timing generator keeps the tear-check block from
 	 * latching a frame, so make sure it stays off.
 	 */
 	phys_enc->hw_intf->ops.enable_timing(phys_enc->hw_intf, 0);
@@ -517,6 +688,16 @@ static void dpu_encoder_phys_cmd_enable_helper(
 	dpu_encoder_helper_split_config(phys_enc, phys_enc->hw_intf->idx);
 
 	_dpu_encoder_phys_cmd_pingpong_config(phys_enc);
+
+	/*
+	 * The factory's enable sequence is connect_external_te(0) -> tearcheck
+	 * -> connect_external_te(1), so the gate is closed again by the time the
+	 * enable returns.  This driver used to leave that to the first
+	 * handle_post_kickoff(), which means a frame enabled after a disable --
+	 * disable_te() opens the gate -- would be the one frame in the session
+	 * that is not gated on the panel's TE.
+	 */
+	_dpu_encoder_phys_cmd_connect_te(phys_enc, true);
 
 	ctl = phys_enc->hw_ctl;
 	ctl->ops.update_pending_flush_intf(ctl, phys_enc->hw_intf->idx);
@@ -661,6 +842,13 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 			  phys_enc->hw_pp->idx - PINGPONG_0);
 	}
 
+	/*
+	 * This call is retained because upstream makes it, and on this board it
+	 * is a no-op in steady state: dpu_encoder_phys_cmd_enable_te() only
+	 * calls disable_autorefresh(), which returns immediately unless
+	 * INTF_TEAR_AUTOREFRESH_CONFIG bit31 is set, and nothing in this tree
+	 * ever sets it.
+	 */
 	dpu_encoder_phys_cmd_enable_te(phys_enc);
 
 	DPU_DEBUG_CMDENC(cmd_enc, "pp:%d pending_cnt %d\n",
@@ -742,6 +930,7 @@ static int dpu_encoder_phys_cmd_wait_for_commit_done(
 	if (!dpu_encoder_phys_cmd_is_master(phys_enc))
 		return 0;
 
+
 	if (phys_enc->irq[INTR_IDX_CTL_START] &&
 	    !phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl))
 		return _dpu_encoder_phys_cmd_wait_for_ctl_start(phys_enc);
@@ -752,11 +941,35 @@ static int dpu_encoder_phys_cmd_wait_for_commit_done(
 static void dpu_encoder_phys_cmd_handle_post_kickoff(
 		struct dpu_encoder_phys *phys_enc)
 {
-	/**
-	 * re-enable external TE, either for the first time after enabling
-	 * or if disabled for Autorefresh
+	/*
+	 * Re-arm the external TE.  Upstream's comment says "either for the first
+	 * time after enabling or if disabled for Autorefresh"; the factory does
+	 * the first half of that once, in its enable sequence
+	 * (connect_external_te(0), tearcheck, connect_external_te(1)), and its
+	 * per-frame hook does not touch the bit at all.  Re-asserting the same
+	 * value here costs one register write and keeps the Autorefresh path,
+	 * which does clear it, working.
 	 */
 	_dpu_encoder_phys_cmd_connect_te(phys_enc, true);
+
+	/*
+	 * m2582.features=tearperframe: re-anchor the tear-check write pointer on
+	 * every kickoff, the way the factory does.
+	 *
+	 * The factory's sde_hw_intf_v1_check_and_reset_tearcheck (0x102fcc) reads
+	 * the current line count and the start position and rewrites
+	 * INTF_TEAR_SYNC_WRCOUNT (0x290) as (line_count << 16) | start_pos, and
+	 * its own event log shows sde_encoder_phys_cmd_tearcheck_config 178 times
+	 * in a single capture, i.e. once per frame.  Mainline programs the whole
+	 * tear-check block once, at enable, and has no equivalent of the re-anchor
+	 * op at all, so nothing ever re-aligns the host's write pointer with the
+	 * panel's scan position.  A drifting write pointer writes a row into the
+	 * wrong line of the ping-pong buffer, which is invisible on flat content
+	 * and shows up as whole rows of wrong data wherever rows differ.
+	 * Off by default: one variable.
+	 */
+	if (m2582_feature_opt_in("tearperframe"))
+		dpu_encoder_phys_cmd_tearcheck_config(phys_enc);
 }
 
 static void dpu_encoder_phys_cmd_trigger_start(
@@ -821,8 +1034,15 @@ struct dpu_encoder_phys *dpu_encoder_phys_cmd_init(struct drm_device *dev,
 		return ERR_PTR(-EINVAL);
 	}
 
-	/* DPU before 5.0 use PINGPONG for TE handling */
-	if (phys_enc->dpu_kms->catalog->mdss_ver->core_major_ver >= 5)
+	/*
+	 * DPU before 5.0 use PINGPONG for TE handling.  "ppte" forces the
+	 * ping-pong path on a newer core, which is what programs PP_RD_PTR_IRQ
+	 * and therefore what makes the ping-pong report frame completion at all.
+	 * The factory's ping-pong tear setup exists and writes those registers;
+	 * whether it runs on this panel is the question this flag answers.
+	 */
+	if (phys_enc->dpu_kms->catalog->mdss_ver->core_major_ver >= 5 &&
+	    !m2582_feature_opt_in("ppte"))
 		phys_enc->has_intf_te = true;
 
 	if (phys_enc->has_intf_te && !phys_enc->hw_intf->ops.enable_tearcheck) {

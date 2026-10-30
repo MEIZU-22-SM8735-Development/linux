@@ -12,6 +12,7 @@
 #include "dpu_hw_pingpong.h"
 #include "dpu_kms.h"
 #include "dpu_trace.h"
+#include <linux/meizu-m2582.h>
 
 #define PP_TEAR_CHECK_EN                0x000
 #define PP_SYNC_CONFIG_VSYNC            0x004
@@ -30,6 +31,14 @@
 #define PP_FBC_MODE                     0x034
 #define PP_FBC_BUDGET_CTL               0x038
 #define PP_FBC_LOSSY_MODE               0x03C
+/*
+ * Ping-pong latency buffer depth.  Same offset as the legacy PP tear-check
+ * start position, which this core does not have (the vendor driver only maps
+ * the tear registers for DPU < 5.0); here it is the PPB FIFO size, in units of
+ * four pixels.
+ */
+#define PPB_FIFO_SIZE_CFG               0x01C
+
 #define PP_DSC_MODE                     0x0a0
 #define PP_DCE_DATA_IN_SWAP             0x0ac
 #define PP_DCE_DATA_OUT_SWAP            0x0c8
@@ -73,6 +82,25 @@ static void dpu_hw_pp_setup_dither(struct dpu_hw_pingpong *pp,
 		DPU_REG_WRITE(c, base + PP_DITHER_MATRIX + i, data);
 	}
 	DPU_REG_WRITE(c, base + PP_DITHER_EN, 1);
+}
+
+/**
+ * dpu_hw_pp_set_ppb_fifo_size() - set the ping-pong latency buffer depth
+ * @pp: pingpong block
+ * @pixels: depth in pixels
+ *
+ * The command-mode interface consumes the compressed frame in bursts while the
+ * layer mixer produces pixels at a steady rate; this FIFO is what absorbs the
+ * difference.  The factory sizes it from the mode and the panel's own
+ * ppb_buf_max_lines (four lines here), and reprograms it per commit.
+ */
+static void dpu_hw_pp_set_ppb_fifo_size(struct dpu_hw_pingpong *pp, u32 pixels)
+{
+	if (!pp)
+		return;
+
+	/* four pixels per FIFO entry, twelve-bit field */
+	DPU_REG_WRITE(&pp->hw, PPB_FIFO_SIZE_CFG, (pixels / 4) & 0xfff);
 }
 
 static int dpu_hw_pp_enable_te(struct dpu_hw_pingpong *pp,
@@ -268,6 +296,16 @@ static int dpu_hw_pp_dsc_enable(struct dpu_hw_pingpong *pp)
 static void dpu_hw_pp_dsc_disable(struct dpu_hw_pingpong *pp)
 {
 	struct dpu_hw_blk_reg_map *c = &pp->hw;
+	u32 data;
+
+	/*
+	 * The factory's sde_hw_pp_dsc_disable (msm_drm.ko 0x11057c) clears
+	 * PP_DCE_DATA_OUT_SWAP BIT(18) and then writes PP_DSC_MODE = 0, so the
+	 * disable undoes exactly what setup/enable did.
+	 */
+	data = DPU_REG_READ(c, PP_DCE_DATA_OUT_SWAP);
+	data &= ~BIT(18);
+	DPU_REG_WRITE(c, PP_DCE_DATA_OUT_SWAP, data);
 
 	DPU_REG_WRITE(c, PP_DSC_MODE, 0);
 }
@@ -275,10 +313,18 @@ static void dpu_hw_pp_dsc_disable(struct dpu_hw_pingpong *pp)
 static int dpu_hw_pp_setup_dsc(struct dpu_hw_pingpong *pp)
 {
 	struct dpu_hw_blk_reg_map *pp_c = &pp->hw;
-	int data;
+	u32 data;
 
+	/*
+	 * Transcribed from the factory's sde_hw_pp_setup_dsc (msm_drm.ko
+	 * 0x1104f0): PP_DCE_DATA_OUT_SWAP |= BIT(18), which its
+	 * sde_hw_pp_dsc_disable (0x11057c) clears again.  The read-back is
+	 * useless on this block -- 0xc8 reads 0 right after the write (0xa0
+	 * behaves the same and still works) -- so the RMW preserves nothing and
+	 * the write is what matters; keep the factory's shape.
+	 */
 	data = DPU_REG_READ(pp_c, PP_DCE_DATA_OUT_SWAP);
-	data |= BIT(18); /* endian flip */
+	data |= BIT(18);
 	DPU_REG_WRITE(pp_c, PP_DCE_DATA_OUT_SWAP, data);
 	return 0;
 }
@@ -309,7 +355,15 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
 	c->idx = cfg->id;
 	c->caps = cfg;
 
-	if (mdss_rev->core_major_ver < 5) {
+	/*
+	 * The factory's sde_hw_pp_setup_te_config (msm_drm.ko 0x10ffe8) writes
+	 * the same eight offsets as dpu_hw_pp_enable_te() below, 0x20 being
+	 * PP_RD_PTR_IRQ, the line at which the ping-pong reports "done".
+	 * Upstream installs these only for DPU < 5, so on this chip nothing ever
+	 * writes PP_RD_PTR_IRQ: group 0 then never sees its pingpong-0 done bit
+	 * and the kickoff wait times out on every frame after the first.
+	 */
+	if (mdss_rev->core_major_ver < 5 || m2582_feature_opt_in("ppte")) {
 		WARN_ON(!cfg->intr_rdptr);
 
 		c->ops.enable_tearcheck = dpu_hw_pp_enable_te;
@@ -320,11 +374,22 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
 	}
 
 	/*
-	 * M2582: from DPU 7.x on the pingpong has no DSC sub-block, compression
-	 * being driven by the standalone DCE blocks instead, so keep upstream's
-	 * DPU < 7 gate on the DSC hooks.
+	 * The FIFO-depth register lives where DPU < 5.0 kept the tear-check one.
+	 * Upstream gates the DSC hooks on DPU < 7 because from 7.x on the block
+	 * has no DSC sub-block; the compressed-stream handshake moved to
+	 * INTF_CONFIG2 BIT(12) (see dpu_hw_intf_program_intf_cmd_cfg).
 	 */
-	if (mdss_rev->core_major_ver < 7) {
+	if (mdss_rev->core_major_ver >= 5)
+		c->ops.set_ppb_fifo_size = dpu_hw_pp_set_ppb_fifo_size;
+
+	/*
+	 * The factory installs these three ops only for DPU <= 6: its
+	 * sde_pp_parse_dt sets SDE_PINGPONG_DSC (bit 5) under `cmp w26,#6 /
+	 * b.hi` (msm_drm.ko 0xfa734) and sde_hw_pingpong_init gates on that bit
+	 * (0x10fd8c `tbz w8,#5`), so on DPU 12 the factory runs with PP_DSC_MODE
+	 * = 0.  "ppdsc" keeps the experiment available but must not be default.
+	 */
+	if (mdss_rev->core_major_ver < 7 || m2582_feature_opt_in("ppdsc")) {
 		c->ops.setup_dsc = dpu_hw_pp_setup_dsc;
 		c->ops.enable_dsc = dpu_hw_pp_dsc_enable;
 		c->ops.disable_dsc = dpu_hw_pp_dsc_disable;

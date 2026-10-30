@@ -38,8 +38,12 @@
 #define LEFT_MIXER 0
 #define RIGHT_MIXER 1
 
-/* timeout in ms waiting for frame done */
-#define DPU_CRTC_FRAME_DONE_TIMEOUT_MS	60
+/*
+ * Timeout in ms waiting for frame done.  Covers two periods of the panel's
+ * 10 Hz ADFR floor, so a commit that arrives just after a TE edge is not
+ * declared failed before the panel clocks it out.
+ */
+#define DPU_CRTC_FRAME_DONE_TIMEOUT_MS	220
 
 #define	CONVERT_S3_15(val) \
 	(((((u64)val) & ~BIT_ULL(63)) >> 17) & GENMASK_ULL(17, 0))

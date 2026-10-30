@@ -32,11 +32,14 @@ struct dpu_hw_dsc_ops {
 	 * @dsc: panel dsc parameters
 	 * @mode: dsc topology mode to be set
 	 * @initial_lines: amount of initial lines to be used
+	 * @slices_per_enc: slices this encoder carries (dsc->slice_count
+	 *                  divided by the number of encoders in the pipeline)
 	 */
 	void (*dsc_config)(struct dpu_hw_dsc *hw_dsc,
 			   struct drm_dsc_config *dsc,
 			   u32 mode,
-			   u32 initial_lines);
+			   u32 initial_lines,
+			   u32 slices_per_enc);
 
 	/**
 	 * @dsc_config_thresh: programs panel thresholds

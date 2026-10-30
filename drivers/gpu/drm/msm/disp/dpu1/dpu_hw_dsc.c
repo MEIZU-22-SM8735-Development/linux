@@ -45,7 +45,8 @@ static void dpu_hw_dsc_disable(struct dpu_hw_dsc *dsc)
 static void dpu_hw_dsc_config(struct dpu_hw_dsc *hw_dsc,
 			      struct drm_dsc_config *dsc,
 			      u32 mode,
-			      u32 initial_lines)
+			      u32 initial_lines,
+			      u32 slices_per_enc)
 {
 	struct dpu_hw_blk_reg_map *c = &hw_dsc->hw;
 	u32 data;

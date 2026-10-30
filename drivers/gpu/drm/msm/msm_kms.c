@@ -11,6 +11,7 @@
 #include <uapi/linux/sched/types.h>
 
 #include <drm/drm_drv.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_mode_config.h>
 #include <drm/drm_vblank.h>
 #include <drm/clients/drm_client_setup.h>
@@ -177,6 +178,47 @@ static int msm_kms_fault_handler(void *arg, unsigned long iova, int flags, void 
 	return -ENOSYS;
 }
 
+/*
+ * The bootloader framebuffer is direct-mapped into this domain (see
+ * msm_iommu_disp_new()).  Take the same range out of the VA allocator so a
+ * GEM mapping can never be handed an address that is already occupied by
+ * that identity mapping.
+ */
+static void msm_kms_reserve_direct_va(struct drm_device *dev,
+				      struct drm_gpuvm *vm,
+				      struct device *iommu_dev)
+{
+	struct drm_mm *mm = &to_msm_vm(vm)->mm;
+	struct iommu_resv_region *r;
+	LIST_HEAD(regions);
+
+	iommu_get_resv_regions(iommu_dev, &regions);
+
+	list_for_each_entry(r, &regions, list) {
+		struct drm_mm_node *node;
+		int ret;
+
+		if (r->type != IOMMU_RESV_DIRECT &&
+		    r->type != IOMMU_RESV_DIRECT_RELAXABLE)
+			continue;
+
+		node = drmm_kzalloc(dev, sizeof(*node), GFP_KERNEL);
+		if (!node)
+			break;
+
+		node->start = ALIGN_DOWN(r->start, PAGE_SIZE);
+		node->size  = ALIGN(r->start + r->length, PAGE_SIZE) -
+			      node->start;
+
+		ret = drm_mm_reserve_node(mm, node);
+		if (ret)
+			drm_dbg_kms(dev, "VA %llx+%llx not reserved: %d\n",
+				    node->start, node->size, ret);
+	}
+
+	iommu_put_resv_regions(iommu_dev, &regions);
+}
+
 struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_dev)
 {
 	struct drm_gpuvm *vm;
@@ -212,6 +254,8 @@ struct drm_gpuvm *msm_kms_init_vm(struct drm_device *dev, struct device *mdss_de
 	}
 
 	msm_mmu_set_fault_handler(to_msm_vm(vm)->mmu, kms, msm_kms_fault_handler);
+
+	msm_kms_reserve_direct_va(dev, vm, iommu_dev);
 
 	return vm;
 }

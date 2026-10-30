@@ -228,6 +228,47 @@ static const struct qcom_ubwc_cfg_data sm8750_data = {
 	.macrotile_mode = true,
 };
 
+/*
+ * SM8735 (tuna), taken from the factory device tree's mdss_mdp node -- the
+ * configuration the vendor stack actually runs with:
+ *
+ *	qcom,sde-ubwc-version     = 0x50000001	(UBWC 5.0.1)
+ *	qcom,sde-ubwc-static      = 1
+ *	qcom,sde-ubwc-swizzle     = 6		(bank swizzle levels 2 and 3)
+ *	qcom,sde-macrotile-mode   = 1
+ *	qcom,sde-highest-bank-bit = <8 3>
+ *
+ * The last one is a (ddr type, value) list, not a single number: the vendor
+ * driver walks it in pairs and takes element 1 of the matching entry
+ * (sde_hw_catalog.c, "for (i = 0; i < props->counts[BANK_BIT]; i++)"), so the
+ * value the hardware is programmed with is 3.  Mainline's msm_mdss writes
+ * (highest_bank_bit - 13) into the same three bits, which is why 16 appears
+ * below: it is the number that produces the vendor's 3.
+ *
+ * The GPU half is configured for real -- Mesa allocates UBWC buffers through
+ * the encoder described here.
+ *
+ * The display half is deliberately NOT enabled: with ubwc_dec_version zero,
+ * dpu_plane_format_mod_supported() stops advertising
+ * DRM_FORMAT_MOD_QCOM_COMPRESSED and every client allocates linear buffers, so
+ * the DPU never decodes UBWC.  This is a known gap, not a validated
+ * configuration.  With decode enabled (dec_version = UBWC_5_0 and macrotile as
+ * below) a Wayland client's scanout came out as a fine checkerboard over the
+ * whole panel, and clearing macrotile_mode did not change that, so the register
+ * composition itself -- MDSS_UBWC_STATIC, UBWC_CTRL_2 and
+ * UBWC_PREDICTION_MODE, see spec 120.6 -- still has to be settled against a
+ * readback of what the vendor stack leaves in those registers before decode can
+ * be turned on.
+ */
+static const struct qcom_ubwc_cfg_data tuna_data = {
+	.ubwc_enc_version = UBWC_5_0,
+	.ubwc_dec_version = 0,	/* see above: display decode not validated yet */
+	.ubwc_swizzle = UBWC_SWIZZLE_ENABLE_LVL2 | UBWC_SWIZZLE_ENABLE_LVL3,
+	.ubwc_bank_spread = true,
+	.highest_bank_bit = 16,	/* vendor encodes 3; mainline writes hbb - 13 */
+	.macrotile_mode = true,	/* qcom,sde-macrotile-mode = <1> in the factory tree */
+};
+
 static const struct qcom_ubwc_cfg_data glymur_data = {
 	.ubwc_enc_version = UBWC_5_0,
 	.ubwc_dec_version = UBWC_5_0,
@@ -294,7 +335,7 @@ static const struct of_device_id qcom_ubwc_configs[] __maybe_unused = {
 	{ .compatible = "qcom,sm8450", .data = &sm8350_data, },
 	{ .compatible = "qcom,sm8550", .data = &sm8550_data, },
 	{ .compatible = "qcom,sm8650", .data = &sm8550_data, },
-	{ .compatible = "qcom,tuna", .data = &sm8750_data, },
+	{ .compatible = "qcom,tuna", .data = &tuna_data },
 	{ .compatible = "qcom,sm8750", .data = &sm8750_data, },
 	{ .compatible = "qcom,x1e80100", .data = &sm8550_data, },
 	{ .compatible = "qcom,x1p42100", .data = &sm8550_data, },

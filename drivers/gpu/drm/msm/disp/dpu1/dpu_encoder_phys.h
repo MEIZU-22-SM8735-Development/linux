@@ -23,8 +23,16 @@
 
 #define DPU_ENCODER_NAME_MAX	16
 
-/* wait for at most 2 vsync for lowest refresh rate (24hz) */
-#define KICKOFF_TIMEOUT_MS		84
+/*
+ * How long a kickoff may wait for the panel.  84 ms is two vsyncs at 24 Hz,
+ * which the vendor uses for a panel that is always scanning at its mode rate.
+ * This board's ADFR floor is 10 Hz (100 ms between TE edges), so a commit that
+ * lands just after a TE would expire before the panel ever clocks the frame
+ * out: measured as "failed wait_for_idle: -110" plus a frame-done timeout storm
+ * once the floor was forced to 10 Hz.  220 ms is two floor periods plus margin,
+ * and only changes how late a genuinely stuck frame is reported.
+ */
+#define KICKOFF_TIMEOUT_MS		220
 #define KICKOFF_TIMEOUT_JIFFIES		msecs_to_jiffies(KICKOFF_TIMEOUT_MS)
 
 /**
@@ -135,6 +143,8 @@ enum dpu_intr_idx {
 	INTR_IDX_CTL_START,
 	INTR_IDX_RDPTR,
 	INTR_IDX_WB_DONE,
+	/* the second ping-pong of a widebus pair; see m2582.features=ppboth */
+	INTR_IDX_PINGPONG2,
 	INTR_IDX_MAX,
 };
 

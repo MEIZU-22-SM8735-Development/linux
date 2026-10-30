@@ -88,6 +88,14 @@ struct dpu_hw_pingpong_ops {
 	void (*disable_dsc)(struct dpu_hw_pingpong *pp);
 
 	/**
+	 * @set_ppb_fifo_size: set the ping-pong latency buffer depth, in pixels
+	 *
+	 * Only exists on cores whose ping-pong has the FIFO-depth register
+	 * instead of the legacy tear-check block.
+	 */
+	void (*set_ppb_fifo_size)(struct dpu_hw_pingpong *pp, u32 pixels);
+
+	/**
 	 * @setup_dsc: Setup DSC
 	 */
 	int (*setup_dsc)(struct dpu_hw_pingpong *pp);

@@ -723,7 +723,30 @@ static const struct msm_mmu_funcs funcs = {
 		.set_stall = msm_iommu_set_stall,
 };
 
-struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
+static void msm_iommu_map_direct_regions(struct msm_iommu *iommu,
+					 struct device *dev);
+
+/*
+ * Round CA: @disp closes the splash-handover race window.
+ *
+ * The failure it defends against is timing-dependent: between
+ * iommu_attach_device() (which drops the IOMMU_RESV_DIRECT splash mapping the
+ * bootloader's still-running display master relies on) and the point where we
+ * re-create that mapping, the splash region is unmapped, and a residual fetch
+ * that lands in the gap faults the arm-smmu port and wedges every later DSI
+ * command DMA (-110).  The round-BN fix re-created the mapping but left a gap:
+ * msm_iommu_disp_new() returned from this function, ran to_msm_iommu(), and
+ * set the fault handler before finally calling the remap.  Any early-boot
+ * change that shifts probe timing (round BZ's tsens/qfprom) can move the race
+ * across the win/lose line.
+ *
+ * So for the display path: install the fault handler *before* attach (so a
+ * fault in the window is routed, not silently fatal) and re-map the direct
+ * regions *immediately* after a successful attach, with nothing in between --
+ * the gap is now zero instructions, not a function return plus two calls.
+ */
+static struct msm_mmu *__msm_iommu_new(struct device *dev, unsigned long quirks,
+				       bool disp)
 {
 	struct iommu_domain *domain;
 	struct msm_iommu *iommu;
@@ -749,6 +772,13 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
 
 	mutex_init(&iommu->init_lock);
 
+	/*
+	 * Route splash-region faults before we attach, so the tiny window
+	 * between attach and remap below can never be silently fatal.
+	 */
+	if (disp)
+		iommu_set_fault_handler(domain, msm_disp_fault_handler, iommu);
+
 	ret = iommu_attach_device(iommu->domain, dev);
 	if (ret) {
 		iommu_domain_free(domain);
@@ -756,22 +786,100 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
 		return ERR_PTR(ret);
 	}
 
+	/*
+	 * No gap: re-create the identity mappings the instant page tables
+	 * exist (arm-smmu allocates them on first attach), before any other
+	 * code -- or a residual bootloader fetch -- can observe the hole.
+	 */
+	if (disp)
+		msm_iommu_map_direct_regions(iommu, dev);
+
 	return &iommu->base;
+}
+
+struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
+{
+	return __msm_iommu_new(dev, quirks, false);
+}
+
+/*
+ * A bootloader that leaves its splash pipeline running hands the kernel a
+ * live -- or stalled -- display master.  Those transactions target the
+ * framebuffer the bootloader programmed, which DT describes as a
+ * reserved-memory region with an iommu-addresses back-reference, i.e. an
+ * IOMMU_RESV_DIRECT region for this device.
+ *
+ * The IOMMU core only installs direct mappings into a device's *default*
+ * domain (iommu_create_device_direct_mappings() is reached solely from
+ * __iommu_probe_device() and iommu_setup_default_domain()), and even there
+ * it skips them unless the default domain translates.  A display driver
+ * that allocates and attaches its own unmanaged domain therefore drops them
+ * silently: from the moment we attach, the splash region is unmapped.  A
+ * residual bootloader fetch is then fault-terminated rather than completed,
+ * and on arm-smmu that leaves the display AXI port wedged -- every later
+ * DSI command DMA times out and the panel never lights.
+ *
+ * Re-create the direct mappings in our own domain.  This must happen after
+ * iommu_attach_device(): arm-smmu only allocates a domain's page tables
+ * when the first device attaches to it, so an earlier iommu_map() would
+ * return -ENODEV.
+ *
+ * A failure here is not fatal.  It leaves the pre-existing behaviour -- a
+ * working display on the boots where the bootloader handed over cleanly --
+ * so it is reported and probe continues.
+ */
+static void msm_iommu_map_direct_regions(struct msm_iommu *iommu,
+					 struct device *dev)
+{
+	struct iommu_domain *domain = iommu->domain;
+	struct iommu_resv_region *r;
+	unsigned long pg_size;
+	LIST_HEAD(regions);
+
+	pg_size = domain->pgsize_bitmap ? 1UL << __ffs(domain->pgsize_bitmap)
+					: PAGE_SIZE;
+
+	iommu_get_resv_regions(dev, &regions);
+
+	list_for_each_entry(r, &regions, list) {
+		phys_addr_t start, end, mapped;
+		int ret;
+
+		if (r->type != IOMMU_RESV_DIRECT &&
+		    r->type != IOMMU_RESV_DIRECT_RELAXABLE)
+			continue;
+
+		start = ALIGN_DOWN(r->start, pg_size);
+		end   = ALIGN(r->start + r->length, pg_size);
+
+		ret = iommu_map(domain, start, start, end - start,
+				r->prot ? r->prot : IOMMU_READ | IOMMU_WRITE,
+				GFP_KERNEL);
+		if (ret) {
+			dev_err(dev,
+				"failed to direct-map %pa..%pa into the display domain: %d\n",
+				&start, &end, ret);
+			continue;
+		}
+
+		mapped = iommu_iova_to_phys(domain, start);
+		dev_dbg(dev,
+			"direct-mapped %pa..%pa into the display domain (iova_to_phys -> %pa)\n",
+			&start, &end, &mapped);
+	}
+
+	iommu_put_resv_regions(dev, &regions);
 }
 
 struct msm_mmu *msm_iommu_disp_new(struct device *dev, unsigned long quirks)
 {
-	struct msm_iommu *iommu;
-	struct msm_mmu *mmu;
-
-	mmu = msm_iommu_new(dev, quirks);
-	if (IS_ERR(mmu))
-		return mmu;
-
-	iommu = to_msm_iommu(mmu);
-	iommu_set_fault_handler(iommu->domain, msm_disp_fault_handler, iommu);
-
-	return mmu;
+	/*
+	 * Round CA: the display fault handler and the direct-region remap are
+	 * now done inside __msm_iommu_new() -- the handler before attach, the
+	 * remap immediately after -- so there is no attach->remap gap for a
+	 * residual splash fetch to fault into.  See __msm_iommu_new().
+	 */
+	return __msm_iommu_new(dev, quirks, true);
 }
 
 struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsigned long quirks)

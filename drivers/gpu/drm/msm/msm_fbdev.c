@@ -169,6 +169,14 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 		ret = PTR_ERR(fbi->screen_buffer);
 		goto fail;
 	}
+	/*
+	 * FBINFO_VIRTFB: this framebuffer is in system memory, so the fb_ops
+	 * below are the sys_* ones (FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS), and
+	 * those warn once per call when the flag is clear.  There is nothing to
+	 * assign to screen_base -- it and screen_buffer are the same union
+	 * member (include/linux/fb.h).
+	 */
+	fbi->flags |= FBINFO_VIRTFB;
 	fbi->screen_size = bo->size;
 	fbi->fix.smem_start = paddr;
 	fbi->fix.smem_len = bo->size;
