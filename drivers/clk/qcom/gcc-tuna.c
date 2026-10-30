@@ -2899,6 +2899,44 @@ static const struct regmap_config gcc_tuna_regmap_config = {
 	.fast_io = true,
 };
 
+/*
+ * PCIe0 and its PHY.  The vendor keeps these as two standalone gdsc nodes
+ * whose regs are the GDSCR addresses, 0x16b004 and 0x16c000 (live:14694,
+ * live:14707); this controller's window starts at 0x100000 (tuna.dtsi:142),
+ * so the offsets are 0x6b004 and 0x6c000, the same pair sm8750 uses
+ * (gcc-sm8750.c:2883-2909).  Their collapse votes are bits 0 and 2 of the
+ * gcc_apcs_gdsc_vote_ctrl syscon at 0x15214c (live:14688, live:14700,
+ * live:14713) -> .collapse_ctrl 0x5214c, and the flags are the vendor's own
+ * properties: support-cfg-gdscr -> POLL_CFG_GDSCR (status is at gdscr + 4,
+ * gdsc.c:35), retain-regs -> RETAIN_FF_ENABLE (bit 11 in both gdsc.c:34 and
+ * the vendor's RETAIN_FF_ENABLE_MASK), collapse-vote -> VOTABLE (gdsc.c:563).
+ * The vendor declares no clamp-io and no hw-trigger, so neither flag is set.
+ * The CFG_GDSCR wait fields are not in the runtime DT and keep mainline's
+ * defaults (gdsc.c:38-40, written at gdsc.c:525-534); sm8750 is the only
+ * sibling that overrides one of them (clk_dis_wait_val = 0xf for PCIe0).
+ */
+static struct gdsc gcc_pcie_0_gdsc = {
+	.gdscr = 0x6b004,
+	.collapse_ctrl = 0x5214c,
+	.collapse_mask = BIT(0),
+	.pd = {
+		.name = "gcc_pcie_0_gdsc",
+	},
+	.pwrsts = PWRSTS_OFF_ON,
+	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+};
+
+static struct gdsc gcc_pcie_0_phy_gdsc = {
+	.gdscr = 0x6c000,
+	.collapse_ctrl = 0x5214c,
+	.collapse_mask = BIT(2),
+	.pd = {
+		.name = "gcc_pcie_0_phy_gdsc",
+	},
+	.pwrsts = PWRSTS_OFF_ON,
+	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+};
+
 static struct gdsc gcc_ufs_mem_phy_gdsc = {
 	.gdscr = 0x9e000,
 	.en_rest_wait_val = 0x2,
@@ -2948,6 +2986,8 @@ static struct gdsc gcc_usb3_phy_gdsc = {
 };
 
 static struct gdsc *gcc_tuna_gdscs[] = {
+	[GCC_PCIE_0_GDSC] = &gcc_pcie_0_gdsc,
+	[GCC_PCIE_0_PHY_GDSC] = &gcc_pcie_0_phy_gdsc,
 	[GCC_UFS_MEM_PHY_GDSC] = &gcc_ufs_mem_phy_gdsc,
 	[GCC_UFS_PHY_GDSC] = &gcc_ufs_phy_gdsc,
 	[GCC_USB30_PRIM_GDSC] = &gcc_usb30_prim_gdsc,
@@ -3014,33 +3054,6 @@ static int gcc_tuna_probe(struct platform_device *pdev)
 	/* FORCE_MEM_CORE_ON for ufs phy ice core clocks */
 	regmap_update_bits(regmap, gcc_ufs_phy_ice_core_clk.halt_reg,
 			   BIT(14), BIT(14));
-
-	/*
-	 * M2582: force the USB3 PIPE clock mux onto the wrapper source.
-	 *
-	 * gcc_usb3_prim_phy_pipe_clk_src is a 2-bit mux at 0x39070 whose hardware
-	 * inputs are:
-	 *   0 -> usb3_phy_wrapper_gcc_usb30_pipe_clk (the wrapper line, present)
-	 *   2 -> bi_tcxo                             (19.2 MHz, wrong domain)
-	 *   3 -> gcc_gpll0_out_even                  (wrong domain)
-	 * Its gate is 0x3906c bit 0.
-	 *
-	 * The "125 MHz" that clk_summary reports only reflects the software parent
-	 * (a clk_fixed_rate the QMP driver registers), not what the hardware mux is
-	 * actually selecting. If the mux is left on tcxo or gpll0 then
-	 * DCTL.CSFTRST never sees a PIPE clock and never self-clears, which is the
-	 * failure this board shows.
-	 */
-	/*
-	 * M2582: read the GDSC power state straight out of the hardware.
-	 *
-	 * pm_genpd_summary reports the software state, not the register. If the
-	 * domain's power-on bit is not actually set then the USB3 PHY has no
-	 * power, and a PHY with no power answers register reads from retention
-	 * while never reporting ready -- which is exactly what is observed.
-	 *   0x50018 = gcc_usb3_phy_gdsc      (0x100000 + 0x50018 = 0x150018)
-	 *   0x39004 = gcc_usb30_prim_gdsc
-	 */
 
 	/*
 	 * Force the USB3 PIPE clock mux onto the wrapper source: 0x39070 = 0
