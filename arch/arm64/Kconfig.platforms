@@ -488,6 +488,38 @@ config ARM64_MEIZU_M2582_DT_IMPORT
 	  captured from this device's firmware, so this is off by default while
 	  the handoff is being debugged. Say N to use the embedded DT verbatim.
 
+config ARM64_MEIZU_M2582_HALT
+	bool "Meizu 22: freeze the machine at a chosen point for a photograph"
+	depends on ARCH_QCOM && OF
+	default y
+	help
+	  Adds meizu.halt_ms=<ms> and meizu.halt_at=<name>, which stop the
+	  machine dead (other CPUs included) at a chosen moment so that a panel
+	  showing the kernel log can be photographed.  On this board that is
+	  the only way to read the log of a boot that dies before USB: pstore
+	  and the cross-reboot marker are both wiped between boots, and a reset
+	  takes the panel with it.
+
+config ARM64_MEIZU_M2582_PDC
+	bool "Meizu 22: send the WCN's PDC init table to the AOP before powering it"
+	depends on ARCH_QCOM && OF && QCOM_AOSS_QMP
+	default y
+	help
+	  The vendor's Bluetooth power driver reconfigures the WCN's power domain
+	  controller through the AOP before the chip's rails are enabled: it
+	  reads qcom,pdc_init_table off its device tree node and sends every
+	  entry over QMP (btpower.ko, bt_aop_pdc_reconfig at .text+0x30ac).
+	  Mainline has no counterpart, and without it the WCN's internal domains
+	  are undefined while the chip is powered and out of reset -- which is
+	  the shape of this board's Bluetooth failure, a hard reset about a
+	  second after the probe with no kernel message.
+
+	  This driver reads the same table shape from the device tree and sends
+	  each entry.  Its probe is ordered before the Bluetooth driver's by the
+	  power-domains reference in meizu-m2582-bt.dtsi, so the table is always
+	  on the wire before those rails can be raised.  Say N to leave the step
+	  out; the Bluetooth node then defers instead of probing.
+
 config ARM64_MEIZU_M2582_MARKER
 	bool
 	depends on ARCH_QCOM && OF
@@ -503,6 +535,17 @@ config ARM64_MEIZU_M2582_BOOT_PROBE
 	help
 	  Select a diagnostic-only board DT for architecture bring-up.
 	  This does not test UFS, USB or display. If unsure, say N.
+
+config ARM64_MEIZU_M2582_FEATURES
+	bool
+	depends on ARCH_QCOM && OF
+	default y
+	help
+	  Honour m2582.features= / m2582.disable= on the kernel command line by
+	  turning the matching device tree nodes off before they are populated
+	  into devices.  One subsystem can then be brought up per boot without
+	  rebuilding, and a subsystem that hangs the machine can be left out of
+	  the next boot from the command line alone.
 
 config BUILTIN_DTB_NAME
 	string

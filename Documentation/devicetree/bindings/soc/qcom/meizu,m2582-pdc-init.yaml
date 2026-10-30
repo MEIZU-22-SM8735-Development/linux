@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/qcom/meizu,m2582-pdc-init.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Meizu 22 (M2582) WCN power domain controller init table
+
+maintainers:
+  - The Meizu 22 mainline port
+
+description: |
+  The WCN7750's power domain controller has to be programmed through the AOP
+  before the chip's rails are enabled.  The vendor's Bluetooth power driver
+  does it from its own device tree node: it reads qcom,pdc_init_table and
+  sends every entry to the AOP over the QMP mailbox (btpower.ko,
+  bt_aop_pdc_reconfig at .text+0x30ac).  Mainline has no counterpart, so the
+  table is carried here.
+
+  The node must be probed before the Bluetooth controller's, because the table
+  has to be on the wire before that driver enables the rails.  That ordering is
+  expressed by the Bluetooth node referring to this one through power-domains,
+  which makes the Bluetooth device defer until this driver has probed.
+
+  The entries are the vendor's own strings, verbatim, so that the table stays
+  traceable to the factory device tree; the driver parses them and rebuilds the
+  wire form the vendor sends ("{class: wlan_pdc, res: %s.%s, %s: %d}").
+
+properties:
+  compatible:
+    const: meizu,m2582-pdc-init
+
+  qcom,qmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The AOP QMP mailbox.  The driver defers until this provider has probed.
+
+  qcom,pdc-init-table:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description:
+      The PDC init table, one entry per message, in the vendor's declarative
+      form: "{class: <class>, ss: <subsystem>, res: <resource>, <key>: <value>}".
+      The "ss" field is validated and not sent; the message put on the wire
+      carries class, res and the single value field.
+
+  "#power-domain-cells":
+    const: 0
+
+  m2582,feature:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      The project's subsystem gate: the node is disabled unless this name is in
+      the m2582.features= command line list.
+
+required:
+  - compatible
+  - qcom,qmp
+  - qcom,pdc-init-table
+  - "#power-domain-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    pdc-init {
+        compatible = "meizu,m2582-pdc-init";
+        m2582,feature = "bt";
+
+        qcom,qmp = <&aoss_qmp>;
+
+        qcom,pdc-init-table =
+            " {class: wlan_pdc, ss: rf, res: s3b.v, upval: 976}",
+            " {class: wlan_pdc, ss: bb, res: pdc, enable: 1}";
+
+        #power-domain-cells = <0>;
+    };

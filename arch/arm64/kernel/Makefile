@@ -41,6 +41,13 @@ obj-$(CONFIG_COMPAT)			+= sys32.o signal32.o			\
 obj-$(CONFIG_COMPAT)			+= sigreturn32.o
 obj-$(CONFIG_COMPAT_ALIGNMENT_FIXUPS)	+= compat_alignment.o
 obj-$(CONFIG_ARM64_MEIZU_M2582_MARKER) += meizu-m2582-fdt.o
+# The freeze-for-a-photograph facility: useful on any board whose failures
+# happen before anyone can read a log, so it is not tied to the marker config.
+obj-$(CONFIG_ARM64_MEIZU_M2582_HALT) += meizu-m2582-halt.o
+obj-$(CONFIG_ARM64_MEIZU_M2582_FEATURES) += meizu-m2582-features.o
+# The WCN power domain controller table, sent over the AOP/QMP mailbox before
+# the Bluetooth driver can raise that chip's rails.
+obj-$(CONFIG_ARM64_MEIZU_M2582_PDC) += meizu-m2582-pdc.o
 obj-$(CONFIG_KUSER_HELPERS)		+= kuser32.o
 obj-$(CONFIG_FUNCTION_TRACER)		+= ftrace.o entry-ftrace.o
 obj-$(CONFIG_MODULES)			+= module.o module-plts.o

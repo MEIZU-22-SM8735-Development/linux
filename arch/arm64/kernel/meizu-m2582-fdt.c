@@ -152,7 +152,17 @@ void meizu_m2582_marker_write(u32 phase)
 
 void __init meizu_m2582_marker_early(void)
 {
-	/* Retired: the on-screen console is the diagnostic channel now. */
+	/*
+	 * Read what the previous boot left behind.  The write side lives in
+	 * meizu_m2582_marker_write() and runs wherever it is called from; this
+	 * read has to happen here because it uses early_memremap, and the
+	 * early ioremap window is gone by the time the late initcall runs.
+	 *
+	 * Without this call /proc/m2582_marker reports valid=0 for ever, which
+	 * is exactly what it did: the reader had been retired along with the
+	 * on-screen console it used to feed.
+	 */
+	m2582_marker_read_previous();
 }
 
 static int m2582_marker_proc_show(struct seq_file *m, void *v)
@@ -181,14 +191,14 @@ static struct notifier_block __maybe_unused m2582_marker_reboot_nb = {
 	.priority = INT_MAX,
 };
 
-static int __init __maybe_unused m2582_marker_late_init(void)
+static int __init m2582_marker_late_init(void)
 {
 	meizu_m2582_marker_write(2);
 	proc_create_single("m2582_marker", 0444, NULL, m2582_marker_proc_show);
 	return register_reboot_notifier(&m2582_marker_reboot_nb);
 }
+late_initcall(m2582_marker_late_init);
 
-#endif /* !M2582_FDT_HOST_TEST */
 
 static int m2582_firmware_ramoops(const void *firmware,
 				   unsigned long long target_base,
@@ -926,3 +936,5 @@ void * __init meizu_m2582_fixup_fdt(const void *firmware)
 #endif /* CONFIG_ARM64_MEIZU_M2582_DT_IMPORT */
 #endif /* CONFIG_ARM64_MEIZU_M2582_BUILTIN_DTB */
 #endif
+
+#endif /* !M2582_FDT_HOST_TEST */
