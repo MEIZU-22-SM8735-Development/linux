@@ -1669,15 +1669,6 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 		return 0;
 
 	/*
-	 * Make sure the GX domain is off before turning off the GMU (CX)
-	 * domain, and before the RSC is told to slumber the domains it
-	 * controls.  The vendor takes GX over and collapses it while the
-	 * domain is still awake, then runs its RSC sleep sequence and checks
-	 * for "gx is stuck on" afterwards.
-	 */
-	a6xx_gmu_gxpd_put(gmu);
-
-	/*
 	 * Force the GMU off if we detected a hang, otherwise try to shut it
 	 * down gracefully
 	 */
@@ -1685,6 +1676,26 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 		a6xx_gmu_force_off(gmu);
 	else
 		a6xx_gmu_shutdown(gmu);
+
+	/*
+	 * Drop GX only now, not before the shutdown above.
+	 *
+	 * a6xx_gmu_shutdown() opens with a GPU_SET OOB handshake -- the "dummy
+	 * handshake" that keeps the firmware's internal power state sane when
+	 * the GPU was resumed but never initialised -- and the GMU cannot
+	 * acknowledge a request about the GPU core once GX is gone: the
+	 * interrupt info register reads back 0x0 and the handshake times out,
+	 * which sends the whole suspend down the force_off path (CM3 reset
+	 * instead of PREPARE_SLUMBER).  Measured on this board: two timeouts
+	 * and a forced power-off on every runtime suspend.
+	 *
+	 * The vendor reaches GX last.  gen8_gmu_power_off runs its RSCC sleep
+	 * sequence, halts GBIF, stops the HFI and only then enters
+	 * gen8_gmu_suspend(), which is where the GX rail is toggled; CX is
+	 * dropped after the clocks.  This is that order, with the clocks and
+	 * the CX (GMU) domain handled below.
+	 */
+	a6xx_gmu_gxpd_put(gmu);
 
 	/* Remove the bus vote */
 	dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
