@@ -337,18 +337,23 @@ static int a6xx_gmu_start(struct a6xx_gmu *gmu)
 		gmu_write(gmu, REG_A6XX_GPU_GMU_CX_GMU_PWR_COL_CP_RESP, 0);
 
 
-	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 0);
-
 	/*
 	 * The reset pulse erases the cache configuration a6xx_gmu_power_config()
-	 * set up, and the firmware's boot walk then fails its cache handshake;
-	 * re-apply it before releasing the CM3.
+	 * set up, and the firmware's boot walk then fails its cache handshake.
+	 * Re-apply it while the CM3 is still held in reset: the vendor does the
+	 * same (gen8_gmu_register_config writes 0x1f40f/0x1f400/0x1f401 before
+	 * gen8_gmu_device_start writes 0 to CM3_SYSRESET), and doing it after the
+	 * release races the boot walk -- the firmware starts executing at the
+	 * MMIO write, so whether it sees this configuration depends on whether
+	 * the CPU wins the race.
 	 */
 	gmu_write(gmu, REG_A6XX_GMU_SYS_BUS_CONFIG, 0x1);
 	gmu_write(gmu, REG_A6XX_GMU_ICACHE_CONFIG, 0x1);
 	gmu_write(gmu, REG_A6XX_GMU_DCACHE_CONFIG, 0x1);
 	/* the configuration has to be visible before the CM3 is released */
 	wmb();
+
+	gmu_write(gmu, REG_A6XX_GMU_CM3_SYSRESET, 0);
 
 	ret = gmu_poll_timeout(gmu, REG_A6XX_GMU_CM3_FW_INIT_RESULT, val,
 		(val & mask) == reset_val, 100, 10000);
