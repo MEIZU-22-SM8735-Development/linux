@@ -96,6 +96,16 @@ struct msm_dp_desc {
 	bool wide_bus_supported;
 };
 
+/*
+ * Tuna (SM8735): one controller at the factory device tree's sde_dp base
+ * 0xaf54000, with wide bus (the vendor node sets qcom,widebus-enable along
+ * with DSC and FEC).  Controllers are matched by this address.
+ */
+static const struct msm_dp_desc msm_dp_desc_tuna[] = {
+	{ .io_start = 0x0af54000, .id = MSM_DP_CONTROLLER_0, .wide_bus_supported = true },
+	{}
+};
+
 static const struct msm_dp_desc msm_dp_desc_glymur[] = {
 	{ .io_start = 0x0af54000, .id = MSM_DP_CONTROLLER_0, .wide_bus_supported = true },
 	{ .io_start = 0x0af5c000, .id = MSM_DP_CONTROLLER_1, .wide_bus_supported = true },
@@ -161,7 +171,8 @@ static const struct msm_dp_desc msm_dp_desc_x1e80100[] = {
 };
 
 static const struct of_device_id msm_dp_dt_match[] = {
-	{ .compatible = "qcom,glymur-dp", .data = &msm_dp_desc_glymur },
+	{ .compatible = "qcom,tuna-dp", .data = msm_dp_desc_tuna },
+	{ .compatible = "qcom,glymur-dp", .data = msm_dp_desc_glymur },
 	{ .compatible = "qcom,sa8775p-dp", .data = &msm_dp_desc_sa8775p },
 	{ .compatible = "qcom,sc7180-dp", .data = &msm_dp_desc_sc7180 },
 	{ .compatible = "qcom,sc7280-dp", .data = &msm_dp_desc_sc7280 },
