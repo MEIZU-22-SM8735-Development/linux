@@ -1083,15 +1083,32 @@ static int geni_i2c_probe(struct platform_device *pdev)
 		goto err_clk;
 	}
 	proto = geni_se_read_proto(&gi2c->se);
-	if (proto == GENI_SE_INVALID_PROTO) {
+	/*
+	 * M2582: a stale protocol is as good as none.
+	 *
+	 * The serial engines come out of the bootloader programmed for whatever
+	 * last used them, and "last" is not necessarily this kernel.  Measured
+	 * on this board: SE4 (a90000, the touchscreen) reports proto 1 = SPI
+	 * and SE5 (a94000, the Bluetooth UART) reports proto 3 = I2C.  mainline
+	 * only loads the firmware when the protocol reads as invalid (255), so
+	 * against a stale-but-valid value it does the worst of both: it skips
+	 * the load and then refuses the bus outright -- "Invalid proto 1", and
+	 * the touchscreen is never probed.  The vendor's driver has no such
+	 * early return; it programs the engine every time.
+	 *
+	 * So do that: anything other than the protocol we want is treated as
+	 * something to overwrite.  It is safe because nothing else can be using
+	 * the engine -- whoever programmed it is gone.
+	 */
+	if (proto != GENI_SE_I2C) {
+		if (proto != GENI_SE_INVALID_PROTO)
+			dev_dbg(dev, "reprogramming SE, stale proto %d\n", proto);
+
 		ret = geni_load_se_firmware(&gi2c->se, GENI_SE_I2C);
 		if (ret) {
 			dev_err_probe(dev, ret, "i2c firmware load failed ret: %d\n", ret);
 			goto err_resources;
 		}
-	} else if (proto != GENI_SE_I2C) {
-		ret = dev_err_probe(dev, -ENXIO, "Invalid proto %d\n", proto);
-		goto err_resources;
 	}
 
 	if (desc && desc->no_dma_support) {
