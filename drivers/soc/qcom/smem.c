@@ -382,6 +382,9 @@ int qcom_smem_bust_hwspin_lock_by_host(unsigned int host)
 	if (host == SMEM_HOST_APPS || !xa_load(&__smem->partitions, host))
 		return -EINVAL;
 
+	if (!__smem->hwlock)
+		return -EOPNOTSUPP;
+
 	return hwspin_lock_bust(__smem->hwlock, SMEM_HOST_ID_TO_HWSPINLOCK_ID(host));
 }
 EXPORT_SYMBOL_GPL(qcom_smem_bust_hwspin_lock_by_host);
@@ -521,11 +524,13 @@ int qcom_smem_alloc(unsigned host, unsigned item, size_t size)
 	if (item >= __smem->item_count)
 		return -EINVAL;
 
-	ret = hwspin_lock_timeout_irqsave(__smem->hwlock,
-					  HWSPINLOCK_TIMEOUT,
-					  &flags);
-	if (ret)
-		return ret;
+	if (__smem->hwlock) {
+		ret = hwspin_lock_timeout_irqsave(__smem->hwlock,
+						  HWSPINLOCK_TIMEOUT,
+						  &flags);
+		if (ret)
+			return ret;
+	}
 
 	part = xa_load(&__smem->partitions, host);
 	if (part) {
@@ -537,7 +542,8 @@ int qcom_smem_alloc(unsigned host, unsigned item, size_t size)
 		ret = qcom_smem_alloc_global(__smem, item, size);
 	}
 
-	hwspin_unlock_irqrestore(__smem->hwlock, &flags);
+	if (__smem->hwlock)
+		hwspin_unlock_irqrestore(__smem->hwlock, &flags);
 
 	return ret;
 }
@@ -1193,20 +1199,37 @@ static int qcom_smem_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(__smem), "SMEM is not initialized by SBL\n");
 	}
 
-	hwlock_id = of_hwspin_lock_get_id(pdev->dev.of_node, 0);
-	if (hwlock_id < 0)
-		return dev_err_probe(&pdev->dev, hwlock_id,
-				     "failed to retrieve hwlock\n");
+	/*
+	 * The hwlock is optional, but its absence is loud: without it,
+	 * concurrent heap allocation from two processors can corrupt SMEM.
+	 * It is also the only part of SMEM that needs a register outside the
+	 * SMEM region itself, so a board whose mutex block is unreachable can
+	 * still use SMEM read-mostly instead of losing the whole
+	 * remote-processor stack with it.  The Meizu 22 is such a board: its
+	 * mutex block hangs the AXI bus when a lock is taken.
+	 */
+	if (of_property_present(pdev->dev.of_node, "hwlocks")) {
+		hwlock_id = of_hwspin_lock_get_id(pdev->dev.of_node, 0);
+		if (hwlock_id < 0)
+			return dev_err_probe(&pdev->dev, hwlock_id,
+					     "failed to retrieve hwlock\n");
 
-	smem->hwlock = devm_hwspin_lock_request_specific(&pdev->dev, hwlock_id);
-	if (!smem->hwlock)
-		return -ENXIO;
+		smem->hwlock = devm_hwspin_lock_request_specific(&pdev->dev, hwlock_id);
+		if (!smem->hwlock)
+			return -ENXIO;
+	} else {
+		dev_warn(&pdev->dev,
+			 "no hwlock: SMEM heap allocation is not serialised with the remote processors\n");
+	}
 
-	ret = hwspin_lock_timeout_irqsave(smem->hwlock, HWSPINLOCK_TIMEOUT, &flags);
-	if (ret)
-		return ret;
+	if (smem->hwlock) {
+		ret = hwspin_lock_timeout_irqsave(smem->hwlock, HWSPINLOCK_TIMEOUT, &flags);
+		if (ret)
+			return ret;
+	}
 	size = readl_relaxed(&header->available) + readl_relaxed(&header->free_offset);
-	hwspin_unlock_irqrestore(smem->hwlock, &flags);
+	if (smem->hwlock)
+		hwspin_unlock_irqrestore(smem->hwlock, &flags);
 
 	version = qcom_smem_get_sbl_version(smem);
 	/*
