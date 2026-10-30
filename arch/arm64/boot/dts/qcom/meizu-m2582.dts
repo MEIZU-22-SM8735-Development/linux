@@ -341,7 +341,17 @@
 	/*
 	 * GPU DVFS table: frequencies, RPMh corners and ACD levels are the vendor's
 	 * power-levels@0 from the factory kgsl node (highest 1150 MHz, its
-	 * initial-pwrlevel = 10). opp-peak-kBps is the DDR bandwidth that level
+	 * initial-pwrlevel = 10).
+	 *
+	 * opp-supported-hw is not optional once the speed bin is readable:
+	 * a6xx_set_supported_hw() then calls dev_pm_opp_set_supported_hw() with
+	 * BIT(0), and _opp_is_supported() drops every OPP that does not carry a
+	 * matching version mask -- that is exactly what "no supported OPPs" and
+	 * "failed to load adreno gpu" looked like on the first boot that could
+	 * read the fuse.  Bit 0 is the only version there is: bin 0x00 and 0xf2
+	 * are the same table (see the catalog entry).
+	 *
+	 * opp-peak-kBps is the DDR bandwidth that level
 	 * votes for, read off the phone's own qcom,bus-table-ddr (0, 781250,
 	 * 2136718, 5285156, 6074218, 6671875, 8171875, 10687500, 12449218,
 	 * 14398437, 16500000, 18597656) through the level's qcom,bus-freq
@@ -356,6 +366,7 @@
 		opp-1150000000 {
 			opp-hz = /bits/ 64 <1150000000>;
 			opp-peak-kBps = <18597656>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L2>;
 			qcom,opp-acd-level = <0xa8285ffd>;
 		};
@@ -363,6 +374,7 @@
 		opp-1100000000 {
 			opp-hz = /bits/ 64 <1100000000>;
 			opp-peak-kBps = <18597656>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
 			qcom,opp-acd-level = <0x88295ffd>;
 		};
@@ -370,6 +382,7 @@
 		opp-1050000000 {
 			opp-hz = /bits/ 64 <1050000000>;
 			opp-peak-kBps = <18597656>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L0>;
 			qcom,opp-acd-level = <0x882a5ffd>;
 		};
@@ -377,6 +390,7 @@
 		opp-937000000 {
 			opp-hz = /bits/ 64 <937000000>;
 			opp-peak-kBps = <16500000>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_TURBO>;
 			qcom,opp-acd-level = <0x882a5ffd>;
 		};
@@ -384,6 +398,7 @@
 		opp-873000000 {
 			opp-hz = /bits/ 64 <873000000>;
 			opp-peak-kBps = <16500000>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
 			qcom,opp-acd-level = <0xa82a5ffd>;
 		};
@@ -391,6 +406,7 @@
 		opp-763000000 {
 			opp-hz = /bits/ 64 <763000000>;
 			opp-peak-kBps = <12449218>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
 			qcom,opp-acd-level = <0x882b5ffd>;
 		};
@@ -398,6 +414,7 @@
 		opp-688000000 {
 			opp-hz = /bits/ 64 <688000000>;
 			opp-peak-kBps = <8171875>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L2>;
 			qcom,opp-acd-level = <0x882b5ffd>;
 		};
@@ -405,6 +422,7 @@
 		opp-643000000 {
 			opp-hz = /bits/ 64 <643000000>;
 			opp-peak-kBps = <8171875>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
 			qcom,opp-acd-level = <0xa82b5ffd>;
 		};
@@ -412,6 +430,7 @@
 		opp-510000000 {
 			opp-hz = /bits/ 64 <510000000>;
 			opp-peak-kBps = <8171875>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
 			qcom,opp-acd-level = <0xc02c5ffd>;
 		};
@@ -419,6 +438,7 @@
 		opp-362000000 {
 			opp-hz = /bits/ 64 <362000000>;
 			opp-peak-kBps = <5285156>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
 			qcom,opp-acd-level = <0xc8295ffd>;
 		};
@@ -426,6 +446,7 @@
 		opp-264000000 {
 			opp-hz = /bits/ 64 <264000000>;
 			opp-peak-kBps = <781250>;
+			opp-supported-hw = <0x1>;
 			opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
 			qcom,opp-acd-level = <0xc8295ffd>;
 		};
@@ -557,19 +578,23 @@
 };
 
 /*
- * Let userspace set the RTC.
+ * The PMIC's RTC counter cannot be written from the AP -- with allow-set-time
+ * the SPMI write to 0x6140/0x6146 comes back "transaction denied" (-EPERM from
+ * the PMIC arbiter), so hwclock -w fails with "Operation not permitted".  The
+ * vendor's stack does not write it either: Android keeps the wall clock in a
+ * time_daemon offset.
  *
- * rtc-pm8xxx refuses RTC_SET_TIME unless the node says so, and the failure is
- * opaque: hwclock reports "ioctl(RTC_SET_TIME) to /dev/rtc0 to set the time
- * failed: No such device", which reads like a missing device rather than a
- * permission flag. Measured on the board: rtc0 registers and RTC_HCTOSYS pulls
- * the system clock from it, but the clock itself sits at 1970-11-29 until this
- * is set.
+ * mainline's alternative, a four-byte nvmem offset cell, was measured on this
+ * board and does not work: the counter arithmetic is right (the cell reads back
+ * a plausible offset) but the low 16 bits of every write to the PMIC SDAM are
+ * dropped, so the stored value 0x6adc46d1 comes back as 0x6adc0000 and the
+ * clock lands five hours off.  So the offset is kept on the root filesystem
+ * instead, by the m2582-clock boot hook, which is also where the measurement
+ * lives (docs/notes/clock-and-reboot-1031.md).
+ *
+ * The counter itself is a real RTC: measured at 1 s/s while running and it
+ * keeps counting through a power-off with the battery attached.
  */
-&pmk8550_rtc {
-	allow-set-time;
-};
-
 /*
  * SPMI address 6 is a PM8550VS on this board, not the PM8550VE that
  * sm8750-pmics.dtsi declares there for the rest of the family.  The phone's own
