@@ -11,6 +11,7 @@
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
+#include <linux/meizu-m2582.h>
 #include <linux/of_irq.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/pm_opp.h>
@@ -31,6 +32,8 @@
 #include "msm_kms.h"
 #include "msm_gem.h"
 #include "phy/dsi_phy.h"
+
+#include <linux/debugfs.h>
 
 #define DSI_RESET_TOGGLE_DELAY_MS 20
 
@@ -159,6 +162,18 @@ struct msm_dsi_host {
 	spinlock_t intr_lock; /* Protect interrupt ctrl register */
 
 	u32 err_work_state;
+	/*
+	 * Sticky OR of every err_work_state this link has reported since power
+	 * on.  err_work_state itself is cleared by dsi_err_worker() on every
+	 * pass and its print is rate limited, so a link error that happened
+	 * once during boot leaves nothing for a later reader to see; this does.
+	 */
+	u32 err_seen;
+	/* Separate errors during boot from errors during a pattern test. */
+	u32 fifo_error_count;
+	u32 mdp_underflow_count;
+	/* sticky OR of the raw STATUS0 word, see dsi_error() */
+	u32 status0_seen;
 	struct work_struct err_work;
 	struct workqueue_struct *workqueue;
 
@@ -169,6 +184,19 @@ struct msm_dsi_host {
 	/* DSI v2 TX buffer */
 	void *tx_buf;
 	dma_addr_t tx_buf_paddr;
+
+	/*
+	 * m2582.features=cmdphys: the controller's command DMA reads physical
+	 * memory, not IOVAs.  The factory's runtime dump shows it fetching from
+	 * 0xfff0c000, an address inside the DRAM bank that fills the top of the
+	 * 32-bit space (arch/arm64/boot/dts/qcom/meizu-m2582-memory.dtsi:
+	 * 0xffe00000 + 0x200000), so what the register wants is a physical
+	 * address.  Our normal path hands it the GEM buffer's IOVA, which is why
+	 * the transfer completes and the panel never sees the bytes.  This buffer
+	 * is coherent (physically contiguous) and small enough for one packet.
+	 */
+	void *cmd_dma_buf;
+	dma_addr_t cmd_dma_paddr;
 
 	int tx_size;
 
@@ -200,6 +228,8 @@ struct msm_dsi_host {
 	 * batch_open says the controller setup for that group is still up.
 	 */
 	u32 tx_offset;
+	/* diagnostic: the group just queued carried MIPI_DSI_MSG_BATCH_COMMAND */
+	bool tx_batched;
 	bool batch_open;
 
 	bool registered;
@@ -832,6 +862,22 @@ bool msm_dsi_host_is_wide_bus_enabled(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
+	/*
+	 * The factory's INTF_CONFIG2 for this panel reads 0x110, i.e.
+	 * DATABUS_WIDEN (BIT(0)) is CLEAR -- the factory's DPU->DSI interface
+	 * is narrow.  Upstream turns wide bus on for *any* DSC panel on DSI 6G
+	 * v2.5+, so this board has always run wide.
+	 *
+	 * This is the single gate for the whole pipeline: it feeds
+	 * dpu_enc->wide_bus_en, which reaches cmd_mode_cfg.wide_bus_en, the
+	 * interface's INTF_CONFIG2 and the datapath width.  Changing only the
+	 * INTF register (m2582.features=intf110) makes the picture worse, which
+	 * is what a register that disagrees with the rest of the pipeline looks
+	 * like, so the whole pipeline has to switch together.
+	 */
+	if (m2582_feature_opt_in("nowidebus"))
+		return false;
+
 	return msm_host->dsc &&
 		msm_dsi_host_version_geq(msm_host, MSM_DSI_VER_MAJOR_6G,
 					MSM_DSI_6G_VER_MINOR_V2_5_0);
@@ -973,6 +1019,26 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 
 		dsi_write(msm_host, REG_DSI_LANE_CTRL,
 			lane_ctrl | DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST);
+	} else if (m2582_feature_opt_in("lctr")) {
+		/*
+		 * m2582.features=lctr: program LANE_CTRL on the non-continuous
+		 * clock path too, the way the factory ends up.
+		 *
+		 * The factory's running controller reads back 0x01000000 here:
+		 * HS_REQ_SEL_PHY (bit 24) set, CLKLN_HS_FORCE_REQUEST (bit 28)
+		 * clear.  Mainline only touches this register when the clock is
+		 * continuous, so with this panel's NON_CONTINUOUS flag the whole
+		 * block is skipped and the register keeps whatever the bootloader
+		 * left.  This is the only link-level register our port provably
+		 * does not program, so it is worth one single-variable test: the
+		 * bit selects who owns the clock-lane HS request, and a wrong
+		 * answer there shows up in the tail bytes of every packet, which
+		 * on a compressed stream means the longest rows lose.
+		 */
+		lane_ctrl = dsi_read(msm_host, REG_DSI_LANE_CTRL);
+		lane_ctrl |= DSI_LANE_CTRL_HS_REQ_SEL_PHY;
+		lane_ctrl &= ~DSI_LANE_CTRL_CLKLN_HS_FORCE_REQUEST;
+		dsi_write(msm_host, REG_DSI_LANE_CTRL, lane_ctrl);
 	}
 
 	data |= DSI_CTRL_ENABLE;
@@ -1022,7 +1088,37 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 	 * Since the current driver only supports slice_per_pkt = 1,
 	 * pkt_per_line will be equal to slice per intf for now.
 	 */
-	pkt_per_line = slice_per_intf;
+	/*
+	 * "dsione": force one packet per line carrying both slices.
+	 *
+	 * This is the *deviation*, not the factory's shape.  The factory's own
+	 * controller was captured on this board (debugfs, screen on, command
+	 * mode) as
+	 *
+	 *	CTRL = 0x39003941    CTRL2 = 0x00000258
+	 *
+	 * and with the field layout from the generated header
+	 * (stream0: DATATYPE bits[13:8], PKT_PER_LINE bits[7:6],
+	 * EOL_BYTE_NUM bits[5:4], EN bit0; CTRL2 STREAM0_SLICE_WIDTH bits[15:0])
+	 * that decodes to
+	 *
+	 *	stream0: DT 0x39, EOL 0, PKT_PER_LINE = 1, EN = 1
+	 *	stream1: DT 0x39, EOL 0, PKT_PER_LINE = 0, EN = 0
+	 *	CTRL2  : slice width 600 = slice_chunk_size
+	 *
+	 * PKT_PER_LINE is written as (pkt_per_line >> 1) below, so a field value
+	 * of 1 means **two packets per line** -- exactly what the default
+	 * produces (slice_per_intf = 2).  An earlier revision of this comment
+	 * claimed the factory ran "PKT_PER_LINE = 0, one packet per line"; that
+	 * misreading is what the dsione arm was built on, and it is wrong.
+	 *
+	 * Note also: the vendor's DSI register window is shifted +4 in this
+	 * region relative to this tree's generated map.  The factory's CTRL sits
+	 * at 0x2a8 (this tree's 0x2a4) and its CTRL2 at 0x2ac (this tree's
+	 * 0x2a8), which is why the captured dump appears to put the framing
+	 * value in the "wrong" register.
+	 */
+	pkt_per_line = m2582_feature_opt_in("dsione") ? 1 : slice_per_intf;
 
 	if (is_cmd_mode) /* packet data type */
 		reg = DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(MIPI_DSI_DCS_LONG_WRITE);
@@ -1052,17 +1148,72 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 		reg_ctrl2 |= DSI_COMMAND_COMPRESSION_MODE_CTRL2_STREAM0_SLICE_WIDTH(dsc->slice_chunk_size);
 
 		/*
-		 * Stream 1 gets stream 0's compression framing.  The vendor's
-		 * controller leaves stream1 EN and SLICE_WIDTH at zero because
-		 * its two DSC encoders are merged into one interface, while here
-		 * both 600-byte slices travel as their own packet: framing only
-		 * stream 0 leaves half the picture pure noise.  The halves are
-		 * symmetric (datatype, pkt_per_line, eol, enable 16 bits apart).
+		 * Stream 1 gets stream 0's compression framing.
+		 *
+		 * The vendor's controller leaves stream1 EN and SLICE_WIDTH at zero
+		 * because its two DSC encoders are merged into one interface.  This
+		 * pipeline is not that: both 600-byte slices travel as their own
+		 * packet, so framing only stream 0 leaves half the picture pure
+		 * noise.  The halves are symmetric -- datatype, pkt_per_line, eol and
+		 * enable sit 16 bits apart -- so mirroring the low half into the high
+		 * half is the whole fix.
 		 */
-		reg_ctrl &= ~0xffff0000;
-		reg_ctrl |= (reg & 0xffff) << 16;
-		reg_ctrl2 &= ~(0xffff << 16);
-		reg_ctrl2 |= (dsc->slice_chunk_size & 0xffff) << 16;
+		/*
+		 * "nostream1": leave the high half at the factory's value instead of
+		 * mirroring stream 0 into it.
+		 *
+		 * The factory's REG_DSI_COMMAND_COMPRESSION_MODE_CTRL reads
+		 * 0x39003941 -- stream 0 framed (datatype 0x39, PKT_PER_LINE field 1
+		 * i.e. two packets per line, EN=1) and stream 1 carrying only the
+		 * datatype with EN=0.  The default here mirrors stream 0 into both
+		 * halves, because the commit that last measured this board working
+		 * (fb4e8c5d2b4f) observed "framing only stream 0 leaves half the
+		 * picture pure noise".  Those two statements disagree, and only the
+		 * hardware can settle it, so this is a one-variable A/B rather than a
+		 * guess.
+		 */
+		/*
+		 * Two arms, because two measurements disagree:
+		 *
+		 *  - the factory's running controller reads 0x39003941, i.e. the high
+		 *    half carries the datatype with EN and the slice width clear, and
+		 *    that is a working stack;
+		 *  - an older commit on this board observed that leaving the high half
+		 *    unframed made half the picture noise, and mirrored stream 0 into
+		 *    it to fix that.
+		 *
+		 * Both cannot be true of the same thing.  The default follows the
+		 * factory but writes the datatype explicitly instead of inheriting
+		 * it, so the register content does not depend on what the bootloader
+		 * left behind; "stream1" restores the mirroring so one cold boot can
+		 * decide.
+		 */
+		if (m2582_feature_opt_in("stream1") &&
+		    !m2582_feature_opt_in("dsione")) {
+			reg_ctrl &= ~0xffff0000;
+			reg_ctrl |= (reg & 0xffff) << 16;
+			reg_ctrl2 &= ~(0xffff << 16);
+			reg_ctrl2 |= (dsc->slice_chunk_size & 0xffff) << 16;
+		} else {
+			/*
+			 * Stream 1 keeps the factory's value: the datatype alone, with
+			 * EN and SLICE_WIDTH clear, so the register pair reads
+			 * 0x39003941 / 0x00000258 as the factory's controller does.
+			 *
+			 * The datatype matters: this pipeline is configured for two
+			 * packets per line (PKT_PER_LINE field 1), so the second packet
+			 * of every line is framed by this half, and a zero there gives
+			 * it datatype 0 -- which is exactly the "half the picture is
+			 * noise" failure an older commit worked around by mirroring
+			 * stream 0 into it.  Writing the datatype explicitly gets the
+			 * factory's register content without depending on whatever the
+			 * bootloader happened to leave in the block.
+			 */
+			reg_ctrl &= ~0xffff0000;
+			reg_ctrl |= (DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(
+					MIPI_DSI_DCS_LONG_WRITE)) << 16;
+			reg_ctrl2 &= ~(0xffff << 16);
+		}
 
 		dsi_write(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL, reg_ctrl);
 		dsi_write(msm_host, REG_DSI_COMMAND_COMPRESSION_MODE_CTRL2, reg_ctrl2);
@@ -1198,6 +1349,11 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 			 */
 			wc = msm_host->dsc->slice_chunk_size + 1;
 
+		/* one packet per line: the word count covers both slices */
+		if (msm_host->dsc && m2582_feature_opt_in("dsione"))
+			wc = msm_host->dsc->slice_chunk_size *
+				msm_host->dsc->slice_count + 1;
+
 		/*
 		 * The vendor's setup_cmd_stream() programs the HS transaction
 		 * timer, DSI_HS_TIMER_CTRL = 0x49c3c, right before
@@ -1217,11 +1373,12 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 			DSI_CMD_MDP_STREAM0_TOTAL_V_TOTAL(mode->vdisplay));
 
 		/*
-		 * Stream 1 carries the second DSC slice of every line.  It is
-		 * framed exactly like stream 0, on the same virtual channel:
-		 * the vendor's controller leaves stream 1 at reset values
-		 * because its two DSC encoders are merged into one interface,
-		 * while here both slices travel as their own packet.
+		 * Stream 1 carries the second DSC slice of every line, framed
+		 * exactly like stream 0 and on the same virtual channel.  The
+		 * factory programs both streams with the same values: its
+		 * running-DSI dump shows STREAM0 and STREAM1 both at
+		 * 0x02590039 / 0x0a6e00c8, i.e. the same 601-byte word count
+		 * and the same 200 x 2670 line geometry for each slice.
 		 */
 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM1_CTRL,
 			DSI_CMD_MDP_STREAM0_CTRL_WORD_COUNT(wc) |
@@ -1465,6 +1622,9 @@ static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
 	off = msm_host->tx_offset;
 	if (len + off > msm_host->tx_size) {
 		pr_err("%s: packet size is too big\n", __func__);
+		/* drop the half-built group, or the next transfer sends stale bytes */
+		msm_host->tx_offset = 0;
+		msm_host->tx_batched = false;
 		return -EINVAL;
 	}
 
@@ -1490,6 +1650,8 @@ static int dsi_cmd_dma_add(struct msm_dsi_host *msm_host,
 	 * never sees a transaction boundary except where the factory puts one.
 	 */
 	data[3] = (msg->flags & MIPI_DSI_MSG_BATCH_COMMAND) ? 0 : BIT(7);
+	if (msg->flags & MIPI_DSI_MSG_BATCH_COMMAND)
+		msm_host->tx_batched = true;
 	if (mipi_dsi_packet_format_is_long(msg->type))
 		data[3] |= BIT(6);
 	if (msg->rx_buf && msg->rx_len)
@@ -1743,6 +1905,7 @@ static void dsi_err_worker(struct work_struct *work)
 	u32 status = msm_host->err_work_state;
 
 	pr_err_ratelimited("%s: status=%x\n", __func__, status);
+	msm_host->err_seen |= status;
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
 
@@ -1808,11 +1971,14 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 
 	/* fifo underflow, overflow (exclude normal Lane Empty bits 16, 20, 24, 28) */
 	if (err) {
+		msm_host->fifo_error_count++;
 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, err);
 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
-		if (err & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)
+		if (err & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW) {
+			msm_host->mdp_underflow_count++;
 			msm_host->err_work_state |=
 					DSI_ERR_STATE_MDP_FIFO_UNDERFLOW;
+		}
 	}
 }
 
@@ -1845,6 +2011,19 @@ static void dsi_error(struct msm_dsi_host *msm_host)
 {
 	/* disable dsi error interrupt */
 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 0);
+
+	/*
+	 * Sticky copy of the raw status word, taken before dsi_status() clears
+	 * the bits it knows about.
+	 *
+	 * The decoded paths only decode the bits this driver has names for, and
+	 * the vendor's own header puts interleave-operation contention at error
+	 * interrupt index 13 while this tree tests STATUS0 bit 31.  Whatever the
+	 * truth is for this silicon, a raw word that is never cleared means no
+	 * status bit can hide from a later reader: anything that was ever set
+	 * shows up there, and can be decoded after the fact.
+	 */
+	msm_host->status0_seen |= dsi_read(msm_host, REG_DSI_STATUS0);
 
 	dsi_clk_status(msm_host);
 	dsi_fifo_status(msm_host);
@@ -2072,29 +2251,179 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 		return -EOPNOTSUPP;
 	}
 
+	/* m2582.features=bpc8: diagnostic, 8 bits per component instead of 10.
+	 * bpp (and therefore the chunk size and the DSI framing) is untouched,
+	 * so this changes only how the encoder interprets the pixel values. */
+	if (m2582_feature_opt_in("bpc8"))
+		dsc->bits_per_component = 8;
+
+	/* m2582.features=oneslice: keep the vendor's 8bpp table row but drive the
+	 * line as a single 1200 px slice, i.e. one 1200-byte packet per line
+	 * instead of two 600-byte ones.  Diagnostic for the two-slice packing. */
+	if (m2582_feature_opt_in("oneslice")) {
+		dsc->slice_width = dsc->pic_width ? dsc->pic_width : 1200;
+		dsc->slice_count = 1;
+	}
+
 	dsc->simple_422 = 0;
-	dsc->convert_rgb = 1;
+	dsc->convert_rgb = !(dsc->native_422 || dsc->native_420);
+	/* m2582.features=noconv: diagnostic, tell both the encoder and the PPS
+	 * that the input is already non-RGB, i.e. skip the YCoCg transform. */
+	if (m2582_feature_opt_in("noconv"))
+		dsc->convert_rgb = false;
 	dsc->vbr_enable = 0;
+
+	/*
+	 * m2582.features=nobp: block prediction off on both sides.
+	 *
+	 * There is only one drm_dsc_config on this board: the panel driver's
+	 * ctx->dsc, handed to the DSI host through dsi->dsc and from there to
+	 * the DPU encoder, so this write and the panel's own block_pred_enable
+	 * assignment are the same field.  It is done here as well so that the
+	 * encoder-side meaning is obvious at the point the encoder's model is
+	 * derived; the panel sets it too because its prepare() runs after this.
+	 *
+	 * The real trap is not two copies but time: the PPS is re-sent
+	 * immediately by the debugfs paths while dsc_config() only runs on a
+	 * modeset, so any model change needs a modeset to reach the encoder.
+	 *
+	 * Block prediction is the only predictor in DSC that predicts a group
+	 * from the group directly above it in the previous line, and the first
+	 * line of a slice has no line above.  That is precisely the condition
+	 * the damage tracks, so this arm is worth running properly.
+	 */
+	if (m2582_feature_opt_in("nobp"))
+		dsc->block_pred_enable = false;
+
+	/*
+	 * DSC 1.1, like the factory.  This is the panel's own configuration and
+	 * not a workaround: the factory device tree node for this panel
+	 * (dtbo.img, the node with pic 1200x2670 and slice 600x30) carries no
+	 * qcom,mdss-dsc-version at all, and dsi_panel.c then defaults to
+	 * major 1 / minor 1.  The 0x70 payload in that same node starts with
+	 * 0x11 for the same reason.  Every node in that image whose
+	 * qcom,mdss-dsc-version is <0x12> belongs to a different panel -- the
+	 * 1440x3200 one with 40-row slices, and two Simulator panels.
+	 *
+	 * Running 1.2 against this decoder costs the picture: DSC 1.2 adds a
+	 * decoder-side rule that is never signalled in the bitstream (the forced
+	 * "very flat" QP on the first group after each line's first), so a 1.2
+	 * decoder and a 1.1-trajectory encoder disagree from the second line of
+	 * every slice onward.  That is the 30-row banding.  MEASURED
+	 * 2026-10-25: the mark pattern is nine damaged slices with the PPS at
+	 * 1.2 and clean with the same build at 1.1.
+	 *
+	 * m2582.features=dsc12 is the opt-out, kept for a controlled A/B.
+	 *
+	 * Both arms have to assign: drm_dsc_config is zeroed, so "leave it
+	 * alone" advertises DSC 1.0, which no part of this stack expects (the
+	 * panel driver's own m2582_verify_pps() is what caught that).
+	 */
+	dsc->dsc_version_minor = m2582_feature_opt_in("dsc12") ? 2 : 1;
 
 	drm_dsc_set_const_params(dsc);
 	drm_dsc_set_rc_buf_thresh(dsc);
 
 	/*
-	 * The panel is DSC 1.2 4:4:4 (rc_range_params[0] = 0x0202), where
-	 * DRM_DSC_1_1_PRE_SCR would give the legacy 0x0201.
+	 * The rate-control tables follow the advertised version, the same way
+	 * the factory driver's sde_dsc_index_map does: DSC 1.1 4:4:4 8bpp/10bpc
+	 * is its DSC_V11_10BPC_8BPP row, which is what DRM_DSC_1_1_PRE_SCR
+	 * carries (range_max_qp[0] = 4 per VESA 1.1 Table E-5, and
+	 * first_line_bpg_offset = 12).  The 1.2 row is the one that differs --
+	 * min_qp[13..14] 11/17 vs 13/16 and max_qp[0] 4 vs 8 -- so this is not
+	 * a cosmetic switch.
+	 *
+	 * The factory tree also sets qcom,mdss-dsc-rc-override_v1, which makes
+	 * the vendor driver swap the range_bpg_offset table for
+	 * sde_dsc_rc_range_bpg_override_v1.  For this rate (8bpp) and format
+	 * both the 1.1 and the 1.2 rows are identical in the two arrays in
+	 * sde_dsc_helper.c, so the DT property has no effect here and needs no
+	 * separate handling.  It does matter for the other ratio types, so a
+	 * different panel or bit depth would have to pass the override table in.
 	 */
-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_2_444);
+	ret = drm_dsc_setup_rc_params(dsc, dsc->dsc_version_minor == 1 ?
+				      DRM_DSC_1_1_PRE_SCR : DRM_DSC_1_2_444);
 	if (ret) {
 		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
 		return ret;
 	}
 
 	/*
-	 * DSC 1.2 derives first_line_bpg_offset from the slice height, which
-	 * mainline's DRM_DSC_1_2_444 table does not carry: a 30-line slice
-	 * wants 13 where the table says 12. It must be set before
-	 * drm_dsc_compute_rc_parameters(), which derives nfl_bpg_offset,
-	 * initial_dec_delay and scale_increment_interval from it.
+	 * m2582.features=dsc11qp -- use the DSC 1.1 *final* QP range table
+	 * instead of mainline's pre-SCR row.
+	 *
+	 * DRM_DSC_1_1_PRE_SCR is the table from before the SCR erratum (see its
+	 * comment in drm_dsc_helper.c).  Its top ranges are lower than the final
+	 * DSC 1.1 table's: range_max_qp[10..14] are 14/15/15/16/17 there against
+	 * 15/16/17/17/19 in the final one, and range_min_qp[13..14] are 13/16
+	 * against 11/17.  The vendor driver uses the final table
+	 * (sde_dsc_helper.c, sde_dsc_rc_range_min_qp/_max_qp rows
+	 * DSC_V11_10BPC_8BPP), and the panel's decoder derives each group's
+	 * quantiser from whichever table it was told, so a mismatch shows up as
+	 * soon as the rate control climbs into those ranges -- which is what
+	 * content with per-pixel detail along x does.
+	 *
+	 * Default off: the A/B has not produced a verdict yet (cube / grad /
+	 * gradl still errored with it on), so this is a switch, not a fix.
+	 * Enable with m2582.features=dsc11qp.
+	 */
+	if (m2582_feature_opt_in("dsc11qp") &&
+	    dsc->dsc_version_minor == 1 && dsc->bits_per_component == 10 &&
+	    (dsc->bits_per_pixel >> 4) == 8) {
+		static const u8 v11_min_qp[DSC_NUM_BUF_RANGES] = {
+			0, 4, 5, 5, 7, 7, 7, 7, 7, 7, 9, 9, 9, 11, 17
+		};
+		static const u8 v11_max_qp[DSC_NUM_BUF_RANGES] = {
+			4, 8, 9, 10, 11, 11, 11, 12, 13, 14, 15, 16, 17, 17, 19
+		};
+		int r;
+
+		for (r = 0; r < DSC_NUM_BUF_RANGES; r++) {
+			dsc->rc_range_params[r].range_min_qp = v11_min_qp[r];
+			dsc->rc_range_params[r].range_max_qp = v11_max_qp[r];
+		}
+	}
+
+
+	/*
+	 * m2582.features=rgmaxq0 -- is the panel applying DSC 1.2's forced
+	 * "very flat" QP?
+	 *
+	 * A slice decodes wrongly iff its first row differs from the row above
+	 * (SLICE-TRIGGER §2: mark shift=0 -> 9 bands, shift=1 -> 0, ruler -> 89,
+	 * hstep -> 2, oneedge/flat -> 0).  Exactly two DSC 1.2 decode rules have
+	 * that shape, and §6.8.5.2 is the sharp one: on the first group of every
+	 * line other than the slice's first, a 1.2 decoder forces
+	 * masterQp = veryFlatQp = 1 + 2*(bpc-8) = 5 whenever
+	 * masterQp < range_max_qp[14], and it is never signalled, so the encoder
+	 * cannot follow it.  Line 0 is identical under 1.1 and 1.2 -- which is
+	 * why the first line of every damaged slice is clean, and why the same
+	 * build is clean with a 1.1 PPS (the 2026-10-25 measurement).
+	 *
+	 * range_max_qp[14] is 17 in the vendor device tree's 0x70 payload too
+	 * (decoded from its 30 rc_range_parameters bytes), so this is not a
+	 * difference from the factory: it is a difference between the panel's
+	 * rule set and our encoder's.  0 makes the gate false for every QP, so a
+	 * 1.2 decoder falls back to stQp -- the 1.1 trajectory our encoder runs.
+	 * The encoder never consults range 14 (its QP stays around 5..10), so
+	 * this arm is inert on the encoder side by construction: it disables the
+	 * decoder rule and nothing else.
+	 *
+	 * Verdict: `mark shift=0` bands 9 -> 0 means §6.8.5.2 is the mechanism
+	 * and the encoder needs the 1.2 rule (its register is still unknown);
+	 * bands persist means the 1.1/1.2 lever is §6.8.4
+	 * (bitSaveMode/mppState) instead.
+	 */
+	if (m2582_feature_opt_in("rgmaxq0"))
+		dsc->rc_range_params[DSC_NUM_BUF_RANGES - 1].range_max_qp = 0;
+
+	/*
+	 * The first-line budget follows the vendor's own rule for DSC 1.2 4:4:4
+	 * (_get_dsc_v1_2_bpg_offset(), inlined into sde_dsc_populate_dsc_config()
+	 * in msm_drm.ko): slice height picks the budget, and it is clamped to
+	 * what the first line can actually carry.  Everything else in the
+	 * rate-control model is derived from this number, which is why it has to
+	 * be settled before drm_dsc_compute_rc_parameters() runs.
 	 */
 	{
 		/* bits_per_pixel carries four fractional bits. */
@@ -2102,7 +2431,20 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 		u32 uncompressed_bpg_rate;
 		u32 flbo;
 
-		if (dsc->slice_height < 8)
+		/* m2582.features=flbo1: use the number the panel vendor's own PPS
+		 * carries (1), on the encoder and on both PPS carriers alike. */
+		if (m2582_feature_opt_in("flbo1"))
+			flbo = 1;
+		else if (dsc->dsc_version_minor == 1)
+			/*
+			 * The factory's DSC 1.1 rule, from sde_dsc_populate_dsc_params()
+			 * in msm_drm.ko: 15 when the panel asks for the 1.1 "SCR"
+			 * variant, 12 otherwise.  This panel's node has no
+			 * qcom,mdss-dsc-scr-version, so it is 12 -- and the factory's
+			 * own 0x70 payload carries exactly that.
+			 */
+			flbo = 12;
+		else if (dsc->slice_height < 8)
 			flbo = 2 * (dsc->slice_height - 1);
 		else if (dsc->slice_height < 20)
 			flbo = 12;
@@ -2124,8 +2466,36 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 			min(flbo, uncompressed_bpg_rate - 3 * bpp);
 	}
 
+	/* m2582.features=noflat: disable flatness detection on both sides.
+	 * Flatness is derived independently by the encoder and the decoder from
+	 * the reconstructed samples, so it is the one mechanism that is only
+	 * exercised by near-flat content -- exactly the content that fails. */
+	if (m2582_feature_opt_in("noflat")) {
+		dsc->flatness_min_qp = 0;
+		dsc->flatness_max_qp = 0;
+	}
+	/*
+	 * m2582.features=flat16: make the flatness decision inert without also
+	 * lowering the ceiling the way "noflat" does.
+	 *
+	 * Every three-pixel group of the failing content is identical, so the
+	 * encoder classifies those rows as flat and pins QP at flatness_min_qp
+	 * (7).  A row that follows a large row-to-row step needs far more bits
+	 * than that QP can buy, so if the pinning is what breaks it, raising the
+	 * floor to the ceiling removes the pinning while leaving the whole QP
+	 * range legal.  Both the encoder registers and the PPS take the value
+	 * from here, and the panel insists on the two agreeing: changing only
+	 * the register made the panel stop scanning (black, no frame-done
+	 * timeout).
+	 */
+	if (m2582_feature_opt_in("flat16"))
+		dsc->flatness_min_qp = dsc->flatness_max_qp;
 	dsc->initial_scale_value = drm_dsc_initial_scale_value(dsc);
 	dsc->line_buf_depth = dsc->bits_per_component + 1;
+	/* m2582.features=lbd10: the reconstructed-line precision used by block
+	 * prediction.  bpc + 1 is a mainline heuristic, not a spec value. */
+	if (m2582_feature_opt_in("lbd10"))
+		dsc->line_buf_depth = 10;
 
 	return drm_dsc_compute_rc_parameters(dsc);
 }
@@ -2645,6 +3015,15 @@ out:
  * its 1 KB on DSI 2.9 covers the 95-byte DSC PPS.
  */
 #define REG_DSI_TPG_CMD_DMA_FIFO	0x00000178
+/*
+ * The factory's command kickoff (dsi_ctrl_hw_cmn_kickoff_command, Meizu
+ * msm_drm.ko @0x14bda4) touches two registers mainline's dsi.xml has no name
+ * for: 0x50 and 0x390 in the factory header, i.e. +4 from this driver's, so
+ * 0x04c and 0x38c here.  0x04c is already handled -- dsi_ctrl_enable() writes
+ * 0x00110000, the same two bits, once at bring-up -- so only the burst bit of
+ * 0x38c is new.  The factory sets it for a multi-packet command group.
+ */
+#define REG_DSI_CMD_MODE_DMA_CTRL_1	0x0000038c
 
 /*
  * The factory's completion for a kickoff: dsi_ctrl_dma_cmd_wait_for_done()
@@ -2680,9 +3059,6 @@ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host, u32 dma_base,
 	const u32 *pkt = cfg_hnd->ops->tx_buf_get(msm_host);
 	u32 i, dwords = DIV_ROUND_UP(len, 4);
 
-	/* The FIFO path takes the packet from the TX buffer, not from dma_base. */
-	(void)dma_base;
-
 	/*
 	 * Raise this controller's bus priority, as the factory does in its
 	 * command kickoff.  It is sticky, so the frames the MDP feeds through
@@ -2695,6 +3071,77 @@ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host, u32 dma_base,
 
 	if (IS_ERR(pkt))
 		return;
+
+	/*
+	 * Factory-equivalent host-memory DMA, opt-in with
+	 * m2582.features=cmdpath_dma.  The factory never uses the FIFO for panel
+	 * commands (its dump has TPG FIFO = 0 and DMA_CMD_OFFSET = 0xfff0c000):
+	 * it points the controller at the command buffer and lets it fetch.
+	 * Everything below the trigger is shared with the FIFO path.
+	 */
+	if (m2582_feature_opt_in("cmdpath_dma")) {
+		u32 reg;
+
+		/*
+		 * The factory writes this bit with a bfi on every kickoff, i.e. it
+		 * clears it again for a single-packet command; an OR here would
+		 * leave it sticky and turn every later command into a "burst".
+		 * Order follows the factory: control first, then address, then
+		 * length, then the trigger.
+		 */
+		reg = dsi_read(msm_host, REG_DSI_CMD_MODE_DMA_CTRL_1);
+		reg &= ~BIT(1);
+		if (msm_host->tx_batched)
+			reg |= BIT(1);
+		dsi_write(msm_host, REG_DSI_CMD_MODE_DMA_CTRL_1, reg);
+		msm_host->tx_batched = false;
+
+		/*
+		 * The factory re-asserts the FIFO control bits on every kickoff
+		 * (dsi_ctrl_hw_cmn_kickoff_command ORs 0x110000 into it), and it
+		 * also leaves the test-pattern generator off; mainline only writes
+		 * the former once at bring-up and only clears the latter on its
+		 * FIFO path.  Reproduce both here so the DMA path is independent of
+		 * whatever ran before it.
+		 */
+		dsi_write(msm_host, REG_DSI_DMA_FIFO_CTRL,
+			  dsi_read(msm_host, REG_DSI_DMA_FIFO_CTRL) | 0x110000);
+		dsi_write(msm_host, REG_DSI_TEST_PATTERN_GEN_CTRL, 0);
+
+		/*
+		 * m2582.features=cmdphys: hand the controller a physical address
+		 * (see the comment on cmd_dma_buf).  The packet is copied into the
+		 * coherent buffer first; the buffer address never changes, so only
+		 * the contents need the barrier.
+		 */
+		if (m2582_feature_opt_in("cmdphys")) {
+			if (!msm_host->cmd_dma_buf) {
+				msm_host->cmd_dma_buf =
+					dma_alloc_coherent(&msm_host->pdev->dev, 4096,
+							   &msm_host->cmd_dma_paddr,
+							   GFP_KERNEL);
+			}
+			if (msm_host->cmd_dma_buf && len <= 4096 &&
+			    !((u64)msm_host->cmd_dma_paddr >> 32)) {
+				memcpy(msm_host->cmd_dma_buf, pkt, len);
+				/* packet in memory before the controller reads it */
+				wmb();
+				dma_base = (u32)msm_host->cmd_dma_paddr;
+			}
+		}
+
+		dsi_write(msm_host, REG_DSI_DMA_BASE, dma_base);
+		reinit_completion(&msm_host->dma_comp);
+		dsi_write(msm_host, REG_DSI_DMA_LEN, len & 0xffffff);
+		/* base and length latched before the trigger is raised */
+		wmb();
+		dsi_write(msm_host, REG_DSI_TRIG_DMA, 1);
+		dsi_cmd_wait_done(msm_host);
+		return;
+	}
+
+	/* The FIFO path takes the packet from the TX buffer, not from dma_base. */
+	(void)dma_base;
 
 	/* Drop whatever the previous transfer left in the FIFO. */
 	dsi_write(msm_host, REG_DSI_TEST_PATTERN_GEN_CTRL, 0);
