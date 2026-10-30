@@ -2372,9 +2372,7 @@ static inline void qphy_clrbits(void __iomem *base, u32 offset, u32 val)
  * ref_clk were declared in the device tree but never enabled at all.
  *
  * pipe_clk_mux is the PIPE clock's parent selector: with it off the PIPE clock
- * path does not reach the PHY's digital block, which is consistent with the one
- * hard measurement we have -- every register in the PHY, in every block, reads a
- * static replicated-byte reset value and ignores 0xa5a5a5a5 completely.
+ * path does not reach the PHY's digital block.
  *
  * The names have to match the device tree's clock-names; pipe_clk is still
  * fetched separately by name ("usb3_pipe") for this driver.
@@ -3223,16 +3221,35 @@ static const struct qmp_combo_offsets qmp_combo_offsets_tuna = {
 	.usb3_pcs	= 0x1c00,
 	.usb3_pcs_aon	= 0x1e00,
 	.usb3_pcs_usb	= 0x1f00,
-	.dp_serdes	= 0x3000,
-	.dp_txa		= 0x3400,
-	.dp_txb		= 0x3800,
-	.dp_dp_phy	= 0x3c00,
+	/*
+	 * The DP half is the v3 layout, not the v8 one the USB3 half is close
+	 * to. The factory's DP controller node splits this same PHY into
+	 * dp_pll 0x88ea000, dp_ln_tx0 0x88ea200, dp_ln_tx1 0x88ea600 and
+	 * dp_phy 0x88eaa00, i.e. +0x2000/+0x2200/+0x2600/+0x2a00 from this
+	 * base; the v8 values would start at 0x3000, past the end of the
+	 * 0x3000-byte window the factory PHY node maps. The tables stay the v6
+	 * ones: the factory driver writes qmp_v6_dp_serdes_tbl into dp_pll and
+	 * qmp_v6_dp_tx_tbl into each dp_ln_tx window.
+	 */
+	.dp_serdes	= 0x2000,
+	.dp_txa		= 0x2200,
+	.dp_txb		= 0x2600,
+	.dp_dp_phy	= 0x2a00,
 };
 
 /*
  * Offsets are relative to the block each call site uses: qmp->pcs for the
- * control registers (which is 0x1c00 here), qmp->pcs_usb for the USB3 ones
- * (0x1f00) and qmp->serdes for the COM ones (0x1000).
+ * control registers (0x1c00 here), qmp->pcs_usb for the USB3 ones (0x1f00),
+ * qmp->dp_serdes for the DP PLL/COM ones (0x2000), qmp->dp_dp_phy for the
+ * DP PHY ones (0x2a00) and qmp->dp_tx/dp_tx2 for the DP TX lanes
+ * (0x2200/0x2600).
+ *
+ * The DP entries are the v6 ones, as in qmp_v6_usb3phy_regs_layout: the
+ * factory's 4nm DP driver writes 0x0f to dp_phy+0x14, 0x20 to dp_pll+0x118,
+ * 0x17 to dp_pll+0x0dc, polls dp_pll+0x1f8/0x1d0 and dp_phy+0x0e4 for the
+ * same bits, and drives the TX lanes at +0x0c/+0x14/+0x54/+0x58/+0x5c
+ * (msm_drm.ko: dp_pll_prepare, dp_config_vco_rate_4nm,
+ * dp_4nm_pll_get_status, dp_catalog_ctrl_late_phy_init).
  */
 static const u32 tuna_usb3phy_regs_layout[QPHY_LAYOUT_SIZE] = {
 	/* applied through qmp->pcs, which is 0x1c00 on this part */
@@ -3244,8 +3261,20 @@ static const u32 tuna_usb3phy_regs_layout[QPHY_LAYOUT_SIZE] = {
 	/* applied through qmp->pcs_usb, which is 0x1f00 on this part */
 	[QPHY_PCS_AUTONOMOUS_MODE_CTRL]	= 0x08,   /* 0x1f08 */
 	[QPHY_PCS_LFPS_RXTERM_IRQ_CLEAR]= 0x14,   /* 0x1f14 */
-	/* com block, applied through qmp->serdes (0x1000) */
-	[QPHY_COM_BIAS_EN_CLKBUFLR_EN]	= 0x08,
+	/* DP PLL/COM block, applied through qmp->dp_serdes (0x2000) */
+	[QPHY_COM_RESETSM_CNTRL]	= 0x118,  /* 0x2118 */
+	[QPHY_COM_C_READY_STATUS]	= 0x1f8,  /* 0x21f8 */
+	[QPHY_COM_CMN_STATUS]		= 0x1d0,  /* 0x21d0 */
+	[QPHY_COM_BIAS_EN_CLKBUFLR_EN]	= 0x0dc,  /* 0x20dc */
+	/* DP PHY block, applied through qmp->dp_dp_phy (0x2a00) */
+	[QPHY_DP_PHY_STATUS]		= 0x0e4,  /* 0x2ae4 */
+	[QPHY_DP_PHY_VCO_DIV]		= 0x070,  /* 0x2a70 */
+	/* DP TX lanes, applied through qmp->dp_tx/dp_tx2 (0x2200/0x2600) */
+	[QPHY_TX_TX_POL_INV]		= 0x05c,  /* 0x225c */
+	[QPHY_TX_TX_DRV_LVL]		= 0x014,  /* 0x2214 */
+	[QPHY_TX_TX_EMP_POST1_LVL]	= 0x00c,  /* 0x220c */
+	[QPHY_TX_HIGHZ_DRVR_EN]		= 0x058,  /* 0x2258 */
+	[QPHY_TX_TRANSCEIVER_BIAS_EN]	= 0x054,  /* 0x2254 */
 	[QPHY_AON_TOGGLE_ENABLE]	= 0x00,
 };
 
@@ -4000,9 +4029,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 	 * phy-msm-ssusb-qmp.ko's msm_ssusb_qmp_ldo_enable() reads
 	 * qcom,vdd-voltage-level / qcom,vdd-max-load-uA and calls
 	 * regulator_set_voltage() / regulator_set_load(); mainline only enables
-	 * the bulk regulators. A PHY whose PLL never locks while every clock
-	 * reports a sane rate is consistent with a rail that is enabled but not
-	 * at the voltage the PHY expects.
+	 * the bulk regulators, leaving the rail at whatever voltage it had.
 	 */
 	{
 		struct device_node *np = qmp->dev->of_node;
@@ -4074,57 +4101,33 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 	}
 
 	/*
-	 * M2582: make sure the PHY's clock reference is actually enabled in the
-	 * TCSR block.
+	 * M2582: make sure the PHY's clock references are actually enabled in
+	 * the TCSR block.
 	 *
-	 * tcsrcc-tuna.c defines the USB3 clock reference as
-	 *   tcsr_usb3_clkref_en: enable_reg = 0x10, enable_mask = BIT(0)
-	 * in the TCSRCC at 0x1fbf000, so the enable is bit 0 of 0x1fbf010. Our
-	 * device tree models that clock as a fixed-clock, which is a software
-	 * fiction: it reports 19.2 MHz and writes nothing. If the gate is not
-	 * actually open, the PHY has no reference, its PLL cannot lock, and
-	 * PCS_STATUS1 never reports ready -- the exact symptom here. The UFS
-	 * reference (offset 0x8) works, which is presumably why UFS is fine.
+	 * The device tree models them as fixed-clocks, which is a software
+	 * fiction: they report 19.2 MHz and write nothing.  Without the gate
+	 * open the PHY has no reference and its PLL cannot lock.
 	 *
-	 * Read, set bit 0, read back, and leave the mapping in place.
+	 * Read, set bit 0, write back.
 	 */
 	{
 		void __iomem *tcsr = ioremap(0x01fbf000, 0x20);
 
 		if (tcsr) {
 			/*
-			 * tcsrcc-tuna.c defines three clock references in this block:
-			 *   tcsr_usb2_clkref_en  enable_reg 0x04 bit0   eUSB2 (HS) PHY
-			 *   tcsr_ufs_clkref_en   enable_reg 0x08 bit0   UFS PHY
-			 *   tcsr_usb3_clkref_en  enable_reg 0x10 bit0   USB3 (SS) PHY
-			 * All three are modelled as fixed-clocks in our device tree, i.e.
-			 * as software fictions that write nothing, so each gate has to be
-			 * opened explicitly. The USB3 one was the reason the SS PHY never
-			 * came ready; the USB2 one is why the HS PHY cannot drive D+/D-,
-			 * which shows up on the host as no connection at all.
+			 * tcsrcc-tuna.c defines three clock references in this
+			 * block, each bit 0 of its own register:
+			 *   0x04  eUSB2 (HS) PHY
+			 *   0x08  UFS PHY
+			 *   0x10  USB3 (SS) PHY
 			 */
-			/*
-			 * Only the USB3 (SS) reference gate is opened here.
-			 *
-			 * Writing offset 0x04 as well was tried and made the kernel oops
-			 * about 1.7 s into boot, in of_device_uevent() -> __pi_strcmp with
-			 * x8 = 0101010101010101, from the of_platform_populate() that
-			 * dwc3_msm_core_init() performs -- the same signature as the UFS
-			 * devfreq crash. With only 0x10 written the system is stable, the
-			 * SS PHY comes ready and the HS PHY drives the bus (the host sees
-			 * a high-speed device), so nothing else is needed.
-			 */
-			static const struct { u32 off; const char *name; } refs[] = {
-				{ 0x04, "usb2" },
-				{ 0x08, "ufs"  },
-				{ 0x10, "usb3" },
-			};
+			static const u32 refs[] = { 0x04, 0x08, 0x10 };
 			int ri;
 
 			for (ri = 0; ri < ARRAY_SIZE(refs); ri++) {
-				u32 before = readl(tcsr + refs[ri].off);
+				u32 before = readl(tcsr + refs[ri]);
 
-				writel(before | BIT(0), tcsr + refs[ri].off);
+				writel(before | BIT(0), tcsr + refs[ri]);
 			}
 			iounmap(tcsr);
 		}
@@ -4384,12 +4387,9 @@ static int qmp_combo_usb_power_on(struct phy *phy)
 	if (ret) {
 		dev_err(qmp->dev, "phy initialization timed-out\n");
 		/*
-		 * Note: a writel() probe of a non-repeating value was tried here to
-		 * settle whether these registers are 8-bit wide. It should not be
-		 * repeated: writing to a register whose meaning is unknown is what a
-		 * bring-up should not do, and the board oopsed shortly afterwards
-		 * (x8 = 0101010101010101 in the register dump -- the same byte
-		 * replication) inside dwc3_otg_sm_work -> of_get_next_available_child.
+		 * Do not probe these registers with a writel() of a test value
+		 * to settle how wide they are: writing a register whose
+		 * meaning is unknown takes the board down.
 		 */
 		goto err_disable_pipe_clk;
 	}
@@ -5252,11 +5252,7 @@ static int qmp_combo_parse_dt(struct qmp_combo *qmp)
 	 *     e0: bl clk_set_rate
 	 *
 	 * We never call either, so a clock that needs an explicit rate is left at
-	 * whatever the bootloader set -- or at nothing at all. The boot-stage
-	 * bisection shows this PHY is unprogrammed (serdes=00000000) from the
-	 * earliest initcall, yet readable, so nothing has powered it down; it has
-	 * simply never been brought up, and its driver's first step in the working
-	 * stack is to program these rates.
+	 * whatever the bootloader set -- or at nothing at all.
 	 */
 	{
 		unsigned long cur = clk_get_rate(qmp->pipe_clk);
@@ -5266,10 +5262,9 @@ static int qmp_combo_parse_dt(struct qmp_combo *qmp)
 			clk_set_rate(qmp->pipe_clk, (unsigned long)r);
 
 		/*
-		 * The vendor's enable_clks() turns this one on as part of the group
-		 * (its clk_summary shows enable_cnt=1 prepare_cnt=1), and the PIPE
-		 * clock is what the SuperSpeed link runs on. Ours reported
-		 * current=0 round=-EINVAL, i.e. never enabled.
+		 * The vendor's enable_clks() turns this one on as part of the
+		 * group; the device tree leaves it off, and the PIPE clock is
+		 * what the SuperSpeed link runs on.
 		 */
 		clk_prepare_enable(qmp->pipe_clk);
 	}
