@@ -500,6 +500,64 @@
 			};
 		};
 
+		/*
+		 * TSENS: four controllers, 8 + 11 + 15 + 5 sensors. Addresses,
+		 * sensor counts and both interrupt lines are the phone's own
+		 * live device tree (its qcom,kgsl-3d0 node carries the gpu-0..5
+		 * zones that read tsens2 5..10). Note the vendor claims only the
+		 * generic "qcom,tsens-v2" compatible, with no calibration nvmem
+		 * cells: this revision reports deci-Celsius in the result
+		 * register, so it needs none. The upstream SoC file's sensor
+		 * counts are SM8750's and do not apply.
+		 */
+		tsens0: thermal-sensor@c228000 {
+			compatible = "qcom,tsens-v2";
+			reg = <0 0x0c228000 0 0x1ff>,
+			      <0 0x0c222000 0 0x1ff>;
+			interrupts = <GIC_SPI 506 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 86 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "uplow", "critical";
+			#qcom,sensors = <8>;
+			#thermal-sensor-cells = <1>;
+			status = "okay";
+		};
+
+		tsens1: thermal-sensor@c229000 {
+			compatible = "qcom,tsens-v2";
+			reg = <0 0x0c229000 0 0x1ff>,
+			      <0 0x0c223000 0 0x1ff>;
+			interrupts = <GIC_SPI 507 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 154 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "uplow", "critical";
+			#qcom,sensors = <11>;
+			#thermal-sensor-cells = <1>;
+			status = "okay";
+		};
+
+		tsens2: thermal-sensor@c22a000 {
+			compatible = "qcom,tsens-v2";
+			reg = <0 0x0c22a000 0 0x1ff>,
+			      <0 0x0c224000 0 0x1ff>;
+			interrupts = <GIC_SPI 508 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 201 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "uplow", "critical";
+			#qcom,sensors = <15>;
+			#thermal-sensor-cells = <1>;
+			status = "okay";
+		};
+
+		tsens3: thermal-sensor@c22b000 {
+			compatible = "qcom,tsens-v2";
+			reg = <0 0x0c22b000 0 0x1ff>,
+			      <0 0x0c225000 0 0x1ff>;
+			interrupts = <GIC_SPI 509 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 203 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "uplow", "critical";
+			#qcom,sensors = <5>;
+			#thermal-sensor-cells = <1>;
+			status = "okay";
+		};
+
 		tcsrcc: clock-controller@1fbf000 {
 			compatible = "qcom,tuna-tcsrcc";
 			reg = <0 0x01fbf000 0 0x20>;
