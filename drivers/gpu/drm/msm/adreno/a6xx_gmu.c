@@ -190,12 +190,13 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
 			break;
 
 	/* If enabled, find the corresponding DDR bandwidth index */
-	if (info->bcms && gmu->nr_gpu_bws > 1 &&
-	    perf_index < GMU_MAX_GX_FREQS) {
-		unsigned int bw;
+	if (info->bcms && gmu->nr_gpu_bws > 1) {
+		unsigned int bw = dev_pm_opp_get_bw(opp, true, 0);
 
-		bw_index = gmu->bw_index_by_perf[perf_index];
-		bw = gmu->gpu_bw_table[bw_index];
+		for (bw_index = 0; bw_index < gmu->nr_gpu_bws - 1; bw_index++) {
+			if (bw == gmu->gpu_bw_table[bw_index])
+				break;
+		}
 
 		/* Vote AB as a fraction of the max bandwidth, starting from A750 */
 		if (bw && adreno_is_a750_family(adreno_gpu)) {
@@ -2128,49 +2129,6 @@ static int a6xx_gmu_build_bw_table(struct device *dev, unsigned long *bandwidths
 	return index;
 }
 
-/*
- * Build the GPU bandwidth table from the chip's own level table instead of the
- * OPP table.  The vendor's power levels carry a DDR vote per GPU frequency and
- * the GMU firmware casts it; mainline normally reads it from opp-peak-kBps,
- * which requires an interconnect path on the GPU node.  This board has none --
- * the vendor does not vote from the AP either -- so the values live in the
- * catalog, and the feature stays a boot-time switch.
- *
- * bw_index_by_perf[] is what a6xx_gmu_set_freq() needs: both arrays are indexed
- * by the same ascending-frequency OPP order.
- */
-static int a6xx_gmu_build_bw_table_levels(struct a6xx_gmu *gmu,
-					  const struct a6xx_info *info)
-{
-	int i, index = 0;
-	u32 last = 0;
-
-	/*
-	 * One bandwidth per GPU OPP entry: the mapping below is positional, so
-	 * a DT with a different number of OPPs must not be half-mapped.
-	 */
-	if (!info->bw_levels || info->nr_bw_levels + 1 != gmu->nr_gpu_freqs ||
-	    info->nr_bw_levels + 1 > GMU_MAX_GX_FREQS)
-		return 1;
-
-	/* Level 0 is "no vote". */
-	gmu->gpu_bw_table[index++] = 0;
-	gmu->bw_index_by_perf[0] = 0;
-
-	for (i = 0; i < info->nr_bw_levels; i++) {
-		u32 bw = info->bw_levels[i];
-
-		if (bw != last) {
-			gmu->gpu_bw_table[index++] = bw;
-			last = bw;
-		}
-
-		gmu->bw_index_by_perf[i + 1] = index - 1;
-	}
-
-	return index;
-}
-
 static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
 {
 	struct a6xx_gpu *a6xx_gpu = container_of(gmu, struct a6xx_gpu, gmu);
@@ -2206,20 +2164,9 @@ static int a6xx_gmu_pwrlevels_probe(struct a6xx_gmu *gmu)
 	 * The GMU also handles GPU Interconnect Votes so build a list
 	 * of DDR bandwidths from the GPU OPP table
 	 */
-	if (info->bcms) {
-		if (of_machine_is_compatible("meizu,m2582")) {
-			if (m2582_feature_opt_in("gpubw"))
-				gmu->nr_gpu_bws = a6xx_gmu_build_bw_table_levels(gmu, info);
-		} else {
-			/*
-			 * Every other machine keeps the OPP-table path: this
-			 * board's catalog table is not a replacement for it.
-			 */
-			gmu->nr_gpu_bws = a6xx_gmu_build_bw_table(
-				&gpu->pdev->dev, gmu->gpu_bw_table,
-				ARRAY_SIZE(gmu->gpu_bw_table));
-		}
-	}
+	if (info->bcms)
+		gmu->nr_gpu_bws = a6xx_gmu_build_bw_table(&gpu->pdev->dev,
+			gmu->gpu_bw_table, ARRAY_SIZE(gmu->gpu_bw_table));
 
 	/* Build the list of RPMh votes that we'll send to the GMU */
 	return a6xx_gmu_rpmh_votes_init(gmu);

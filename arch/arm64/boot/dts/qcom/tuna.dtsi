@@ -479,6 +479,27 @@
 			status = "disabled";
 		};
 
+		/*
+		 * QFPROM (fuse) block. Only the GPU speed bin is modelled: it is
+		 * what decides which power levels this particular die is binned
+		 * for, and the vendor's tuna.dtsi reads it from gpu_speed_bin@138
+		 * (2 bytes, bits 0..8). The rest of the fuse map (feat_conf*,
+		 * gaming_bin) is left out until something consumes it.
+		 */
+		qfprom: qfprom@221c8000 {
+			compatible = "qcom,tuna-qfprom", "qcom,qfprom";
+			reg = <0 0x221c8000 0 0x1000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			read-only;
+			ranges;
+
+			gpu_speed_bin: gpu_speed_bin@138 {
+				reg = <0x138 0x2>;
+				bits = <0 9>;
+			};
+		};
+
 		tcsrcc: clock-controller@1fbf000 {
 			compatible = "qcom,tuna-tcsrcc";
 			reg = <0 0x01fbf000 0 0x20>;

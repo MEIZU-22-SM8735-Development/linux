@@ -62,8 +62,6 @@ struct a6xx_info {
 	 * from the GMU; board code uses it when m2582.features=gpubw is given, so
 	 * the OPP table itself stays free of interconnect paths.
 	 */
-	const u32 *bw_levels;
-	u32 nr_bw_levels;
 };
 
 struct a6xx_gpu {

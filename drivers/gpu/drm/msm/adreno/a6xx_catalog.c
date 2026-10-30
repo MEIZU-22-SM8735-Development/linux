@@ -2422,24 +2422,6 @@ static const u32 a825_ifpc_reglist_regs[] = {
 };
 DECLARE_ADRENO_REGLIST_LIST(a825_ifpc_reglist);
 
-/*
- * GPU DDR vote per power level, in KBps, ordered by ascending frequency -- the
- * same order as the OPP table in the board DT.  The numbers are the vendor's:
- * qcom,gpu-pwrlevels-0 gives each level a qcom,bus-freq index into
- * qcom,bus-table-ddr, and that table holds (0, 781250, 2149902, 5285156,
- * 6078314, 6667779, 8171875, 10691084, 12449218, 14398437, 16500000,
- * 18597656).  Level by level that is 1150/1100/1050 MHz -> 18597656,
- * 937/873 -> 16500000, 763 -> 12449218, 688/643/510 -> 8171875,
- * 362 -> 5285156, 264 -> 781250.
- *
- * Only used when m2582.features=gpubw is given: the vote is the GMU's, so the
- * GPU node carries no interconnect path and the OPP table stays untouched.
- */
-static const u32 a825_bw_levels[] = {
-	781250, 5285156, 8171875, 8171875, 8171875, 12449218,
-	16500000, 16500000, 18597656, 18597656, 18597656,
-};
-
 static const struct adreno_reglist_pipe a825_nonctxt_regs[] = {
 	{ REG_A8XX_CP_SMMU_STREAM_ID_LPAC, 0x00000101, BIT(PIPE_NONE) },
 	{ REG_A8XX_GRAS_DBG_ECO_CNTL, 0x00000800, BIT(PIPE_BV) | BIT(PIPE_BR) },
@@ -2619,8 +2601,6 @@ static const struct adreno_info a8xx_gpus[] = {
 		.nonctxt_reglist = a825_nonctxt_regs,
 		.pwrup_reglist = &a825_pwrup_reglist,
 		.ifpc_reglist = &a825_ifpc_reglist,
-		.bw_levels = a825_bw_levels,
-		.nr_bw_levels = ARRAY_SIZE(a825_bw_levels),
 		.protect = &a825_protect,
 		.gbif_cx = a825_gbif,
 		.max_slices = 2,	/* GEN8_6_0_NUM_PHYSICAL_SLICES */
@@ -2652,8 +2632,20 @@ static const struct adreno_info a8xx_gpus[] = {
 		},
 	},
 	.preempt_record_size = 3372 * SZ_1K,	/* vendor ctxt_record_size */
+	/*
+	 * The QFPROM gpu_speed_bin cell on this board reads 0xf2 (242).  Both
+	 * fuses map to the same power-level table: the vendor's
+	 * qcom,gpu-pwrlevels-0 (fuse 0) and its -2 (fuse 0xf2) list the same
+	 * eleven levels down to the same RPMh corners, bus indices and ACD
+	 * values, so there is only one supported-hw bit to describe.  Without
+	 * this entry the fuse still reads fine but fuse_to_supp_hw() misses it
+	 * and the driver logs "missing support for speed-bin: 242" before
+	 * falling back to exactly this bit -- the table is right either way,
+	 * only the message was not.
+	 */
 	.speedbins = ADRENO_SPEEDBINS(
-		{ 0, 0 },
+		{ 0x00, 0 },
+		{ 0xf2, 0 },
 	),
 	}, {
 		.chip_ids = ADRENO_CHIP_IDS(0x44070001),
