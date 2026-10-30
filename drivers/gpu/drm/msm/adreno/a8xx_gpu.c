@@ -897,7 +897,6 @@ void a8xx_recover(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
-	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
 	int active_submits;
 
 	adreno_dump_info(gpu);
@@ -931,9 +930,24 @@ void a8xx_recover(struct msm_gpu *gpu)
 	 */
 	gpu->active_submits = 0;
 
-	reinit_completion(&gmu->pd_gate);
-	dev_pm_genpd_add_notifier(gmu->cxpd, &gmu->pd_nb);
-	dev_pm_genpd_synced_poweroff(gmu->cxpd);
+	/*
+	 * Do not ask for a synchronous power-off of the CX domain here.  The
+	 * vendor's kgsl never does -- it has no dev_pm_genpd_synced_poweroff()
+	 * call at all, only a notifier that observes the domain's own OFF
+	 * event.  mainline's version arms the next power-off to wait for the
+	 * GDSC to report itself collapsed, and that is a one-way trap on this
+	 * SoC: when the domain does not collapse, or when the suspend never
+	 * reaches the GDSC at all because the GMU device is already down, the
+	 * completion never fires, the flag is only cleared by a power-on that
+	 * never comes, and every later runtime suspend takes the synchronous
+	 * path and fails, leaving runtime_status=error for good.
+	 *
+	 * Nothing downstream needs the collapse: a6xx_gmu_resume() cold-boots
+	 * the GMU from scratch on every resume (TCM retention is never enabled
+	 * for a8xx), so the firmware re-initialises the GPU whether or not CX
+	 * dropped.  What the recovery does need is the GMU halted and GX
+	 * power-cycled, and a6xx_gmu_stop() does both on the suspend below.
+	 */
 
 	/* Drop the rpm refcount from active submits */
 	if (active_submits)
@@ -941,11 +955,6 @@ void a8xx_recover(struct msm_gpu *gpu)
 
 	/* And the final one from recover worker */
 	pm_runtime_put_sync(&gpu->pdev->dev);
-
-	if (!wait_for_completion_timeout(&gmu->pd_gate, msecs_to_jiffies(1000)))
-		DRM_DEV_ERROR(&gpu->pdev->dev, "cx gdsc didn't collapse\n");
-
-	dev_pm_genpd_remove_notifier(gmu->cxpd);
 
 	pm_runtime_use_autosuspend(&gpu->pdev->dev);
 
