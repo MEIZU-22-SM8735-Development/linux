@@ -2785,6 +2785,15 @@ static const struct of_device_id qca_bluetooth_of_match[] = {
 	{ .compatible = "qcom,wcn6750-bt", .data = &qca_soc_data_wcn6750},
 	{ .compatible = "qcom,wcn6855-bt", .data = &qca_soc_data_wcn6855},
 	{ .compatible = "qcom,wcn7850-bt", .data = &qca_soc_data_wcn7850},
+	/*
+	 * WCN7750 is the same generation as the WCN7850 and its Bluetooth core
+	 * is the same one, reached the same way over UART; the vendor's own
+	 * module (vendor-ref/meizu-stock/.../btpower.ko) names the part
+	 * "qcom,wcn7750-bt", and the factory device tree's bluetooth node uses
+	 * that compatible.  The supplies the driver asks for are exactly the
+	 * ones that node provides, so the WCN7850's data applies unchanged.
+	 */
+	{ .compatible = "qcom,wcn7750-bt", .data = &qca_soc_data_wcn7850},
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, qca_bluetooth_of_match);
