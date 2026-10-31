@@ -107,17 +107,32 @@
 
 #define STRCAT(X, Y) (X Y)
 
+	/*
+	 * M2582: no 10-bit scanout.  The compositor picks the deepest format a
+	 * plane advertises, so on this board it renders into AR30
+	 * (a2r10g10b10) -- and what reaches the panel is that frame minus its
+	 * flat regions: the wallpaper and the panel background come out black
+	 * while client windows and text are correct, and window edges lose
+	 * their antialiasing.  The buffer itself is fine (read back with
+	 * drm_peekfb: the full gradient is there) and the same frame committed
+	 * as XRGB8888 by a bare DRM client is perfect, so the 10-bit scanout
+	 * path is what does not work.  The factory's panel is 8 bpc; 10-bit is
+	 * offered again only once the format is verified on the panel.
+	 */
+	/*
+	 * M2582: opaque formats only.  A compositor picks the first format it can
+	 * render into, and with an alpha-bearing one the scanout is blended by
+	 * the plane: KWin fills its buffer with the whole desktop -- drm_peekfb
+	 * reads back a full wallpaper -- while the panel stays black, because the
+	 * alpha left in opaque pixels is zero.  Only formats without an alpha
+	 * channel are offered until that blend path is verified; the factory's
+	 * panel is opaque and its plane list is built the same way.
+	 */
 static const uint32_t plane_formats[] = {
-	DRM_FORMAT_ARGB8888,
-	DRM_FORMAT_ABGR8888,
-	DRM_FORMAT_RGBA8888,
-	DRM_FORMAT_BGRA8888,
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_RGBX8888,
 	DRM_FORMAT_BGRX8888,
 	DRM_FORMAT_XBGR8888,
-	DRM_FORMAT_ARGB2101010,
-	DRM_FORMAT_XRGB2101010,
 	DRM_FORMAT_RGB888,
 	DRM_FORMAT_BGR888,
 	DRM_FORMAT_RGB565,
@@ -141,13 +156,7 @@ static const uint32_t plane_formats[] = {
 };
 
 static const uint32_t plane_formats_yuv[] = {
-	DRM_FORMAT_ARGB8888,
-	DRM_FORMAT_ABGR8888,
-	DRM_FORMAT_RGBA8888,
 	DRM_FORMAT_BGRX8888,
-	DRM_FORMAT_BGRA8888,
-	DRM_FORMAT_ARGB2101010,
-	DRM_FORMAT_XRGB2101010,
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_XBGR8888,
 	DRM_FORMAT_RGBX8888,
