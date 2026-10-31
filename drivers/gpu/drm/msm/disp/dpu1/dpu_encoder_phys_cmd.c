@@ -348,13 +348,14 @@ static int _dpu_encoder_phys_cmd_wait_for_idle(
 		 * m2582.features=rdptrwait: pace on the interface's read-pointer
 		 * event instead of the ping-pong done one.
 		 *
-		 * Ping-pong done (MDP interrupt group 0) never asserts on this
-		 * board, so the wait above can only time out -- and the frame then
-		 * gets armed while the DDIC is still reading the previous one,
-		 * which is what a picture that tears differently every frame looks
-		 * like.  The interface's read-pointer interrupt does fire, and it
-		 * is the event that actually means "the panel has taken this
-		 * line/frame": it is the same one mainline uses for vblank.
+		 * Ping-pong done says the DPU finished reading the frame out of the
+		 * SSPPs and nothing more: the command-mode engine is still sending
+		 * that frame for the rest of the frame time, so arming the next one
+		 * on that event lands inside the transfer and wedges the engine
+		 * (STATUS0 = CMD_MODE_ENGINE_BUSY | DMA_BUSY | MDP_BUSY, and then
+		 * every commit times out).  The interface's read-pointer interrupt
+		 * fires once per frame after the panel has taken the frame, and it is
+		 * the same event mainline uses for vblank.
 		 */
 		struct dpu_encoder_wait_info vb;
 
