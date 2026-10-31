@@ -275,6 +275,30 @@ static int _dpu_encoder_phys_cmd_handle_ppdone_timeout(
 	return -ETIMEDOUT;
 }
 
+/*
+ * m2582.features=intfnowait: skip the read-pointer wait when the interface has
+ * already handed the previous frame over.  Off by default: rdptrwait alone is the
+ * configuration that was measured stable, and this only removes waits, so it has
+ * to be shown not to bring the wedge back before it becomes the default.
+ *
+ * True when the interface is not in the middle of writing a frame, i.e. when a
+ * new kickoff can be armed without landing inside the previous frame's transfer.
+ * INTF_LINE_COUNT is the interface's own write pointer into the command-mode
+ * engine; it only moves while a frame is being handed over.
+ */
+static bool dpu_encoder_phys_cmd_intf_between_frames(
+		struct dpu_encoder_phys *phys_enc)
+{
+	struct dpu_hw_intf_status st = { 0 };
+
+	if (!phys_enc->hw_intf || !phys_enc->hw_intf->ops.get_status)
+		return false;
+
+	phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &st);
+
+	return st.is_en && st.line_count == 0;
+}
+
 static int _dpu_encoder_phys_cmd_wait_for_idle(
 		struct dpu_encoder_phys *phys_enc)
 {
@@ -305,6 +329,18 @@ static int _dpu_encoder_phys_cmd_wait_for_idle(
 	 * edge the factory's ctl_done/scheduler path is built on.
 	 */
 	if (m2582_feature_opt_in("noppwait")) {
+		ret = 0;
+	} else if (m2582_feature_opt_in("rdptrwait") &&
+		   m2582_feature_opt_in("intfnowait") &&
+		   phys_enc->irq[INTR_IDX_RDPTR] &&
+		   dpu_encoder_phys_cmd_intf_between_frames(phys_enc)) {
+		/*
+		 * The interface has already written the previous frame out, so
+		 * arming the next one cannot collide with the command-mode
+		 * engine.  This is what keeps the kickoff pipeline full: only the
+		 * case that can wedge the DSI (arming while the interface is still
+		 * mid-frame) has to wait for the read-pointer event.
+		 */
 		ret = 0;
 	} else if (m2582_feature_opt_in("rdptrwait") &&
 		   phys_enc->irq[INTR_IDX_RDPTR]) {
@@ -825,6 +861,7 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 		DPU_ERROR("invalid encoder\n");
 		return;
 	}
+
 	DRM_DEBUG_KMS("id:%u pp:%d pending_cnt:%d\n", DRMID(phys_enc->parent),
 		      phys_enc->hw_pp->idx - PINGPONG_0,
 		      atomic_read(&phys_enc->pending_kickoff_cnt));
@@ -843,11 +880,11 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 	}
 
 	/*
-	 * This call is retained because upstream makes it, and on this board it
-	 * is a no-op in steady state: dpu_encoder_phys_cmd_enable_te() only
-	 * calls disable_autorefresh(), which returns immediately unless
-	 * INTF_TEAR_AUTOREFRESH_CONFIG bit31 is set, and nothing in this tree
-	 * ever sets it.
+	 * Upstream calls this before every kickoff; on this board it only clears
+	 * the autorefresh configuration, which nothing here sets, so it is a
+	 * no-op.  The factory's extra TE write-pointer re-anchor that was tried
+	 * here is gone: touching the tear check on every kickoff cost the panel
+	 * frames it used to show, including plain CPU-written buffers.
 	 */
 	dpu_encoder_phys_cmd_enable_te(phys_enc);
 
@@ -931,8 +968,22 @@ static int dpu_encoder_phys_cmd_wait_for_commit_done(
 		return 0;
 
 
+	/*
+	 * M2582: wait for the start interrupt only while the start request is
+	 * still pending.
+	 *
+	 * Upstream waits when CTL_START reads back 0 (!is_started()), i.e. when
+	 * the request has *already* been consumed.  That is the normal case on
+	 * this core, so both the pre-flush and the post-flush call waited for an
+	 * interrupt that had already fired and each timed out after
+	 * KICKOFF_TIMEOUT_MS.  Measured (image arch-wait-1031): every commit cost
+	 * 452 ms inside msm_atomic_commit_tail -- prevwait=224 ms, postwait=227 ms
+	 * -- with the probe reporting started=0 ret=-22 for both.  That pins any
+	 * client to 2 fps while the panel scans at 121 Hz and the GPU draws this
+	 * mode at 5453 fps, which is what "the desktop is laggy" was.
+	 */
 	if (phys_enc->irq[INTR_IDX_CTL_START] &&
-	    !phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl))
+	    phys_enc->hw_ctl->ops.is_started(phys_enc->hw_ctl))
 		return _dpu_encoder_phys_cmd_wait_for_ctl_start(phys_enc);
 
 	return dpu_encoder_phys_cmd_wait_for_tx_complete(phys_enc);
@@ -953,23 +1004,21 @@ static void dpu_encoder_phys_cmd_handle_post_kickoff(
 	_dpu_encoder_phys_cmd_connect_te(phys_enc, true);
 
 	/*
-	 * m2582.features=tearperframe: re-anchor the tear-check write pointer on
-	 * every kickoff, the way the factory does.
+	 * M2582: put the tear-check write pointer back at start_pos after every
+	 * kickoff, which is what the factory's autorefresh-disable sequence does
+	 * ("replace te write count with start_pos to meet trigger window").
 	 *
-	 * The factory's sde_hw_intf_v1_check_and_reset_tearcheck (0x102fcc) reads
-	 * the current line count and the start position and rewrites
-	 * INTF_TEAR_SYNC_WRCOUNT (0x290) as (line_count << 16) | start_pos, and
-	 * its own event log shows sde_encoder_phys_cmd_tearcheck_config 178 times
-	 * in a single capture, i.e. once per frame.  Mainline programs the whole
-	 * tear-check block once, at enable, and has no equivalent of the re-anchor
-	 * op at all, so nothing ever re-aligns the host's write pointer with the
-	 * panel's scan position.  A drifting write pointer writes a row into the
-	 * wrong line of the ping-pong buffer, which is invisible on flat content
-	 * and shows up as whole rows of wrong data wherever rows differ.
-	 * Off by default: one variable.
+	 * Without it the panel takes the first frame of a session and none after
+	 * it: a client that commits once (drm_flip) is always correct, while one
+	 * that keeps committing (kmscube, a compositor) shows one frame and then
+	 * nothing, with every later frame reported done by the DPU.  Only the
+	 * pointer is written here -- re-running the whole tear-check block per
+	 * frame stops and restarts the counter, which is a different experiment
+	 * and was measured to cost even the first frame.
 	 */
-	if (m2582_feature_opt_in("tearperframe"))
-		dpu_encoder_phys_cmd_tearcheck_config(phys_enc);
+	if (m2582_feature_opt_in("tearperframe") &&
+	    phys_enc->hw_intf->ops.reset_tearcheck)
+		phys_enc->hw_intf->ops.reset_tearcheck(phys_enc->hw_intf);
 }
 
 static void dpu_encoder_phys_cmd_trigger_start(

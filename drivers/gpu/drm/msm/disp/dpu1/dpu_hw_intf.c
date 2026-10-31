@@ -665,6 +665,40 @@ static int dpu_hw_intf_disable_te(struct dpu_hw_intf *intf)
 	return 0;
 }
 
+/*
+ * M2582: put the tear-check write pointer back at the start position.
+ *
+ * This is the factory's sde_hw_intf_v1_check_and_reset_tearcheck: it keeps the
+ * frame count from INTF_TEAR_SYNC_WRCOUNT, takes the line from START_POS, and
+ * writes both back.  The factory calls it from its autorefresh-disable
+ * sequence, whose comment is "replace te write count with start_pos to meet
+ * trigger window" -- i.e. without this the write pointer sits outside the
+ * window in which the interface may trigger the control block, and the panel
+ * then takes the first frame of a session and none after it.
+ */
+static void dpu_hw_intf_reset_tearcheck(struct dpu_hw_intf *intf)
+{
+	struct dpu_hw_blk_reg_map *c;
+	u32 val, frame_cnt, start_pos;
+
+	if (!intf)
+		return;
+
+	c = &intf->hw;
+
+	val = DPU_REG_READ(c, INTF_TEAR_SYNC_WRCOUNT);
+	frame_cnt = val >> 16;
+	start_pos = DPU_REG_READ(c, INTF_TEAR_START_POS);
+
+	if (intf->mdss_ver->core_major_ver >= 10)
+		DPU_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT_EXT,
+			      (start_pos & 0xffff0000) >> 16);
+
+	DPU_REG_WRITE(c, INTF_TEAR_SYNC_WRCOUNT,
+		      (frame_cnt << 16) | (start_pos & 0xffff));
+	wmb();
+}
+
 static int dpu_hw_intf_connect_external_te(struct dpu_hw_intf *intf,
 		bool enable_external_te)
 {
@@ -899,6 +933,7 @@ struct dpu_hw_intf *dpu_hw_intf_init(struct drm_device *dev,
 
 		c->ops.enable_tearcheck = dpu_hw_intf_enable_te;
 		c->ops.disable_tearcheck = dpu_hw_intf_disable_te;
+		c->ops.reset_tearcheck = dpu_hw_intf_reset_tearcheck;
 		c->ops.connect_external_te = dpu_hw_intf_connect_external_te;
 		if (mdss_rev->core_major_ver >= 8)
 			c->ops.vsync_sel = dpu_hw_intf_vsync_sel_v8;

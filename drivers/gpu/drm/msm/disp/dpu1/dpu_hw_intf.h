@@ -104,6 +104,13 @@ struct dpu_hw_intf_ops {
 
 	int (*disable_tearcheck)(struct dpu_hw_intf *intf);
 
+	/*
+	 * M2582: re-anchor the tear-check write pointer on the panel's current
+	 * scan line.  The factory does this once per kickoff; mainline programs
+	 * the pointer once, at enable.
+	 */
+	void (*reset_tearcheck)(struct dpu_hw_intf *intf);
+
 	int (*connect_external_te)(struct dpu_hw_intf *intf, bool enable_external_te);
 
 	void (*vsync_sel)(struct dpu_hw_intf *intf, struct dpu_vsync_source_cfg *cfg);
