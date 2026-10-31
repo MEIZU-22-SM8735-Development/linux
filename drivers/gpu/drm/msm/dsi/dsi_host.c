@@ -237,6 +237,12 @@ struct msm_dsi_host {
 	bool enabled;
 	int irq;
 	u32 last_isr;
+
+	/* m2582: DSI-side per-frame accounting, read through m2582_dsi */
+	u32 mdp_done_count;
+	u32 mdp_done_status0_or;
+	u32 isr_or;
+	struct dentry *debugfs_dentry;
 };
 
 static inline u32 dsi_read(struct msm_dsi_host *msm_host, u32 reg)
@@ -248,6 +254,104 @@ static inline void dsi_write(struct msm_dsi_host *msm_host, u32 reg, u32 data)
 {
 	writel(data, msm_host->ctrl_base + reg);
 }
+
+/* m2582: read-only view of the command-mode frame engine, see msm_dsi_host_irq() */
+static int m2582_dsi_show(struct seq_file *m, void *unused)
+{
+	struct msm_dsi_host *msm_host = m->private;
+
+	seq_printf(m, "power_on %d enabled %d registered %d\n",
+		   msm_host->power_on, msm_host->enabled, msm_host->registered);
+	seq_printf(m, "mdp_done %u status0_at_mdp_done %08x isr_or %08x\n",
+		   msm_host->mdp_done_count,
+		   msm_host->mdp_done_status0_or, msm_host->isr_or);
+	seq_printf(m, "last_isr %08x status0_seen %08x err_seen %08x fifo_err %u mdp_underflow %u\n",
+		   msm_host->last_isr, msm_host->status0_seen,
+		   msm_host->err_seen, msm_host->fifo_error_count,
+		   msm_host->mdp_underflow_count);
+
+	if (!msm_host->ctrl_base || !msm_host->power_on)
+		return 0;
+
+	seq_printf(m, "CTRL %08x STATUS0 %08x CMD_DMA_CTRL %08x\n",
+		   dsi_read(msm_host, REG_DSI_CTRL),
+		   dsi_read(msm_host, REG_DSI_STATUS0),
+		   dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL));
+	seq_printf(m, "TRIG_CTRL %08x TRIG_DMA %08x INTR_CTRL %08x\n",
+		   dsi_read(msm_host, REG_DSI_TRIG_CTRL),
+		   dsi_read(msm_host, REG_DSI_TRIG_DMA),
+		   dsi_read(msm_host, REG_DSI_INTR_CTRL));
+	seq_printf(m, "STREAM0_CTRL %08x STREAM0_TOTAL %08x\n",
+		   dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL),
+		   dsi_read(msm_host, REG_DSI_CMD_MDP_STREAM0_TOTAL));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(m2582_dsi);
+
+/*
+ * m2582: the whole command-mode register window, 0x000..0x1ff, for a
+ * field-by-field comparison against a dump taken from the factory kernel.  The
+ * block is 0x400 bytes in the DT, so every offset here is inside the mapping.
+ */
+static int m2582_dsi_regs_show(struct seq_file *m, void *unused)
+{
+	struct msm_dsi_host *msm_host = m->private;
+	u32 reg;
+
+	if (!msm_host->ctrl_base || !msm_host->power_on)
+		return 0;
+
+	for (reg = 0; reg < 0x200; reg += 4)
+		seq_printf(m, "%03x %08x\n", reg, dsi_read(msm_host, reg));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(m2582_dsi_regs);
+
+/*
+ * m2582: make the controller draw the frame itself, so the link to the panel can
+ * be exercised with the DPU's pixels out of the picture.  "1" enables the
+ * command-mode test pattern and triggers it once, "2" triggers one more frame,
+ * "0" puts the stream back on the DPU.
+ */
+static ssize_t m2582_dsi_tpg_write(struct file *f, const char __user *ubuf,
+				   size_t len, loff_t *off)
+{
+	struct msm_dsi_host *msm_host = file_inode(f)->i_private;
+	char buf[16];
+	unsigned int val;
+
+	if (!msm_host || !msm_host->power_on)
+		return -ENODEV;
+	if (len == 0 || len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val == 1) {
+		msm_dsi_host_test_pattern_en(&msm_host->base);
+	} else if (val == 2) {
+		dsi_write(msm_host, REG_DSI_TEST_PATTERN_GEN_CMD_STREAM0_TRIGGER,
+			  DSI_TEST_PATTERN_GEN_CMD_STREAM0_TRIGGER_SW_TRIGGER);
+	} else {
+		u32 reg = dsi_read(msm_host, REG_DSI_TEST_PATTERN_GEN_CTRL);
+
+		reg &= ~(DSI_TEST_PATTERN_GEN_CTRL_EN |
+			 DSI_TEST_PATTERN_GEN_CTRL_CMD_MDP_STREAM0_PATTERN_SEL__MASK);
+		dsi_write(msm_host, REG_DSI_TEST_PATTERN_GEN_CTRL, reg);
+	}
+
+	return len;
+}
+
+static const struct file_operations m2582_dsi_tpg_fops = {
+	.write = m2582_dsi_tpg_write,
+	.llseek = noop_llseek,
+};
 
 static const struct msm_dsi_cfg_handler *
 dsi_get_config(struct msm_dsi_host *msm_host)
@@ -2061,6 +2165,21 @@ static irqreturn_t dsi_host_irq(int irq, void *ptr)
 	if (isr & DSI_IRQ_CMD_DMA_DONE)
 		complete(&msm_host->dma_comp);
 
+	/*
+	 * m2582: the command-mode frame engine is the one link in the chain the
+	 * driver never watched.  DSI_IRQ_MASK_CMD_MDP_DONE is enabled in
+	 * dsi_op_mode_config(), but nothing counted the resulting status bit, so
+	 * "the DPU finished every frame" said nothing about whether the DSI ever
+	 * finished reading one.  Count them and keep the raw STATUS0 word seen at
+	 * each completion.
+	 */
+	msm_host->isr_or |= isr;
+	if (isr & DSI_IRQ_CMD_MDP_DONE) {
+		msm_host->mdp_done_count++;
+		msm_host->mdp_done_status0_or |=
+			dsi_read(msm_host, REG_DSI_STATUS0);
+	}
+
 	return IRQ_HANDLED;
 }
 
@@ -2718,6 +2837,9 @@ void msm_dsi_host_destroy(struct mipi_dsi_host *host)
 		msm_host->workqueue = NULL;
 	}
 
+	debugfs_remove_recursive(msm_host->debugfs_dentry);
+	msm_host->debugfs_dentry = NULL;
+
 	mutex_destroy(&msm_host->cmd_mutex);
 	mutex_destroy(&msm_host->dev_mutex);
 
@@ -2756,6 +2878,15 @@ int msm_dsi_host_register(struct mipi_dsi_host *host)
 			return ret;
 
 		msm_host->registered = true;
+
+		/* m2582: <debugfs>/m2582-dsi/{engine,regs}, command-mode frame state */
+		msm_host->debugfs_dentry = debugfs_create_dir("m2582-dsi", NULL);
+		debugfs_create_file("engine", 0400, msm_host->debugfs_dentry,
+				    msm_host, &m2582_dsi_fops);
+		debugfs_create_file("regs", 0400, msm_host->debugfs_dentry,
+				    msm_host, &m2582_dsi_regs_fops);
+		debugfs_create_file("tpg", 0200, msm_host->debugfs_dentry,
+				    msm_host, &m2582_dsi_tpg_fops);
 	}
 
 	return 0;
