@@ -289,14 +289,39 @@ static int _dpu_encoder_phys_cmd_handle_ppdone_timeout(
 static bool dpu_encoder_phys_cmd_intf_between_frames(
 		struct dpu_encoder_phys *phys_enc)
 {
+	struct dpu_encoder_phys_cmd *cmd_enc =
+			to_dpu_encoder_phys_cmd(phys_enc);
 	struct dpu_hw_intf_status st = { 0 };
 
 	if (!phys_enc->hw_intf || !phys_enc->hw_intf->ops.get_status)
 		return false;
 
 	phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &st);
+	if (!st.is_en)
+		return false;
 
-	return st.is_en && st.line_count == 0;
+	/*
+	 * Either the interface is parked at line 0, or it has already counted a
+	 * whole frame since the last kickoff.  The counter is the second half of
+	 * the test because the line counter is not documented to return to 0
+	 * between frames on this core, and a signal that never arrives would
+	 * silently turn this switch back into plain rdptrwait.
+	 */
+	return st.line_count == 0 || st.frame_count != cmd_enc->last_intf_frame_count;
+}
+
+static void dpu_encoder_phys_cmd_intf_sample_frame_count(
+		struct dpu_encoder_phys *phys_enc)
+{
+	struct dpu_encoder_phys_cmd *cmd_enc =
+			to_dpu_encoder_phys_cmd(phys_enc);
+	struct dpu_hw_intf_status st = { 0 };
+
+	if (!phys_enc->hw_intf || !phys_enc->hw_intf->ops.get_status)
+		return;
+
+	phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &st);
+	cmd_enc->last_intf_frame_count = st.frame_count;
 }
 
 static int _dpu_encoder_phys_cmd_wait_for_idle(
@@ -888,6 +913,9 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 	 * frames it used to show, including plain CPU-written buffers.
 	 */
 	dpu_encoder_phys_cmd_enable_te(phys_enc);
+
+	if (m2582_feature_opt_in("intfnowait"))
+		dpu_encoder_phys_cmd_intf_sample_frame_count(phys_enc);
 
 	DPU_DEBUG_CMDENC(cmd_enc, "pp:%d pending_cnt %d\n",
 			phys_enc->hw_pp->idx - PINGPONG_0,
