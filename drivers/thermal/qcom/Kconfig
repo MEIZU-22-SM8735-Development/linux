@@ -42,3 +42,15 @@ config QCOM_LMH
 	  input from temperature and current sensors.  On many newer Qualcomm SoCs
 	  LMh is configured in the firmware and this feature need not be enabled.
 	  However, on certain SoCs like sdm845 LMh has to be configured from kernel.
+
+config QCOM_CPU_HOTPLUG_CDEV
+	bool "Qualcomm CPU hotplug cooling device"
+	depends on THERMAL && HOTPLUG_CPU
+	help
+	  This enables a thermal cooling device per CPU that takes the CPU out
+	  of service when the governor asks for it.  It is what the emergency
+	  trips on Qualcomm SoCs use: the vendor's ladder offlines a core at
+	  120 C, and its weaker 118 C step is a scheduler hint (WALT cpu-pause)
+	  that has no equivalent in this tree.
+
+	  CPU0 is skipped because the kernel does not allow offlining it.

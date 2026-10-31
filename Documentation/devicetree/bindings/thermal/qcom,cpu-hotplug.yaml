@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/thermal/qcom,cpu-hotplug.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm CPU hotplug thermal cooling device
+
+description: |
+  A cooling device per CPU whose entire job is to take that CPU out of
+  service when a thermal zone asks for it.  State 0 leaves the CPU online,
+  state 1 offlines it.
+
+  Qualcomm's own emergency ladder uses this as the hardest step: a CPU sensor
+  at 120 C offlines the core it watches.  The step below it in their design,
+  cpu-pause, only hides the CPU from the WALT scheduler and has nothing to
+  drive it in mainline.
+
+  CPU0 is not usable because the kernel does not allow offlining it.
+
+properties:
+  compatible:
+    const: qcom,cpu-hotplug
+
+patternProperties:
+  "^cpu[0-9]+-hotplug$":
+    type: object
+    additionalProperties: false
+
+    properties:
+      qcom,cpu:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description: CPU node this cooling device offlines
+
+      qcom,cdev-alias:
+        $ref: /schemas/types.yaml#/definitions/string
+        description: |
+          Name the cooling device appears under in
+          /sys/class/thermal.  Defaults to "cpuN-hotplug".
+
+      "#cooling-cells":
+        const: 2
+
+    required:
+      - qcom,cpu
+      - "#cooling-cells"
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/thermal/thermal.h>
+
+    cpu-hotplug {
+        compatible = "qcom,cpu-hotplug";
+
+        cpu7-hotplug {
+            qcom,cpu = <&cpu7>;
+            #cooling-cells = <2>;
+        };
+    };
+...
