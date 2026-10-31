@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: BSD-3-Clause
+#include <dt-bindings/thermal/thermal.h>
 /*
  * Meizu 22 (M2582) -- thermal zones.
  *
- * Two independent sources:
+ * Two independent sensor families.  The TSENS zones are the ones with
+ * actuators -- the three cpufreq cooling devices and the GPU's devfreq
+ * cooling device:
  *
- *  - The PMXR2230 supplies the CPU rails and watches its own die temperature
- *    in hardware: stage 2 and stage 3 shutdown are armed by default, so it
- *    shuts the board down on its own with Linux out of the loop. Trip points
- *    are the factory tree's values for this PMIC (95 C passive, 115 C hot,
- *    145 C critical), which match the binding's example for this family.
- *    Software only ever lowers the hardware stage limits.
+ *  - SoC TSENS (nodes in tuna.dtsi).  This revision reports deci-Celsius in
+ *    the result register and the vendor's tree claims no calibration cells
+ *    for it, so the uncalibrated generic v2 path is what the phone itself
+ *    runs.  Five of its sensors watch the CPU clusters and one watches the
+ *    GPU; the rest monitor blocks with no mainline actuator.
  *
- *  - SoC TSENS (nodes in tuna.dtsi), which is what the GPU zone below hangs
- *    off. This revision reports deci-Celsius in the result register and the
- *    vendor's tree claims no calibration cells for it, so the uncalibrated
- *    generic v2 path is what the phone itself runs.
+ *  - The PMXR2230, which supplies the CPU rails and protects its own die in
+ *    hardware: stage 2 and stage 3 shutdown are armed by default, so it cuts
+ *    the rails with Linux out of the loop.  Its zone is a stage indicator
+ *    rather than a thermometer, and it cannot drive a cooling device on this
+ *    kernel -- see the note in that zone.
+ *
+ * Everything with an actuator throttles through mainline cooling devices:
+ * cpufreq-cpu0 / cpufreq-cpu4 / cpufreq-cpu7 for the clusters and
+ * devfreq-3d00000.gpu for the GPU.  Blocks the vendor throttles through
+ * cpu-pause / cpu-hotplug / DDR DVFS have no mainline equivalent and stay
+ * monitoring only.
  */
 &spmi_bus {
 	pmxr2230: pmic@1 {
@@ -58,6 +67,36 @@
 					type = "critical";
 				};
 			};
+
+			/*
+			 * No cooling map here, although stage 1 would be the right
+			 * moment to back the SoC off: it cannot bind.
+			 *
+			 * This sensor is not a thermometer either.  qcom-spmi-temp-alarm
+			 * reports DEFAULT_TEMP (37 C) while the PMIC sits in stage 0
+			 * and jumps to the stage threshold it tripped on, so a trip
+			 * here would mean "the PMIC entered its hardware stage 1".
+			 *
+			 * A map was tried and never bound.  thermal_of.c matches a
+			 * cooling map to a trip through trip->priv, which it sets to
+			 * the trip's device node, but qcom-spmi-temp-alarm stores its
+			 * own trip index there:
+			 *
+			 *     qpnp_tm_gen2_rev2_configure_trip_temps_cb():
+			 *         trip->priv = THERMAL_INT_TO_TRIP_PRIV(chip->ntrips);
+			 *
+			 * The driver is allowed to do that (the encoding macros live
+			 * in include/linux/thermal.h), so the two uses collide and
+			 * pmxr2230-thermal, pm8550ve-d/f all bind no cooling device.
+			 * Measured on the board: every lookup logged the map's trip
+			 * node against a priv of (efault)/(null) and returned no
+			 * match.  Fixing it means changing either the core lookup to
+			 * key on the trip id instead of priv, or the driver to keep
+			 * its index elsewhere; that is a thermal core change and
+			 * belongs in its own round.  Hardware protection is not
+			 * affected: stage 2 and stage 3 shutdown run in the PMIC
+			 * itself.
+			 */
 		};
 
 		/*
@@ -75,30 +114,80 @@
 		 *   cpu-1-2-0  tsens1 s3    cpu-2-0-0  tsens0 s1
 		 *   cpuss-0-0  tsens1 s1
 		 *
-		 * Kept as monitoring only: there are no cooling maps here yet, so
-		 * nothing throttles.  The vendor's own CPU zones drive cpu-pause /
-		 * cpu-hotplug, which mainline does not have; the equivalent would
-		 * be the cpufreq cooling devices that already exist on this board
-		 * (cpufreq-cpu0 / -cpu4 / -cpu7), and that is a behaviour change
-		 * worth its own boot.
+		 * Trip ladder, and why one trip was not enough.
 		 *
-		 * Trips are the vendor's numbers (105 C passive, 125 C hot) minus
-		 * the emergency pair, which only make sense with its own cooling
-		 * devices.
+		 * With only the vendor's 105 C passive trip the governor never
+		 * settled: step_wise compares the temperature against
+		 * (trip - hysteresis), so 105 C with 5 s of hysteresis is an
+		 * effective 100 C, and it only moves one cooling state per poll.
+		 * Measured on the board (6 busy cores, 25 s): the SoC parked at
+		 * 104.8 C while the clusters oscillated between one and two OPPs
+		 * below maximum -- chatter, with 20 C of headroom left and no
+		 * margin at all under the 125 C hot trip.
+		 *
+		 * So each zone now has two passive trips plus a critical one:
+		 *
+		 *    85 C  passive, capped to 4 frequency steps per cluster
+		 *    95 C  passive, allowed to use the whole OPP table
+		 *   115 C  critical: orderly shutdown
+		 *
+		 * The cap on the low trip is the per-instance upper bound from the
+		 * cooling spec (`<&cpu0 0 4>`), so mild heating costs at most four
+		 * OPPs and sustained heat escalates to the full table.  Several
+		 * instances may share a cooling device: __thermal_cdev_update()
+		 * keeps the deepest state requested by any of them
+		 * (drivers/thermal/thermal_helpers.c).
+		 *
+		 * Why the second trip is 95 C and not the vendor's 105 C: measured
+		 * on the board with 8 busy cores, the capped first stage saturates
+		 * (all three cooling devices at state 4, 1516/2438/2630 MHz) within
+		 * two seconds and the SoC still plateaus at 100 C.  Four OPPs are
+		 * worth only ~5 C here, so a 105 C trip (effective 103 C) was never
+		 * reached and nothing escalated.  At 95 C the full table engages
+		 * while the first stage is still saturated, and 20 C are left
+		 * before the critical trip.
+		 *
+		 * The board has no vendor cpu-pause / cpu-hotplug device, so the
+		 * actuator is mainline cpufreq cooling -- which is why the maps
+		 * point at the first CPU of each policy.  Any one CPU sensor over
+		 * its trip throttles all three clusters.
+		 *
+		 * 115 C critical sits at the PMXR2230's hardware stage 2 threshold
+		 * and well under its stage 3 (145 C), so software shuts down in an
+		 * orderly way before the PMIC cuts the rails.
 		 */
+
 		cpu-0-0-0-thermal {
 			polling-delay-passive = <100>;
 			thermal-sensors = <&tsens1 9>;
 			trips {
-				cpu0_alert: trip-point0 {
-					temperature = <105000>;
-					hysteresis = <5000>;
+				cpu0_warm: trip-point0 {
+					temperature = <85000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
-				cpu0_hot: trip-point1 {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "hot";
+				cpu0_alert: trip-point1 {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+				cpu0_crit: trip-point2 {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				map-warm {
+					trip = <&cpu0_warm>;
+					cooling-device = <&cpu0 0 4>, <&cpu4 0 4>,
+							 <&cpu7 0 4>;
+				};
+				map-hot {
+					trip = <&cpu0_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -107,15 +196,33 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&tsens0 4>;
 			trips {
-				cpu1_alert: trip-point0 {
-					temperature = <105000>;
-					hysteresis = <5000>;
+				cpu1_warm: trip-point0 {
+					temperature = <85000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
-				cpu1_hot: trip-point1 {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "hot";
+				cpu1_alert: trip-point1 {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+				cpu1_crit: trip-point2 {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				map-warm {
+					trip = <&cpu1_warm>;
+					cooling-device = <&cpu0 0 4>, <&cpu4 0 4>,
+							 <&cpu7 0 4>;
+				};
+				map-hot {
+					trip = <&cpu1_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -124,15 +231,33 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&tsens1 3>;
 			trips {
-				cpu12_alert: trip-point0 {
-					temperature = <105000>;
-					hysteresis = <5000>;
+				cpu12_warm: trip-point0 {
+					temperature = <85000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
-				cpu12_hot: trip-point1 {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "hot";
+				cpu12_alert: trip-point1 {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+				cpu12_crit: trip-point2 {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				map-warm {
+					trip = <&cpu12_warm>;
+					cooling-device = <&cpu0 0 4>, <&cpu4 0 4>,
+							 <&cpu7 0 4>;
+				};
+				map-hot {
+					trip = <&cpu12_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -141,15 +266,33 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&tsens0 1>;
 			trips {
-				cpu2_alert: trip-point0 {
-					temperature = <105000>;
-					hysteresis = <5000>;
+				cpu2_warm: trip-point0 {
+					temperature = <85000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
-				cpu2_hot: trip-point1 {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "hot";
+				cpu2_alert: trip-point1 {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+				cpu2_crit: trip-point2 {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				map-warm {
+					trip = <&cpu2_warm>;
+					cooling-device = <&cpu0 0 4>, <&cpu4 0 4>,
+							 <&cpu7 0 4>;
+				};
+				map-hot {
+					trip = <&cpu2_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -158,15 +301,33 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&tsens1 1>;
 			trips {
-				cpuss_alert: trip-point0 {
-					temperature = <105000>;
-					hysteresis = <5000>;
+				cpuss_warm: trip-point0 {
+					temperature = <85000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
-				cpuss_hot: trip-point1 {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "hot";
+				cpuss_alert: trip-point1 {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+				cpuss_crit: trip-point2 {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+			cooling-maps {
+				map-warm {
+					trip = <&cpuss_warm>;
+					cooling-device = <&cpu0 0 4>, <&cpu4 0 4>,
+							 <&cpu7 0 4>;
+				};
+				map-hot {
+					trip = <&cpuss_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -478,15 +639,15 @@
 
 			trips {
 				gpu_alert0: trip-point0 {
-					temperature = <105000>;
-					hysteresis = <5000>;
+					temperature = <95000>;
+					hysteresis = <3000>;
 					type = "passive";
 				};
 
-				gpu_hot: trip-point1 {
-					temperature = <125000>;
-					hysteresis = <0>;
-					type = "hot";
+				gpu_crit: trip-point1 {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
 				};
 			};
 
