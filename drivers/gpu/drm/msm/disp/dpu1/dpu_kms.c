@@ -310,6 +310,20 @@ static int dpu_kms_debugfs_init(struct msm_kms *kms, struct drm_minor *minor)
 	dpu_debugfs_core_irq_init(dpu_kms, entry);
 	dpu_debugfs_sspp_init(dpu_kms, entry);
 
+	/*
+	 * M2582: read-only window on the command-mode handshake, so the tear
+	 * check can be compared with the state this board was measured working
+	 * in.  INTF_1 is at 0x35000: 0x35284 TEAR_CHECK_EN, 0x35288
+	 * SYNC_CONFIG_VSYNC, which has to read 0x0018003a (BIT(19) counter
+	 * enable, BIT(20) hw_vsync_mode, 0x3a = 58).  0x1501c is CTL_START; a
+	 * value that stays 1 means the start request was never consumed, which
+	 * is what makes the ping-pong never report done.
+	 */
+	dpu_debugfs_create_regset32("m2582_intf_tear", 0400, entry,
+				    0x35280, 16, dpu_kms);
+	dpu_debugfs_create_regset32("m2582_ctl", 0400, entry,
+				    0x15010, 16, dpu_kms);
+
 	return dpu_core_perf_debugfs_init(dpu_kms, entry);
 }
 #endif
