@@ -287,4 +287,3 @@
 		#power-domain-cells = <0>;
 	};
 };
-
