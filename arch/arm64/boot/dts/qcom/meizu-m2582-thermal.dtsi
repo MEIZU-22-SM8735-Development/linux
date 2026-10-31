@@ -172,6 +172,294 @@
 		};
 
 		/*
+		 * Everything else the four TSENS controllers measure.
+		 *
+		 * Same source as the CPU zones above: the vendor's own zone names
+		 * and sensor indices.  These are the SoC blocks that are not CPU or
+		 * GPU -- the always-on island, the camera ISP, Venus video, the DDR
+		 * controller, the two Hexagon NSP sensor groups and the modem
+		 * subsystem.  Monitoring only, like the CPU ones.
+		 */
+			/* always-on island */
+		aoss-0-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens0 0>;
+			trips {
+				aoss_0_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				aoss_0_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		aoss-1-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens1 0>;
+			trips {
+				aoss_1_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				aoss_1_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		aoss-2-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 0>;
+			trips {
+				aoss_2_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				aoss_2_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		aoss-3-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens3 0>;
+			trips {
+				aoss_3_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				aoss_3_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+			/* ISP / camera */
+		camera-0-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 1>;
+			trips {
+				camera_0_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				camera_0_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		camera-1-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 2>;
+			trips {
+				camera_1_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				camera_1_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+			/* Venus video */
+		video-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 3>;
+			trips {
+				video_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				video_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+			/* DDR / memory controller */
+		ddr-0-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 4>;
+			trips {
+				ddr_0_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				ddr_0_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+			/* Hexagon NSP (vector) */
+		nsphvx-0-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 11>;
+			trips {
+				nsphvx_0_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				nsphvx_0_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		nsphvx-1-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 12>;
+			trips {
+				nsphvx_1_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				nsphvx_1_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+			/* Hexagon NSP (matrix) */
+		nsphmx-0-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 13>;
+			trips {
+				nsphmx_0_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				nsphmx_0_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		nsphmx-1-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens2 14>;
+			trips {
+				nsphmx_1_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				nsphmx_1_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+			/* modem subsystem */
+		mdmss-0-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens3 1>;
+			trips {
+				mdmss_0_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				mdmss_0_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		mdmss-1-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens3 2>;
+			trips {
+				mdmss_1_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				mdmss_1_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		mdmss-2-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens3 3>;
+			trips {
+				mdmss_2_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				mdmss_2_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		mdmss-3-thermal {
+			polling-delay-passive = <100>;
+			thermal-sensors = <&tsens3 4>;
+			trips {
+				mdmss_3_alert: trip-point0 {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				mdmss_3_hot: trip-point1 {
+					temperature = <125000>;
+					hysteresis = <0>;
+					type = "hot";
+				};
+			};
+		};
+
+		/*
 		 * The phone's own tree carries six of these, gpu-0..gpu-5, on
 		 * tsens2 sensors 5..10, each throttling the GPU from 105 C and
 		 * calling it hot at 125 C. Six zones would all drive the same
