@@ -275,55 +275,6 @@ static int _dpu_encoder_phys_cmd_handle_ppdone_timeout(
 	return -ETIMEDOUT;
 }
 
-/*
- * m2582.features=intfnowait: skip the read-pointer wait when the interface has
- * already handed the previous frame over.  Off by default: rdptrwait alone is the
- * configuration that was measured stable, and this only removes waits, so it has
- * to be shown not to bring the wedge back before it becomes the default.
- *
- * True when the interface is not in the middle of writing a frame, i.e. when a
- * new kickoff can be armed without landing inside the previous frame's transfer.
- * INTF_LINE_COUNT is the interface's own write pointer into the command-mode
- * engine; it only moves while a frame is being handed over.
- */
-static bool dpu_encoder_phys_cmd_intf_between_frames(
-		struct dpu_encoder_phys *phys_enc)
-{
-	struct dpu_encoder_phys_cmd *cmd_enc =
-			to_dpu_encoder_phys_cmd(phys_enc);
-	struct dpu_hw_intf_status st = { 0 };
-
-	if (!phys_enc->hw_intf || !phys_enc->hw_intf->ops.get_status)
-		return false;
-
-	phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &st);
-	if (!st.is_en)
-		return false;
-
-	/*
-	 * Either the interface is parked at line 0, or it has already counted a
-	 * whole frame since the last kickoff.  The counter is the second half of
-	 * the test because the line counter is not documented to return to 0
-	 * between frames on this core, and a signal that never arrives would
-	 * silently turn this switch back into plain rdptrwait.
-	 */
-	return st.line_count == 0 || st.frame_count != cmd_enc->last_intf_frame_count;
-}
-
-static void dpu_encoder_phys_cmd_intf_sample_frame_count(
-		struct dpu_encoder_phys *phys_enc)
-{
-	struct dpu_encoder_phys_cmd *cmd_enc =
-			to_dpu_encoder_phys_cmd(phys_enc);
-	struct dpu_hw_intf_status st = { 0 };
-
-	if (!phys_enc->hw_intf || !phys_enc->hw_intf->ops.get_status)
-		return;
-
-	phys_enc->hw_intf->ops.get_status(phys_enc->hw_intf, &st);
-	cmd_enc->last_intf_frame_count = st.frame_count;
-}
-
 static int _dpu_encoder_phys_cmd_wait_for_idle(
 		struct dpu_encoder_phys *phys_enc)
 {
@@ -354,18 +305,6 @@ static int _dpu_encoder_phys_cmd_wait_for_idle(
 	 * edge the factory's ctl_done/scheduler path is built on.
 	 */
 	if (m2582_feature_opt_in("noppwait")) {
-		ret = 0;
-	} else if (m2582_feature_opt_in("rdptrwait") &&
-		   m2582_feature_opt_in("intfnowait") &&
-		   phys_enc->irq[INTR_IDX_RDPTR] &&
-		   dpu_encoder_phys_cmd_intf_between_frames(phys_enc)) {
-		/*
-		 * The interface has already written the previous frame out, so
-		 * arming the next one cannot collide with the command-mode
-		 * engine.  This is what keeps the kickoff pipeline full: only the
-		 * case that can wedge the DSI (arming while the interface is still
-		 * mid-frame) has to wait for the read-pointer event.
-		 */
 		ret = 0;
 	} else if (m2582_feature_opt_in("rdptrwait") &&
 		   phys_enc->irq[INTR_IDX_RDPTR]) {
@@ -913,9 +852,6 @@ static void dpu_encoder_phys_cmd_prepare_for_kickoff(
 	 * frames it used to show, including plain CPU-written buffers.
 	 */
 	dpu_encoder_phys_cmd_enable_te(phys_enc);
-
-	if (m2582_feature_opt_in("intfnowait"))
-		dpu_encoder_phys_cmd_intf_sample_frame_count(phys_enc);
 
 	DPU_DEBUG_CMDENC(cmd_enc, "pp:%d pending_cnt %d\n",
 			phys_enc->hw_pp->idx - PINGPONG_0,

@@ -256,8 +256,6 @@ struct dpu_encoder_phys_cmd {
 	int pp_timeout_report_cnt;
 	atomic_t pending_vblank_cnt;
 	wait_queue_head_t pending_vblank_wq;
-	/* interface frame counter sampled at the last kickoff (m2582 intfnowait) */
-	u32 last_intf_frame_count;
 };
 
 /**
