@@ -25,6 +25,7 @@
 #include "dpu_hw_catalog.h"
 #include "dpu_hw_intf.h"
 #include "dpu_hw_ctl.h"
+#include "dpu_hw_reg_dma.h"
 #include "dpu_hw_cwb.h"
 #include "dpu_hw_dspp.h"
 #include "dpu_hw_dsc.h"
@@ -1668,6 +1669,9 @@ static void _dpu_encoder_trigger_flush(struct drm_encoder *drm_enc,
 	if (extra_flush_bits && ctl->ops.update_pending_flush)
 		ctl->ops.update_pending_flush(ctl, extra_flush_bits);
 
+	/* M2582: start the regDMA script together with the frame */
+
+
 	ctl->ops.trigger_flush(ctl);
 
 	if (ctl->ops.get_pending_flush)
@@ -1890,7 +1894,8 @@ static u32 _dpu_encoder_calculate_linetime(struct dpu_encoder_virt *dpu_enc,
 		return 0;
 	}
 
-	pclk_rate = mode->clock; /* pixel clock in kHz */
+	/* see DPU_M2582_LINK_PCLK_KHZ: the mode clock is the nominal refresh now */
+	pclk_rate = dpu_mode_is_m2582(mode) ? DPU_M2582_LINK_PCLK_KHZ : mode->clock;
 	if (pclk_rate == 0) {
 		DPU_ERROR("pclk is 0, cannot calculate line time\n");
 		return 0;
@@ -2108,12 +2113,9 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 		if (dpu_encoder_use_dsc_merge(enc_master->parent))
 			dsc_common_mode |= DSC_MODE_MULTIPLEX;
 	}
-	if (m2582_feature_opt_in("mode1"))
-		dsc_common_mode |= DSC_MODE_SPLIT_PANEL;
-	if (m2582_feature_opt_in("mode2"))
-		dsc_common_mode |= DSC_MODE_MULTIPLEX;
-	if (m2582_feature_opt_in("mode3"))
-		dsc_common_mode |= DSC_MODE_SPLIT_PANEL | DSC_MODE_MULTIPLEX;
+
+
+
 
 	/*
 	 * One slice per encoder: the factory reads DSC_CMN_MAIN_CNF's
@@ -2141,8 +2143,7 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 	 */
 	for (i = 0; i < num_dsc; i++)
 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i],
-					 m2582_feature_opt_in("dscswap") ?
-						hw_pp[num_dsc - 1 - i] : hw_pp[i],
+					 hw_pp[i],
 					 dsc, dsc_common_mode, initial_lines,
 					 num_active_ss);
 
@@ -2155,11 +2156,7 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
 	 * configuration measured working on this board (120.5 fps, no timeouts)
 	 * did not write it and inherited the bootloader's value.
 	 */
-	if (m2582_feature_opt_in("ppbfifo"))
-		for (i = 0; i < num_dsc; i++)
-			if (hw_pp[i]->ops.set_ppb_fifo_size)
-				hw_pp[i]->ops.set_ppb_fifo_size(hw_pp[i],
-					DIV_ROUND_UP(dsc->pic_width * 4, num_dsc));
+
 }
 
 /**
@@ -2210,7 +2207,7 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *drm_enc)
 	 * the model.
 	 */
 	if (dpu_enc->dsc) {
-		if (!m2582_feature_opt_in("dscstatic") || needs_hw_reset ||
+		if (needs_hw_reset ||
 		    !dpu_enc->dsc_config_valid ||
 		    memcmp(&dpu_enc->dsc_last_config, dpu_enc->dsc,
 			   sizeof(*dpu_enc->dsc))) {

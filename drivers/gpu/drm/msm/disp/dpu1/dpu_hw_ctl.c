@@ -393,20 +393,51 @@ static void dpu_hw_ctl_update_pending_flush_dspp(struct dpu_hw_ctl *ctx,
 static void dpu_hw_ctl_update_pending_flush_dspp_sub_blocks(
 	struct dpu_hw_ctl *ctx,	enum dpu_dspp dspp, u32 dspp_sub_blk)
 {
+	u32 bit;
+
 	if (dspp >= DSPP_MAX)
 		return;
 
+	/*
+	 * The bit numbers are the hardware's, not ours: each colour block of a
+	 * DSPP is shadowed until its own bit is written to the per-DSPP flush
+	 * register, and the block only reaches the datapath once that happens.
+	 * Measured from the factory stack (dspp_sub_blk_flush_tbl): VLUT 1,
+	 * IGC 2, GAMUT 3, PCC 4, GC 5, LTM 7, SPR 8, DEMURA 9, RC 10.
+	 */
 	switch (dspp_sub_blk) {
+	case DPU_DSPP_VLUT:
+		bit = 1;
+		break;
+	case DPU_DSPP_IGC:
+		bit = 2;
+		break;
+	case DPU_DSPP_GAMUT:
+		bit = 3;
+		break;
 	case DPU_DSPP_PCC:
-		ctx->pending_dspp_flush_mask[dspp - DSPP_0] |= BIT(4);
+		bit = 4;
 		break;
 	case DPU_DSPP_GC:
-		ctx->pending_dspp_flush_mask[dspp - DSPP_0] |= BIT(5);
+		bit = 5;
+		break;
+	case DPU_DSPP_LTM:
+		bit = 7;
+		break;
+	case DPU_DSPP_SPR:
+		bit = 8;
+		break;
+	case DPU_DSPP_DEMURA:
+		bit = 9;
+		break;
+	case DPU_DSPP_RC:
+		bit = 10;
 		break;
 	default:
 		return;
 	}
 
+	ctx->pending_dspp_flush_mask[dspp - DSPP_0] |= BIT(bit);
 	ctx->pending_flush_mask |= BIT(DSPP_IDX);
 }
 

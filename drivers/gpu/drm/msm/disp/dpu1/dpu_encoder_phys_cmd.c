@@ -153,43 +153,6 @@ static void dpu_encoder_phys_cmd_ctl_start_irq(void *arg)
 	DPU_ATRACE_END("ctl_start_irq");
 }
 
-/*
- * m2582.features=ppboth: a widebus pair is two ping-pongs feeding one
- * interface, and this driver registers and waits on the first one's done only.
- * If the pair reports completion from the second ping-pong -- or if the first
- * one's done edge is not the one that marks the frame as consumed -- then the
- * kickoff is released one slice early for one half, which is the shape of the
- * damage this board shows in a single 600-wide column.
- *
- * The handler deliberately only releases the wait and decrements the pending
- * count; the frame-done event stays with the first ping-pong so a frame cannot
- * be reported twice.
- */
-static void m2582_pp2_done_irq(void *arg)
-{
-	struct dpu_encoder_phys *phys_enc = arg;
-
-	atomic_add_unless(&phys_enc->pending_kickoff_cnt, -1, 0);
-	wake_up_all(&phys_enc->pending_kickoff_wq);
-}
-
-/* the ping-pong paired with this encoder's, if any */
-static u32 m2582_pp2_intr(struct dpu_encoder_phys *phys_enc)
-{
-	const struct dpu_pingpong_cfg *pp;
-
-	if (!m2582_feature_opt_in("ppboth") || !phys_enc->dpu_kms ||
-	    !phys_enc->hw_pp)
-		return 0;
-
-	for (pp = phys_enc->dpu_kms->catalog->pingpong;
-	     pp && pp->id != PINGPONG_NONE; pp++)
-		if (pp->id == phys_enc->hw_pp->idx + 1)
-			return pp->intr_done;
-
-	return 0;
-}
-
 static void dpu_encoder_phys_cmd_underrun_irq(void *arg)
 {
 	struct dpu_encoder_phys *phys_enc = arg;
@@ -205,7 +168,6 @@ static void dpu_encoder_phys_cmd_atomic_mode_set(
 	phys_enc->irq[INTR_IDX_CTL_START] = phys_enc->hw_ctl->caps->intr_start;
 
 	phys_enc->irq[INTR_IDX_PINGPONG] = phys_enc->hw_pp->caps->intr_done;
-	phys_enc->irq[INTR_IDX_PINGPONG2] = m2582_pp2_intr(phys_enc);
 
 	if (phys_enc->has_intf_te)
 		phys_enc->irq[INTR_IDX_RDPTR] = phys_enc->hw_intf->cap->intr_tear_rd_ptr;
@@ -288,38 +250,27 @@ static int _dpu_encoder_phys_cmd_wait_for_idle(
 	wait_info.timeout_ms = KICKOFF_TIMEOUT_MS;
 
 	/*
-	 * m2582.features=noppwait: do not gate the next kickoff on the ping-pong
-	 * done interrupt.
-	 *
-	 * Measured on this board (image grpall-1025-1725): across 300+ interrupt
-	 * dispatches the MDP core's own interrupt group never asserts a single
-	 * bit -- grp0 status_or=00000000 with en_or=04000100, i.e. ping-pong done
-	 * is enabled but the hardware never raises it -- while the only bit that
-	 * does fire is grp1 bit 9, ctl_start, once per kickoff.  So the ping-pong
-	 * done interrupt this wait is written against cannot arrive, and every
-	 * frame after the first times out.
-	 *
-	 * So this gate is skipped entirely.  Pacing then comes from the
-	 * post-kickoff commit-done wait, which uses the ctl_start interrupt --
-	 * the one interrupt this board does deliver once per frame, and the same
-	 * edge the factory's ctl_done/scheduler path is built on.
+	 * Ping-pong done paces the next kickoff.  An earlier reading of the
+	 * status register ("done is enabled but never raised") was wrong: the ISR
+	 * clears it, and the driver's own counter shows one done per ctl_start
+	 * (4433/4433 over 40 s, 2026-11-12).  The interrupt really was missing
+	 * while every resume left the MDSS core unreset; with mdssresetresume in
+	 * place the upstream path paces correctly, and rdptrwait is only a
+	 * fallback.
 	 */
-	if (m2582_feature_opt_in("noppwait")) {
-		ret = 0;
-	} else if (m2582_feature_opt_in("rdptrwait") &&
+	if (m2582_feature_opt_in("rdptrwait") &&
 		   phys_enc->irq[INTR_IDX_RDPTR]) {
 		/*
 		 * m2582.features=rdptrwait: pace on the interface's read-pointer
 		 * event instead of the ping-pong done one.
 		 *
-		 * Ping-pong done says the DPU finished reading the frame out of the
-		 * SSPPs and nothing more: the command-mode engine is still sending
-		 * that frame for the rest of the frame time, so arming the next one
-		 * on that event lands inside the transfer and wedges the engine
-		 * (STATUS0 = CMD_MODE_ENGINE_BUSY | DMA_BUSY | MDP_BUSY, and then
-		 * every commit times out).  The interface's read-pointer interrupt
-		 * fires once per frame after the panel has taken the frame, and it is
-		 * the same event mainline uses for vblank.
+		 * Kept as a fallback.  While the core was left unreset across
+		 * resumes this was the only pacing that survived: arming the next
+		 * frame on a ping-pong done that never arrived wedged the engine
+		 * (STATUS0 = CMD_MODE_ENGINE_BUSY | DMA_BUSY | MDP_BUSY, then
+		 * every commit timed out).  It costs frame rate -- updates are
+		 * capped near the panel's own rate, 35.5 fps against 110.8 fps on
+		 * the ping-pong path, measured 2026-11-12.
 		 */
 		struct dpu_encoder_wait_info vb;
 
@@ -342,17 +293,6 @@ static int _dpu_encoder_phys_cmd_wait_for_idle(
 		_dpu_encoder_phys_cmd_handle_ppdone_timeout(phys_enc);
 	else if (!ret)
 		cmd_enc->pp_timeout_report_cnt = 0;
-
-	/*
-	 * m2582.features=noidlewait: on this board the ping-pong done interrupt
-	 * fires for the first frame and then never again, so upstream's gate
-	 * (timeout makes the commit fail, and every following commit then times
-	 * out too) drops all but a few frames.  The flag kicks the frame off
-	 * anyway and leaves the wait as a statistic, which separates "the panel
-	 * is fed out of order" from anything downstream of the interface.
-	 */
-	if (ret == -ETIMEDOUT && m2582_feature_opt_in("noidlewait"))
-		return 0;
 
 	return ret;
 }
@@ -434,10 +374,6 @@ static void dpu_encoder_phys_cmd_irq_enable(struct dpu_encoder_phys *phys_enc)
 				       phys_enc->irq[INTR_IDX_UNDERRUN],
 				       dpu_encoder_phys_cmd_underrun_irq,
 				       phys_enc);
-	if (phys_enc->irq[INTR_IDX_PINGPONG2])
-		dpu_core_irq_register_callback(phys_enc->dpu_kms,
-					       phys_enc->irq[INTR_IDX_PINGPONG2],
-					       m2582_pp2_done_irq, phys_enc);
 	dpu_encoder_phys_cmd_control_vblank_irq(phys_enc, true);
 
 	if (dpu_encoder_phys_cmd_is_master(phys_enc) && phys_enc->irq[INTR_IDX_CTL_START])
@@ -551,21 +487,14 @@ static void dpu_encoder_phys_cmd_tearcheck_config(
 	 * state this board was measured working in (120.5 fps, no timeouts).
 	 *
 	 */
-	tc_cfg.hw_vsync_mode = m2582_feature_opt_in("tevm0") ? 0 : 1;
+	tc_cfg.hw_vsync_mode = 1;
 	/*
-	 * m2582.features=tevm0 restores the vendor's value.
-	 *
-	 * sde_encoder_phys_cmd_tearcheck_config() (the SM8735 vendor source) sets
-	 * hw_vsync_mode = 0 -- "enable external TE after kickoff to avoid
-	 * premature autorefresh" -- and every other field of this block is
-	 * identical between the two drivers: vsync_count, sync_cfg_height
-	 * 0xFFFFFFF0 for a 32-bit TE path, start_pos and vsync_init_val =
-	 * vdisplay, rd_ptr_irq = vdisplay + 1, wr_ptr_irq = 1,
-	 * sync_threshold_start/continue, and TEAR_DETECT_CTRL = vsync_init_val +
-	 * 0x14.  This bit is therefore the only difference left in the whole
-	 * frame-start mechanism, which is why it is an arm and not a comment:
-	 * 1 is what makes the interface run on this board, 0 is what the factory
-	 * runs.
+	 * 1, not the factory's 0: this board was measured working with the
+	 * counter running off the interface's TE pulse (INTF_TEAR_SYNC_CONFIG_VSYNC
+	 * = 0x0018003a), and with 0 the counters stop advancing, which leaves the
+	 * CTL start unconsumed and the ping-pong never reporting done.  Every
+	 * other field of this block matches the vendor's
+	 * sde_encoder_phys_cmd_tearcheck_config().
 	 */
 	/*
 	 * 32-bit field: this SoC's tear block latches 0xfffffff0 (read back on
@@ -643,25 +572,11 @@ static void dpu_encoder_phys_cmd_setup_timing_engine(
 	}
 
 	/*
-	 * m2582.features=vendorintf: the factory's kernel never programs the
-	 * interface timing generator from its command-mode encoder at all --
-	 * enable_timing is only ever called from its video encoder -- so it
-	 * inherits whatever the bootloader left.  DisplayDxe disassembly has a
-	 * path that writes 0x1801011 to an INTF timing-engine register, but the
-	 * active DSI0 instance/value is not captured; the saved vendor 0x35000
-	 * read is DP0, not DSI0.  Forcing the block off is therefore a mainline
-	 * write that may differ from DSI0's inherited state, but that difference
-	 * still needs an active DSI0 readback.
-	 * m2582.features=nointften: this one write, isolated from the rest of
-	 * the vendorintf bundle, so it can be A/B'd on its own.  With the write
-	 * in place, mainline INTF1 +0x000 reads back 0.  Off by default.
-	 */
-	if (m2582_feature_opt_in("vendorintf") ||
-	    m2582_feature_opt_in("nointften"))
-		return;
-
-	/* A free-running timing generator keeps the tear-check block from
-	 * latching a frame, so make sure it stays off.
+	 * The factory's command-mode encoder never programs the interface timing
+	 * generator (its enable_timing is only called from the video encoder), so
+	 * it inherits the bootloader's state.  Mainline does write it, and a
+	 * free-running timing generator keeps the tear-check block from latching a
+	 * frame, so it is forced off here.
 	 */
 	phys_enc->hw_intf->ops.enable_timing(phys_enc->hw_intf, 0);
 }
@@ -968,22 +883,6 @@ static void dpu_encoder_phys_cmd_handle_post_kickoff(
 	 */
 	_dpu_encoder_phys_cmd_connect_te(phys_enc, true);
 
-	/*
-	 * M2582: put the tear-check write pointer back at start_pos after every
-	 * kickoff, which is what the factory's autorefresh-disable sequence does
-	 * ("replace te write count with start_pos to meet trigger window").
-	 *
-	 * Without it the panel takes the first frame of a session and none after
-	 * it: a client that commits once (drm_flip) is always correct, while one
-	 * that keeps committing (kmscube, a compositor) shows one frame and then
-	 * nothing, with every later frame reported done by the DPU.  Only the
-	 * pointer is written here -- re-running the whole tear-check block per
-	 * frame stops and restarts the counter, which is a different experiment
-	 * and was measured to cost even the first frame.
-	 */
-	if (m2582_feature_opt_in("tearperframe") &&
-	    phys_enc->hw_intf->ops.reset_tearcheck)
-		phys_enc->hw_intf->ops.reset_tearcheck(phys_enc->hw_intf);
 }
 
 static void dpu_encoder_phys_cmd_trigger_start(
@@ -1048,15 +947,7 @@ struct dpu_encoder_phys *dpu_encoder_phys_cmd_init(struct drm_device *dev,
 		return ERR_PTR(-EINVAL);
 	}
 
-	/*
-	 * DPU before 5.0 use PINGPONG for TE handling.  "ppte" forces the
-	 * ping-pong path on a newer core, which is what programs PP_RD_PTR_IRQ
-	 * and therefore what makes the ping-pong report frame completion at all.
-	 * The factory's ping-pong tear setup exists and writes those registers;
-	 * whether it runs on this panel is the question this flag answers.
-	 */
-	if (phys_enc->dpu_kms->catalog->mdss_ver->core_major_ver >= 5 &&
-	    !m2582_feature_opt_in("ppte"))
+	if (phys_enc->dpu_kms->catalog->mdss_ver->core_major_ver >= 5)
 		phys_enc->has_intf_te = true;
 
 	if (phys_enc->has_intf_te && !phys_enc->hw_intf->ops.enable_tearcheck) {

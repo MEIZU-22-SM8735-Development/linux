@@ -419,7 +419,7 @@ static void _dpu_crtc_blend_setup_pipe(struct drm_crtc *crtc,
 
 	state = plane->state;
 	/* Independent halves share a stage but require distinct SSPP slots. */
-	if (m2582_feature_opt_in("srcsplitplanes") &&
+	if (false &&
 	    state->dst.x1 >= crtc->state->adjusted_mode.hdisplay / 2)
 		stage_idx = 1;
 
@@ -855,36 +855,6 @@ static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
 }
 
 
-/*
- * M2582: stage a DSPP colour script for this commit.  The encoder starts it
- * right before the CTL flush.  Off unless m2582.features=regdmatest: it is the
- * experiment that tells us whether the engine is needed at all, given that a
- * plain register write plus the DSPP flush bit is enough for the same effect.
- */
-static void m2582_regdma_stage(struct drm_crtc *crtc)
-{
-	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
-	struct msm_drm_private *priv = crtc->dev->dev_private;
-	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
-
-	if (!dpu_kms || !dpu_kms->regdma)
-		return;
-
-	if (!m2582_feature_opt_in("regdmatest"))
-		return;
-
-	if (!cstate->num_mixers || !cstate->mixers[0].lm_ctl ||
-	    !cstate->mixers[0].hw_dspp)
-		return;
-
-	/* canary: write a recognisable word into the DSPP's SPR block */
-	dpu_reg_dma_begin(dpu_kms->regdma, DPU_REG_DMA_SEL_DSPP0);
-	dpu_reg_dma_write_reg(dpu_kms->regdma, 0x15404, 0x12345678);
-
-	pr_info_once("m2582-regdma: stage dspp idx %d, kick ret %d\n",
-		     cstate->mixers[0].hw_dspp->idx,
-		     dpu_reg_dma_kick(dpu_kms, cstate->mixers[0].lm_ctl));
-}
 
 static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 {
@@ -954,7 +924,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			ctl->ops.update_pending_flush_dspp(ctl,
 				mixer[i].hw_dspp->idx, DPU_DSPP_SPR);
 			/* the PCC probe needs PCC's own flush bit */
-			if (m2582_feature_opt_in("sprtest"))
+			if (false)
 				ctl->ops.update_pending_flush_dspp(ctl,
 					mixer[i].hw_dspp->idx, DPU_DSPP_PCC);
 		}
@@ -998,7 +968,6 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 	 * engine; build the script here and let the encoder start it right
 	 * before the CTL flush.
 	 */
-	m2582_regdma_stage(crtc);
 
 	/*
 	 * PP_DONE irq is only used by command mode for now.
@@ -1499,7 +1468,7 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	 * panel needs it for every composition, not just for CTM/gamma users.
 	 */
 	if (crtc_state->ctm || crtc_state->gamma_lut ||
-	    m2582_feature_opt_in("spr") || m2582_feature_opt_in("sprtest"))
+	    false || false)
 		topology.num_dspp = topology.num_lm;
 
 	return topology;

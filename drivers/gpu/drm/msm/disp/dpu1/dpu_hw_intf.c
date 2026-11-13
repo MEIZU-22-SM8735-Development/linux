@@ -121,12 +121,22 @@
 #define INTF_CFG2_PROG_DYNREF           BIT(28)
 
 /*
- * INTF_TIMING_ENGINE_ALIGN_CTRL has no upstream name.  The factory writes it,
- * together with CONFIG2 BIT(23), whenever its setup_timing_engine is called for
- * a wide-bus output; the value is 0x46 when compression is on and 0x451 when it
- * is off (msm_drm.ko 0x101bd4 branch / 0x101bec OR-of-BIT(23) / 0x101c00 value
- * selected at 0x1019f8).  Mainline never writes it, so this board keeps the
- * bootloader's 0x00000001.
+ * INTF_TIMING_ENGINE_ALIGN_CTRL has no upstream name.  It is the *esync* / AVR
+ * alignment control, not a wide-bus one: the vendor's own source writes it only
+ * when the display info has esync enabled, with 0x451, or 0x46 when AVR is on as
+ * well, and sets CONFIG2 BIT(23) in the same block (sde_hw_intf.c:660-676,
+ * fed from `info->esync_enabled, avr_enabled` at sde_encoder_phys_vid.c:695).
+ * An earlier reading of the disassembly ("0x46 with compression, 0x451 without")
+ * confused the AVR flag with compression.
+ *
+ * This board runs esync off, so neither register has to be programmed.  That is
+ * now a property of the reset state rather than of whatever the bootloader left:
+ * MDSS performs a CORE reset on every resume (mdssresetresume), and after it
+ * ALIGN_CTRL reads 0x1 -- the hardware's own reset value, since nothing in this
+ * driver writes it -- while CONFIG2 reads 0x110, which IS written here by
+ * dpu_hw_intf_setup_intf_cfg().  Measured 2026-11-12 on build 1112-2345 after
+ * several suspend/resume rounds.  Earlier notes calling 0x1 "the bootloader's
+ * value" predate the reset-on-resume fix and should not be relied on.
  */
 #define INTF_TIMING_ENGINE_ALIGN_CTRL   0x06C
 #define INTF_CFG2_ALIGN_CTRL_EN         BIT(23)
@@ -211,8 +221,7 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 	 * difference is real.  m2582.features=nopfdyn clears them; programmed at
 	 * enable time, so a runtime switch needs a real mode switch.
 	 */
-	if (!dp_intf && intf->mdss_ver->core_major_ver >= 7 &&
-	    !m2582_feature_opt_in("nopfdyn"))
+	if (!dp_intf && intf->mdss_ver->core_major_ver >= 7)
 		intf_cfg2 |= INTF_CFG2_PERIPHERAL_FLUSH | INTF_CFG2_PROG_DYNREF;
 
 	data_width = p->width;
@@ -300,6 +309,41 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 	DPU_REG_WRITE(c, INTF_HSYNC_SKEW, p->hsync_skew);
 	DPU_REG_WRITE(c, INTF_POLARITY_CTL, polarity_ctl);
 	DPU_REG_WRITE(c, INTF_FRAME_LINE_COUNT_EN, 0x3);
+	/*
+	 * m2582.features=intfsnap: reproduce the factory's *live* INTF1 state for
+	 * this panel.  The vendor block bases are mainline + 0x1000
+	 * (qcom,sde-intf-off = <0x35000 0x36000 ...> in the factory DT), so the
+	 * panel's interface is mainline INTF_1 = factory 0x36000, and the
+	 * recovery dump of that window reads
+	 *   INTF_CONFIG  = 0x00800000  bit 23 -- set on Android, never by us
+	 *   INTF_CONFIG2 = 0x00001111  bits 0/4/8/12 -- we have 0/4/12 plus the
+	 *                              24/28 pair Android does not set, and we
+	 *                              never set bit 8
+	 *   ALIGN_CTRL   = 0x00000001  (0x3606c) -- we leave it at 0
+	 * Bits 0 (widebus), 4 (data hctl) and 12 (DCE compress) already match.
+	 * "intfalign"/"nopfdyn"/"nowidebus" each cover one of the others; this is
+	 * the whole factory combination behind a single switch, including
+	 * CONFIG2[8], which nothing in mainline or in the factory source names.
+	 */
+
+
+	/*
+	 * m2582.features=intfrmw: program INTF_CONFIG the way the factory driver
+	 * does, i.e. read-modify-write instead of writing a value built from zero.
+	 *
+	 * sde_hw_intf_setup_timing_engine() opens with
+	 *     intf_cfg = SDE_REG_READ(c, INTF_CONFIG);
+	 * in both vendor drops we have (sm8735 techpack and the current
+	 * qualcomm-linux/display-driver), so every bit the vendor does not model
+	 * survives: the recovery dump of this panel's interface reads
+	 * INTF_CONFIG = 0x00800000, i.e. bit 23, for which there is no writer
+	 * anywhere in the vendor source.  Mainline builds the register from zero
+	 * and therefore clears it.
+	 *
+	 * Bits 29/30 (active H/V) and 31 (programmable fetch) are ours, so they
+	 * are masked out of the preserved value rather than carried over.
+	 */
+
 	DPU_REG_WRITE(c, INTF_CONFIG, intf_cfg);
 	DPU_REG_WRITE(c, INTF_PANEL_FORMAT, panel_format);
 	if (intf->mdss_ver->core_major_ver >= 5) {
@@ -312,18 +356,19 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 			intf_cfg2 |= INTF_CFG2_DATA_HCTL_EN;
 
 		/*
-		 * m2582.features=intfalign: reproduce the factory's alignment
-		 * programming for a compressed wide-bus output.  Off by default so
-		 * that the two writes stay a single variable against the baseline.
+		 * m2582.features=intfalign: drive the esync/AVR alignment pair
+		 * (0x06C + CONFIG2 BIT(23)) with the values the factory uses when
+		 * esync is enabled.  Kept as an experiment only: the factory does
+		 * not program this pair for a command-mode panel (their live
+		 * ALIGN_CTRL is the bootloader's 1 and their CONFIG2 has BIT(23)
+		 * clear), so writing 0x46/0x451 is not "the factory state".
 		 */
-		if (p->wide_bus_en && m2582_feature_opt_in("intfalign"))
-			intf_cfg2 |= INTF_CFG2_ALIGN_CTRL_EN;
+
 
 		DPU_REG_WRITE(c, INTF_CONFIG2, intf_cfg2);
 
-		if (p->wide_bus_en && m2582_feature_opt_in("intfalign"))
-			DPU_REG_WRITE(c, INTF_TIMING_ENGINE_ALIGN_CTRL,
-				      p->compression_en ? 0x46 : 0x451);
+
+
 		DPU_REG_WRITE(c, INTF_DISPLAY_DATA_HCTL, display_data_hctl);
 		DPU_REG_WRITE(c, INTF_ACTIVE_DATA_HCTL, active_data_hctl);
 	}
@@ -524,15 +569,7 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 	 * established offline, and writing zero where the factory enables would
 	 * mis-route the two halves, so it stays opt-in.
 	 */
-	if (m2582_feature_opt_in("ppbsplit")) {
-		void __iomem *mdp = c->blk_addr - intf->cap->base;
 
-		writel_relaxed(0, mdp + 0x334);	/* MDP_PPB0_CONFIG */
-		writel_relaxed(0, mdp + 0x330);	/* MDP_PPB0_CNTL   */
-		writel_relaxed(0, mdp + 0x33c);	/* MDP_PPB1_CONFIG */
-		writel_relaxed(0, mdp + 0x338);	/* MDP_PPB1_CNTL   */
-		wmb();
-	}
 
 	/*
 	 * The factory also sets the timestamp source from inside its tear-check
@@ -542,18 +579,16 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 	 * bootloader's 0x30 on this board -- BIT(4) set, BIT(0) clear.
 	 * "novendorts" reverts to that for A/B.
 	 */
-	if (!m2582_feature_opt_in("novendorts"))
-		DPU_REG_WRITE(c, INTF_VSYNC_TIMESTAMP_CTRL,
-			      BIT(0) | INTF_VSYNC_TS_SRC_EN);
+	DPU_REG_WRITE(c, INTF_VSYNC_TIMESTAMP_CTRL,
+		      BIT(0) | INTF_VSYNC_TS_SRC_EN);
 
 	/*
-	 * m2582.features=dsppzero: this driver never reserves a DSPP, so the
-	 * whole block keeps whatever the bootloader left in it.  Clear the
-	 * enable words of the colour stages that reshape pixels (IGC, PCC, GC,
-	 * MEMCOLOR, SIXZONE, 3D GAMUT) on both DSPPs; none is a register this
-	 * driver writes.
+	 * This driver never reserves a DSPP, so the whole block keeps whatever
+	 * the bootloader left in it.  Clear the enable words of the colour
+	 * stages that reshape pixels (IGC, PCC, GC, MEMCOLOR, SIXZONE, 3D GAMUT)
+	 * on both DSPPs; none is a register this driver writes.
 	 */
-	if (!m2582_feature_opt_in("nodsppzero")) {
+	{
 		void __iomem *mdp = c->blk_addr - intf->cap->base;
 		/*
 		 * Every colour block the factory DT declares inside the DSPP, at
@@ -597,24 +632,7 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 	 * the enable/swap attempt; every address stays inside the gap between
 	 * DSPP0 (0x54000) and DSPP1 (0x56000).
 	 */
-	if (m2582_feature_opt_in("gcinv2")) {
-		void __iomem *mdp = c->blk_addr - intf->cap->base;
-		static const u32 dspp[2] = { 0x54000, 0x56000 };
-		static const u32 chan[3] = { 0x1808, 0x1a08, 0x1c08 };
-		unsigned int d, c, i;
 
-		for (d = 0; d < ARRAY_SIZE(dspp); d++) {
-			void __iomem *base = mdp + dspp[d];
-
-			for (c = 0; c < 3; c++)
-				for (i = 0; i < 512; i++)
-					writel_relaxed(1023 - i * 2, base + chan[c] + i * 4);
-			writel_relaxed(1, base + 0x1804);
-			writel_relaxed(1, base + 0x1800);
-		}
-		/* LUT and enable must be visible before the next frame */
-		wmb();
-	}
 
 
 	return 0;
@@ -861,12 +879,10 @@ static void dpu_hw_intf_program_intf_cmd_cfg(struct dpu_hw_intf *intf,
 	 * never written.  m2582.features=vendorintf suppresses only this
 	 * addition; it cannot restore the pre-reset bootloader contents.
 	 */
-	if (!m2582_feature_opt_in("vendorintf"))
-		intf_cfg2 |= INTF_CFG2_DATA_HCTL_EN;
+	intf_cfg2 |= INTF_CFG2_DATA_HCTL_EN;
 
 	/* Isolate DATA_HCTL_EN without changing wide bus or compression. */
-	if (m2582_feature_opt_in("nohctl4"))
-		intf_cfg2 &= ~INTF_CFG2_DATA_HCTL_EN;
+
 
 	/*
 	 * m2582.features=intf110 is a diagnostic full-register value, not a
@@ -875,8 +891,7 @@ static void dpu_hw_intf_program_intf_cmd_cfg(struct dpu_hw_intf *intf,
 	 * DSI0 is at vendor offset 0x36000.  This arm also clears BIT(0) and
 	 * BIT(12), so its worse picture cannot isolate DATA_HCTL_EN.
 	 */
-	if (m2582_feature_opt_in("intf110"))
-		intf_cfg2 = 0x110;
+
 
 	DPU_REG_WRITE(&intf->hw, INTF_CONFIG2, intf_cfg2);
 }

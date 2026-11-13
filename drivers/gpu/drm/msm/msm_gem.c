@@ -5,10 +5,12 @@
  */
 
 #include <linux/dma-map-ops.h>
+#include <linux/dma-mapping.h>
 #include <linux/vmalloc.h>
 #include <linux/spinlock.h>
 #include <linux/shmem_fs.h>
 #include <linux/dma-buf.h>
+#include <linux/meizu-m2582.h>
 
 #include <drm/drm_dumb_buffers.h>
 #include <drm/drm_prime.h>
@@ -21,6 +23,14 @@
 #include "msm_gem.h"
 #include "msm_gpu.h"
 #include "msm_kms.h"
+
+static unsigned int m2582_scanout_syncs;
+module_param_named(m2582_scanout_syncs, m2582_scanout_syncs, uint, 0400);
+static unsigned int m2582_scanout_dma_syncs;
+module_param_named(m2582_scanout_dma_syncs, m2582_scanout_dma_syncs, uint, 0400);
+static unsigned int m2582_scanout_dma_fallbacks;
+module_param_named(m2582_scanout_dma_fallbacks, m2582_scanout_dma_fallbacks,
+			   uint, 0400);
 
 static void update_device_mem(struct msm_drm_private *priv, ssize_t size)
 {
@@ -127,18 +137,83 @@ void msm_gem_vma_put(struct drm_gem_object *obj)
  * Let this be a cautionary tail of abstraction gone wrong.
  */
 
+static struct device *msm_gem_display_dma_device(struct msm_gem_object *msm_obj)
+{
+	struct drm_device *drm = msm_obj->base.dev;
+	struct msm_drm_private *priv = drm->dev_private;
+
+	/* The display VM can use a different device from GEM's DRM device. */
+	if ((msm_obj->flags & MSM_BO_SCANOUT) && priv && priv->kms &&
+	    priv->kms->vm) {
+		struct msm_gem_vm *vm = to_msm_vm(priv->kms->vm);
+
+		if (vm->mmu && vm->mmu->dev)
+			return vm->mmu->dev;
+	}
+
+	return NULL;
+}
+
+static struct device *msm_gem_dma_device(struct msm_gem_object *msm_obj)
+{
+	struct device *display_dev = NULL;
+
+
+
+	return display_dev ? display_dev : msm_obj->base.dev->dev;
+}
+
 static void sync_for_device(struct msm_gem_object *msm_obj)
 {
-	struct device *dev = msm_obj->base.dev->dev;
+	struct device *dev = msm_gem_dma_device(msm_obj);
 
+	msm_obj->dma_dev = dev;
 	dma_map_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL, 0);
 }
 
 static void sync_for_cpu(struct msm_gem_object *msm_obj)
 {
-	struct device *dev = msm_obj->base.dev->dev;
+	struct device *dev = msm_obj->dma_dev;
+
+	if (!dev)
+		dev = msm_gem_dma_device(msm_obj);
 
 	dma_unmap_sgtable(dev, msm_obj->sgt, DMA_BIDIRECTIONAL, 0);
+	msm_obj->dma_dev = NULL;
+}
+
+void msm_gem_sync_for_device(struct drm_gem_object *obj,
+				     struct device *dma_dev)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+
+	/*
+	 * Local WC GEM objects are dma-mapped when their pages are created.
+	 * Re-sync that existing mapping after the CPU producer has updated it;
+	 * imported dma-bufs own their attachment mapping and synchronization.
+	 */
+	if ((msm_obj->flags & MSM_BO_WC) && msm_obj->sgt && !obj->import_attach) {
+		/* Map, sync and unmap must use the same device and original SG count. */
+		if (!dma_dev)
+			dma_dev = msm_obj->dma_dev ?: obj->dev->dev;
+		else if (msm_obj->dma_dev)
+			dma_dev = msm_obj->dma_dev;
+		if (msm_obj->flags & MSM_BO_SCANOUT) {
+			struct device *display_dev =
+				msm_gem_display_dma_device(msm_obj);
+
+			if (display_dev && dma_dev == display_dev)
+				WRITE_ONCE(m2582_scanout_dma_syncs,
+					   READ_ONCE(m2582_scanout_dma_syncs) + 1);
+			else
+				WRITE_ONCE(m2582_scanout_dma_fallbacks,
+					   READ_ONCE(m2582_scanout_dma_fallbacks) + 1);
+		}
+		dma_sync_sgtable_for_device(dma_dev, msm_obj->sgt,
+					    DMA_BIDIRECTIONAL);
+		WRITE_ONCE(m2582_scanout_syncs,
+			   READ_ONCE(m2582_scanout_syncs) + 1);
+	}
 }
 
 static void update_lru_active(struct drm_gem_object *obj)
@@ -467,6 +542,10 @@ int msm_gem_prot(struct drm_gem_object *obj)
 	if (msm_obj->flags & MSM_BO_CACHED_COHERENT)
 		prot |= IOMMU_CACHE;
 
+	/* Diagnostic: force the scanout mapping cacheable to match the vendor's
+	 * dma-coherent display CB. Default off. */
+
+
 	return prot;
 }
 
@@ -697,6 +776,15 @@ int msm_gem_dumb_create(struct drm_file *file, struct drm_device *dev,
 	}
 	if (!pitch_align || pitch_align > U32_MAX)
 		return -EINVAL;
+	/*
+	 * M2582: the bootloader scans out its splash with YSTRIDE0 = 4800, i.e.
+	 * exactly width * 4 with no padding, and that picture is correct on this
+	 * panel.  The 32-pixel (128 B) alignment below turns 4800 into 4864 for
+	 * this mode, which makes the pitch a multiple of 256 B.  Keep the small
+	 * alignment under a feature flag so the two can be compared with nothing
+	 * else changed.
+	 */
+
 	ret = drm_mode_size_dumb(dev, args, pitch_align, 0);
 	if (ret)
 		return ret;

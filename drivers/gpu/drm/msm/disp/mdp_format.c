@@ -7,6 +7,7 @@
 
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <linux/meizu-m2582.h>
 
 #include "msm_drv.h"
 #include "mdp_kms.h"
@@ -616,6 +617,25 @@ static const struct msm_format mdp_formats_ubwc[] = {
 		MDP_TILE_HEIGHT_UBWC),
 };
 
+/* Meizu msm_drm.ko sde_format_map_tile: RGB tile input has no metadata. */
+#define M2582_RGB_TILE(fmt, alpha, e0, e1, e2, e3) { \
+	.pixel_format = DRM_FORMAT_ ## fmt, \
+	.fetch_type = MDP_PLANE_INTERLEAVED, \
+	.alpha_enable = alpha, \
+	.element = { e0, e1, e2, e3 }, \
+	.bpc_g_y = BPC8, .bpc_b_cb = BPC8, .bpc_r_cr = BPC8, .bpc_a = BPC8A, \
+	.chroma_sample = CHROMA_FULL, .unpack_count = 4, .bpp = 4, \
+	.fetch_mode = MDP_FETCH_UBWC, .flags = MSM_FORMAT_FLAG_UNPACK_TIGHT, \
+	.num_planes = 1, .tile_height = MDP_TILE_HEIGHT_UBWC, \
+}
+
+static const struct msm_format m2582_formats_tile[] = {
+	M2582_RGB_TILE(ARGB8888, true, C3_ALPHA, C2_R_Cr, C0_G_Y, C1_B_Cb),
+	M2582_RGB_TILE(ABGR8888, true, C3_ALPHA, C1_B_Cb, C0_G_Y, C2_R_Cr),
+	M2582_RGB_TILE(XRGB8888, false, C3_ALPHA, C2_R_Cr, C0_G_Y, C1_B_Cb),
+	M2582_RGB_TILE(XBGR8888, false, C2_R_Cr, C0_G_Y, C1_B_Cb, C3_ALPHA),
+};
+
 const struct msm_format *mdp_get_format(struct msm_kms *kms, uint32_t format,
 		uint64_t modifier)
 {
@@ -632,6 +652,8 @@ const struct msm_format *mdp_get_format(struct msm_kms *kms, uint32_t format,
 		map = mdp_formats_ubwc;
 		map_size = ARRAY_SIZE(mdp_formats_ubwc);
 		break;
+	case DRM_FORMAT_MOD_QCOM_TILED3:
+		return NULL;
 	default:
 		drm_err(kms->dev, "unsupported format modifier %llX\n", modifier);
 		return NULL;

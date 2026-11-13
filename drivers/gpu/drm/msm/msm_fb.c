@@ -12,6 +12,9 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_probe_helper.h>
 
+#include <linux/meizu-m2582.h>
+#include <linux/scatterlist.h>
+
 #include "msm_drv.h"
 #include "msm_kms.h"
 #include "msm_gem.h"
@@ -80,14 +83,20 @@ int msm_framebuffer_prepare(struct drm_framebuffer *fb, bool needs_dirtyfb)
 {
 	struct msm_drm_private *priv = fb->dev->dev_private;
 	struct drm_gpuvm *vm = priv->kms->vm;
+	struct device *dma_dev = NULL;
 	struct msm_framebuffer *msm_fb = to_msm_framebuffer(fb);
 	int ret, i, n = fb->format->num_planes;
+
+	if (vm && to_msm_vm(vm)->mmu)
+		dma_dev = to_msm_vm(vm)->mmu->dev;
 
 	if (needs_dirtyfb)
 		refcount_inc(&msm_fb->dirtyfb);
 
-	if (atomic_inc_return(&msm_fb->prepare_count) > 1)
+	if (atomic_inc_return(&msm_fb->prepare_count) > 1) {
+
 		return 0;
+	}
 
 	for (i = 0; i < n; i++) {
 		msm_gem_vma_get(fb->obj[i]);
@@ -96,6 +105,7 @@ int msm_framebuffer_prepare(struct drm_framebuffer *fb, bool needs_dirtyfb)
 			      fb->base.id, i, msm_fb->iova[i], ret);
 		if (ret)
 			return ret;
+
 	}
 
 	return 0;
@@ -125,7 +135,17 @@ void msm_framebuffer_cleanup(struct drm_framebuffer *fb, bool needed_dirtyfb)
 uint32_t msm_framebuffer_iova(struct drm_framebuffer *fb, int plane)
 {
 	struct msm_framebuffer *msm_fb = to_msm_framebuffer(fb);
-	return msm_fb->iova[plane] + fb->offsets[plane];
+	uint64_t iova = msm_fb->iova[plane];
+
+	/*
+	 * Diagnostic only: with displaybypass the SMMU passes the address the
+	 * DPU programs straight through, so the DPU must be given the physical
+	 * address.  This is only correct for a physically-contiguous buffer
+	 * (CMA); scattered dumb buffers have no single physical base.
+	 */
+
+
+	return iova + fb->offsets[plane];
 }
 
 struct drm_gem_object *msm_framebuffer_bo(struct drm_framebuffer *fb, int plane)

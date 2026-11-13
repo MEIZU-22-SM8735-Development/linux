@@ -72,6 +72,11 @@ struct dpu_hw_dspp_ops {
 	 */
 	void (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut);
 
+	/**
+	 * setup_spr - program the sub-pixel rendering block
+	 * @ctx: Pointer to dspp context
+	 */
+	void (*setup_spr)(struct dpu_hw_dspp *ctx);
 };
 
 /**
@@ -107,6 +112,9 @@ static inline struct dpu_hw_dspp *to_dpu_hw_dspp(struct dpu_hw_blk *hw)
 struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 				     const struct dpu_dspp_cfg *cfg,
 				     void __iomem *addr);
+
+/* M2582 bring-up: override the SPR control word at runtime */
+void m2582_spr_override_cfg(u32 cfg);
 
 #endif /*_DPU_HW_DSPP_H */
 

@@ -217,6 +217,8 @@ struct msm_gem_object {
 
 	struct page **pages;
 	struct sg_table *sgt;
+	/* DMA device used for the persistent WC mapping, if any. */
+	struct device *dma_dev;
 	void *vaddr;
 
 	char name[32]; /* Identifier to print for the debugfs files */
@@ -261,6 +263,8 @@ struct msm_gem_object {
 
 void msm_gem_vma_get(struct drm_gem_object *obj);
 void msm_gem_vma_put(struct drm_gem_object *obj);
+void msm_gem_sync_for_device(struct drm_gem_object *obj,
+				     struct device *dma_dev);
 
 int msm_gem_prot(struct drm_gem_object *obj);
 int msm_gem_pin_vma_locked(struct drm_gem_object *obj, struct drm_gpuva *vma);

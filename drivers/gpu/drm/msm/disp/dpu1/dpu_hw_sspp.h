@@ -151,6 +151,7 @@ struct dpu_sw_pipe_cfg {
 	struct drm_rect src_rect;
 	struct drm_rect dst_rect;
 	unsigned int rotation;
+	u32 plane_pitch[DPU_MAX_PLANES];
 };
 
 /**
@@ -189,6 +190,9 @@ struct dpu_hw_sspp_ops {
 	 */
 	void (*setup_format)(struct dpu_sw_pipe *pipe,
 			     const struct msm_format *fmt, u32 flags);
+
+	/** @set_src_split_order: mark the pipe as the right half of a split */
+	void (*set_src_split_order)(struct dpu_sw_pipe *pipe, bool enable);
 
 	/**
 	 * @setup_rects: setup pipe ROI rectangles
@@ -389,4 +393,3 @@ void dpu_hw_sspp_init_v13(struct dpu_hw_sspp *c,
 			  const struct dpu_mdss_version *mdss_rev);
 
 #endif /*_DPU_HW_SSPP_H */
-

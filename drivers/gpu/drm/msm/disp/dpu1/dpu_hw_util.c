@@ -480,10 +480,7 @@ void _dpu_hw_setup_qos_lut(struct dpu_hw_blk_reg_map *c, u32 offset,
 	 * decides how many 256 B chunk requests a fetch of a given length
 	 * issues -- the one difference against a picture that is known correct.
 	 */
-	if (m2582_feature_opt_in("creqbl")) {
-		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_0, 0x44556666);
-		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_1, 0x00112233);
-	} else if (qos_8lvl) {
+	if (qos_8lvl) {
 		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_0, cfg->creq_lut);
 		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_1, cfg->creq_lut >> 32);
 	} else {

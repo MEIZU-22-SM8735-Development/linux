@@ -5,6 +5,7 @@
  */
 
 #define pr_fmt(fmt)	"[drm:%s] " fmt, __func__
+#include <linux/meizu-m2582.h>
 #include "dpu_kms.h"
 #include "dpu_hw_lm.h"
 #include "dpu_hw_ctl.h"
@@ -793,9 +794,11 @@ static struct dpu_hw_sspp *dpu_rm_try_sspp(struct dpu_rm *rm,
 {
 	uint32_t crtc_id = crtc->base.id;
 	struct dpu_hw_sspp *hw_sspp;
-	int i;
+	int i, slot;
 
-	for (i = 0; i < ARRAY_SIZE(rm->hw_sspp); i++) {
+	/* Meizu's captured full-screen UBWC frame uses DMA4 left, DMA3 right. */
+	for (slot = 0; slot < ARRAY_SIZE(rm->hw_sspp); slot++) {
+		i = slot;
 		if (!rm->hw_sspp[i])
 			continue;
 
@@ -841,6 +844,11 @@ struct dpu_hw_sspp *dpu_rm_reserve_sspp(struct dpu_rm *rm,
 					struct dpu_rm_sspp_requirements *reqs)
 {
 	struct dpu_hw_sspp *hw_sspp = NULL;
+
+	/* Diagnostic source selection; preserve actual geometry and scale needs. */
+
+
+
 
 	if (!reqs->scale && !reqs->yuv)
 		hw_sspp = dpu_rm_try_sspp(rm, global_state, crtc, reqs, SSPP_TYPE_DMA);

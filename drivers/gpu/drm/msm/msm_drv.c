@@ -1037,60 +1037,11 @@ static int add_gpu_components(struct device *dev,
 
 static int msm_drm_bind(struct device *dev)
 {
-	struct device *parent;
-	int ret;
-
-	ret = msm_drm_init(dev,
+	return msm_drm_init(dev,
 			    msm_gpu_no_components() ?
 				    &msm_kms_driver :
 				    &msm_driver,
 			    NULL);
-	if (ret || !m2582_feature_opt_in("mdsscyclebind"))
-		return ret;
-
-	/* Complete one CORE off/on after every display component has bound. */
-	for (parent = dev->parent; parent; parent = parent->parent) {
-		unsigned int waited;
-
-		if (!of_device_is_compatible(parent->of_node, "qcom,tuna-mdss"))
-			continue;
-		for (waited = 0; waited < 5000; waited += 20) {
-			if (pm_runtime_active(parent) &&
-			    atomic_read(&parent->power.usage_count) == 1 &&
-			    !atomic_read(&parent->power.child_count))
-				break;
-			msleep(20);
-		}
-		if (!pm_runtime_active(parent) ||
-		    atomic_read(&parent->power.usage_count) != 1) {
-			dev_err(parent, "m2582-mdss-pm: unexpected bind power refs usage=%d kids=%d\n",
-				atomic_read(&parent->power.usage_count),
-				atomic_read(&parent->power.child_count));
-			break;
-		}
-		if (atomic_read(&parent->power.child_count)) {
-			dev_err(parent, "m2582-mdss-pm: display children stayed active after %u ms\n",
-				waited);
-			break;
-		}
-		ret = pm_runtime_put_sync_suspend(parent);
-		if (ret < 0) {
-			pm_runtime_get_noresume(parent);
-			dev_err(parent, "m2582-mdss-pm: post-bind suspend failed: %d\n", ret);
-			break;
-		}
-		ret = pm_runtime_resume_and_get(parent);
-		if (ret < 0) {
-			pm_runtime_get_noresume(parent);
-			dev_err(parent, "m2582-mdss-pm: post-bind resume failed: %d\n", ret);
-			break;
-		}
-		dev_info(parent, "m2582-mdss-pm: completed post-bind CORE cycle; usage=%d kids=%d\n",
-			 atomic_read(&parent->power.usage_count),
-			 atomic_read(&parent->power.child_count));
-		break;
-	}
-	return 0;
 }
 
 static void msm_drm_unbind(struct device *dev)

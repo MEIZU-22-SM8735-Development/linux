@@ -65,12 +65,22 @@ static int _dsc_calc_output_buf_max_addr(struct dpu_hw_dsc *hw_dsc, int num_soft
 {
 	int max_addr = 2400 / num_softslice;
 
-	/* m2582.features=ob2399: drop the native-42x halving.  The capability bit
-	 * is a catalog guess for this SoC; if the part does not actually have it
-	 * the encoder's output buffer is twice as large as we think, and lines
-	 * that need more data are the ones that suffer when it is not. */
-	if ((hw_dsc->caps->features & BIT(DPU_DSC_NATIVE_42x_EN)) &&
-	    !m2582_feature_opt_in("ob2399"))
+	/*
+	 * The vendor halves this for SDE_DSC_REDUCED_OB_MAX only, never for
+	 * native-42x support (msm_drm.ko, sde_hw_dsc_config: it tests feature bit
+	 * 4 for native 42x and bit 5 for reduced-OB and then selects 0x257c0000 /
+	 * 0x12bc0000, i.e. 2399 / 1199).  Upstream mainline instead hangs the
+	 * halving on DPU_DSC_NATIVE_42x_EN.
+	 *
+	 * For this board the two routes give the *same* number, which is why this
+	 * has to stay 1199: one soft slice per encoder (DSC_CMN_MAIN_CNF 0x83,
+	 * slice_per_enc 1) with the halving applied is 2400/1/2 - 1 = 1199, and
+	 * the factory's 2400/1 - 1 with its reduced-OB cap is 1199 as well.  Do
+	 * not "fix" the condition without also changing the slice count: that
+	 * moves the value to 2399 and the encoder then thinks its output buffer
+	 * is twice the size the decoder models.
+	 */
+	if (hw_dsc->caps->features & BIT(DPU_DSC_NATIVE_42x_EN))
 		max_addr /= 2;
 
 	return max_addr - 1;
@@ -143,26 +153,15 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	 * corrupted output.
 	 */
 	if ((hw_dsc->caps->features & BIT(DPU_DSC_FULL_ICH_PREC)) &&
-	    dsc->bits_per_component > 8 &&
-	    !m2582_feature_opt_in("noich"))
+	    dsc->bits_per_component > 8)
 		data |= BIT(12);
 
 	/*
 	 * ENC_DF_CTRL[11:10] are the ICH reset override.  The factory ORs in
-	 * 0xC00 only when _dce_dsc_ich_reset_override_needed() holds
-	 * (half_panel_pu && slice_count > 1 && slice_width == pic_width), i.e.
-	 * a half-panel partial update; its live full-frame value for this
-	 * 1200x2670 panel is 0x12bc1003, bits[11:10] clear.  The bits move where
-	 * the hardware resets ICH: end of slice line with merge or two soft
-	 * slices, end of slice with one soft slice and no merge -- this panel is
-	 * the latter.  Default is the factory's; ich1/ich2/ich3 walk the field.
+	 * 0xC00 only for a half-panel partial update; its live full-frame value
+	 * for this 1200x2670 panel is 0x12bc1003, bits[11:10] clear, and this
+	 * panel is the one-soft-slice, no-merge case, so clear is correct.
 	 */
-	if (m2582_feature_opt_in("ich1"))
-		data |= 0x1 << 10;
-	else if (m2582_feature_opt_in("ich2"))
-		data |= 0x2 << 10;
-	else if (m2582_feature_opt_in("ich3"))
-		data |= 0x3 << 10;
 
 	data |= (_dsc_calc_output_buf_max_addr(hw_dsc, num_active_slice_per_enc) << 18);
 
@@ -243,31 +242,9 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	DPU_REG_WRITE(hw, sblk->enc.base + DSC_RC_OFFSETS_4, data);
 
 	det_thresh_flatness = drm_dsc_flatness_det_thresh(dsc);
-	/*
-	 * m2582.features=flatswap: diagnostic.  The PPS carries flatness_min_qp
-	 * and flatness_max_qp in that order, but the two five-bit fields cannot
-	 * be told apart from the factory disassembly.  Flatness is only consulted
-	 * while the encoder quantises, so an inverted pair is invisible at 10 bpp
-	 * and fatal at 8 bpp.
-	 */
-	if (m2582_feature_opt_in("flatswap"))
-		data = (dsc->flatness_max_qp & 0x1f) |
-		       ((dsc->flatness_min_qp & 0x1f) << 5);
-	else if (m2582_feature_opt_in("flatreg7"))
-		/*
-		 * m2582.features=flatreg7: diagnostic.  Write the encoder's
-		 * window as the pair it had before flat16 (7) while the PPS
-		 * keeps carrying 16/16, to see which copy this DDIC actually
-		 * runs on -- the PPS bytes it is sent, or the encoder's
-		 * shadow registers it can read back.  Clean output here means
-		 * the panel follows the registers; garble means the bits it
-		 * decodes come from the PPS and the fault is in what the
-		 * encoder emits.
-		 */
-		data = (7 & 0x1f) | ((7 & 0x1f) << 5);
-	else
-		data = (dsc->flatness_min_qp & 0x1f) |
-		       ((dsc->flatness_max_qp & 0x1f) << 5);
+	/* PPS byte 36/37 order: flatness_min_qp in [4:0], max in [9:5]. */
+	data = (dsc->flatness_min_qp & 0x1f) |
+	       ((dsc->flatness_max_qp & 0x1f) << 5);
 	data |= (det_thresh_flatness & 0xff) << 10;
 
 	DPU_REG_WRITE(hw, sblk->enc.base + DSC_FLATNESS_QP, data);
@@ -319,10 +296,8 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 	 * programmed for the splash -- they decide how the two encoders' output
 	 * is merged for the interface, so a stale value is not harmless.
 	 */
-	if (!m2582_feature_opt_in("no4hs")) {
-		DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_CFG, 0);
-		DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_EN, 0);
-	}
+	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_CFG, 0);
+	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_EN, 0);
 }
 
 static void dpu_hw_dsc_config_thresh_1_2(struct dpu_hw_dsc *hw_dsc,

@@ -7,6 +7,7 @@
 #include <linux/adreno-smmu-priv.h>
 #include <linux/io-pgtable.h>
 #include <linux/kmemleak.h>
+#include <linux/meizu-m2582.h>
 #include "msm_drv.h"
 #include "msm_gpu_trace.h"
 #include "msm_mmu.h"
@@ -675,6 +676,41 @@ static void msm_iommu_detach(struct msm_mmu *mmu)
 	iommu_detach_device(iommu->domain, mmu->dev);
 }
 
+/* Diagnostic only: compare the display domain's translation with its SG list. */
+static void m2582_verify_display_map(struct msm_iommu *iommu, u64 iova,
+				      struct sg_table *sgt, size_t len, int prot)
+{
+	const size_t offsets[] = { 0, 256, PAGE_SIZE,
+				  len >= PAGE_SIZE ? len - PAGE_SIZE : 0 };
+	int sample;
+
+	dev_info(iommu->base.dev,
+		 "m2582-mapverify: iova=%llx len=%zx orig_nents=%u prot=%x pgsizes=%lx\n",
+		 iova, len, sgt->orig_nents, prot, iommu->domain->pgsize_bitmap);
+	for (sample = 0; sample < ARRAY_SIZE(offsets); sample++) {
+		struct scatterlist *sg;
+		phys_addr_t expected = 0, translated;
+		size_t offset = offsets[sample];
+		unsigned int j;
+
+		if (offset >= len)
+			continue;
+		for_each_sgtable_sg(sgt, sg, j) {
+			if (offset < sg->length) {
+				expected = sg_phys(sg) + offset;
+				break;
+			}
+			offset -= sg->length;
+		}
+		translated = iommu_iova_to_phys(iommu->domain,
+					      iova + offsets[sample]);
+		dev_info(iommu->base.dev,
+			 "m2582-mapverify: offset=%zx expected=%pa translated=%pa match=%u\n",
+			 offsets[sample], &expected, &translated,
+			 expected && expected == translated);
+	}
+}
+
 static int msm_iommu_map(struct msm_mmu *mmu, uint64_t iova,
 			 struct sg_table *sgt, size_t off, size_t len,
 			 int prot)
@@ -691,6 +727,8 @@ static int msm_iommu_map(struct msm_mmu *mmu, uint64_t iova,
 	ret = iommu_map_sgtable(iommu->domain, iova, sgt, prot);
 	if (ret < 0)
 		return ret;
+
+
 
 	return (ret == len) ? 0 : -EINVAL;
 }

@@ -363,7 +363,7 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
 	 * writes PP_RD_PTR_IRQ: group 0 then never sees its pingpong-0 done bit
 	 * and the kickoff wait times out on every frame after the first.
 	 */
-	if (mdss_rev->core_major_ver < 5 || m2582_feature_opt_in("ppte")) {
+	if (mdss_rev->core_major_ver < 5) {
 		WARN_ON(!cfg->intr_rdptr);
 
 		c->ops.enable_tearcheck = dpu_hw_pp_enable_te;
@@ -372,7 +372,6 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
 		c->ops.get_line_count = dpu_hw_pp_get_line_count;
 		c->ops.disable_autorefresh = dpu_hw_pp_disable_autorefresh;
 	}
-
 	/*
 	 * The FIFO-depth register lives where DPU < 5.0 kept the tear-check one.
 	 * Upstream gates the DSC hooks on DPU < 7 because from 7.x on the block
@@ -387,9 +386,9 @@ struct dpu_hw_pingpong *dpu_hw_pingpong_init(struct drm_device *dev,
 	 * sde_pp_parse_dt sets SDE_PINGPONG_DSC (bit 5) under `cmp w26,#6 /
 	 * b.hi` (msm_drm.ko 0xfa734) and sde_hw_pingpong_init gates on that bit
 	 * (0x10fd8c `tbz w8,#5`), so on DPU 12 the factory runs with PP_DSC_MODE
-	 * = 0.  "ppdsc" keeps the experiment available but must not be default.
+	 * = 0.
 	 */
-	if (mdss_rev->core_major_ver < 7 || m2582_feature_opt_in("ppdsc")) {
+	if (mdss_rev->core_major_ver < 7) {
 		c->ops.setup_dsc = dpu_hw_pp_setup_dsc;
 		c->ops.enable_dsc = dpu_hw_pp_dsc_enable;
 		c->ops.disable_dsc = dpu_hw_pp_dsc_disable;

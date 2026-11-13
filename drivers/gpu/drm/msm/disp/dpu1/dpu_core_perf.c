@@ -99,7 +99,18 @@ static u64 _dpu_core_perf_calc_clk(const struct dpu_perf_cfg *perf_cfg,
 
 	mode = &state->adjusted_mode;
 
-	mode_clk = (u64)mode->vtotal * mode->hdisplay * drm_mode_vrefresh(mode);
+	/*
+	 * m2582: mode->clock is the panel's nominal refresh now, so
+	 * drm_mode_vrefresh() finally reports the truth (120/90 Hz) and this
+	 * product would drop by 1.5354x.  Keep the vote the board was measured
+	 * with: hdisplay * link_pclk / htotal is the same number as before.
+	 */
+	if (dpu_mode_is_m2582(mode))
+		mode_clk = (u64)mode->hdisplay * DPU_M2582_LINK_PCLK_KHZ * 1000 /
+			   mode->htotal;
+	else
+		mode_clk = (u64)mode->vtotal * mode->hdisplay *
+			   drm_mode_vrefresh(mode);
 
 	drm_atomic_crtc_for_each_plane(plane, crtc) {
 		pstate = to_dpu_plane_state(plane->state);

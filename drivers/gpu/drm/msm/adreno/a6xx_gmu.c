@@ -2518,7 +2518,9 @@ int a6xx_gmu_init(struct a6xx_gpu *a6xx_gpu, struct device_node *node)
 	 * touch GX registers once the firmware may have collapsed them.
 	 */
 	if (of_machine_is_compatible("meizu,m2582"))
-		a6xx_gpu->ifpc = m2582_feature_opt_in("gpuifpc");
+		/* Must stay off on this board: with IFPC on, clears still work but
+		 * every shader draw silently does nothing (2026-11-01). */
+		a6xx_gpu->ifpc = false;
 	else
 		a6xx_gpu->ifpc = adreno_gpu->info->quirks & ADRENO_QUIRK_IFPC;
 

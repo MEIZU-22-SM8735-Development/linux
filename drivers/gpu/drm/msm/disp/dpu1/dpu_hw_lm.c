@@ -233,7 +233,7 @@ static int _set_staged_sspp(u32 stage, struct dpu_hw_stage_cfg *stage_cfg,
 {
 	int i;
 	u32 pipe_type = 0, pipe_id = 0, rec_id = 0;
-	u32 src_sel[PIPES_PER_STAGE];
+	u32 src_sel;
 
 	*value = LM_BG_SRC_SEL_V12_RESET_VALUE;
 	if (!stage_cfg || !pipes_per_stage)
@@ -242,8 +242,6 @@ static int _set_staged_sspp(u32 stage, struct dpu_hw_stage_cfg *stage_cfg,
 	for (i = 0; i < pipes_per_stage; i++) {
 		enum dpu_sspp pipe = stage_cfg->stage[stage][i];
 		enum dpu_sspp_multirect_index rect_index = stage_cfg->multirect_index[stage][i];
-
-		src_sel[i] = LM_BG_SRC_SEL_V12_RESET_VALUE;
 
 		if (!pipe)
 			continue;
@@ -270,14 +268,12 @@ static int _set_staged_sspp(u32 stage, struct dpu_hw_stage_cfg *stage_cfg,
 			rec_id = 0;
 		}
 
-		/* calculate SWI value for rec-0 and rec-1 and store it temporary buffer */
-		src_sel[i] = (((pipe_type & 0x3) << 6) | ((rec_id & 0x3) << 4) | (pipe_id & 0xf));
+		/* Each source occupies one byte; keep unused sources disabled. */
+		src_sel = ((pipe_type & 0x3) << 6) |
+			  ((rec_id & 0x3) << 4) | (pipe_id & 0xf);
+		*value &= ~(0xff << (i * 8));
+		*value |= src_sel << (i * 8);
 	}
-
-	/* calculate final SWI register value for rec-0 and rec-1 */
-	*value = 0;
-	for (i = 0; i < pipes_per_stage; i++)
-		*value |= src_sel[i] << (i * 8);
 
 	return 0;
 }

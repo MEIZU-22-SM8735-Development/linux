@@ -498,7 +498,7 @@ static void dpu_hw_sspp_setup_rects(struct dpu_sw_pipe *pipe,
 	dpu_hw_setup_rects_impl(pipe, cfg, ctx, src_size_off,
 				src_xy_off, out_size_off, out_xy_off);
 
-	if (m2582_feature_opt_in("vendororder") && cfg->plane_pitch[0]) {
+	if (false && cfg->plane_pitch[0]) {
 		u32 ystride0, ystride1;
 
 		if (pipe->multirect_index == DPU_SSPP_RECT_SOLO) {
@@ -599,7 +599,7 @@ static void dpu_hw_sspp_setup_sourceaddress(struct dpu_sw_pipe *pipe,
 		ystride0 = lo | (lo << 16);
 	}
 
-	if (!m2582_feature_opt_in("vendororder")) {
+	if (true) {
 		DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE0, ystride0);
 		DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE1, ystride1);
 	}
@@ -712,7 +712,6 @@ static void dpu_hw_sspp_setup_cdp(struct dpu_sw_pipe *pipe,
 {
 	struct dpu_hw_sspp *ctx = pipe->sspp;
 	u32 cdp_cntl_offset = 0;
-	u32 cdp_override = READ_ONCE(m2582_cdp_override);
 
 	if (!ctx)
 		return;
@@ -729,10 +728,7 @@ static void dpu_hw_sspp_setup_cdp(struct dpu_sw_pipe *pipe,
 	 * bits are a legal hardware state and the combinations in between are
 	 * the only CDP states never measured here.
 	 */
-	if (m2582_feature_opt_in("abgrprobe") && cdp_override <= 0xf)
-		DPU_REG_WRITE(&ctx->hw, cdp_cntl_offset, cdp_override);
-	else
-		dpu_setup_cdp(&ctx->hw, cdp_cntl_offset, fmt, enable);
+	dpu_setup_cdp(&ctx->hw, cdp_cntl_offset, fmt, enable);
 }
 
 static bool dpu_hw_sspp_setup_clk_force_ctrl(struct dpu_hw_sspp *ctx, bool enable)

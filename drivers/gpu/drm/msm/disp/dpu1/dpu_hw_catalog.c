@@ -515,6 +515,11 @@ static const u32 msm8998_rt_pri_lvl[] = {1, 2, 2, 2};
 static const u32 msm8998_nrt_pri_lvl[] = {1, 1, 1, 1};
 static const u32 sdm845_rt_pri_lvl[] = {3, 3, 4, 4, 5, 5, 6, 6};
 static const u32 sdm845_nrt_pri_lvl[] = {3, 3, 3, 3, 3, 3, 3, 3};
+/* the factory table is the same level repeated over all sixteen xins */
+static const u32 tuna_nrt_pri_lvl[] = {
+	3, 3, 3, 3, 3, 3, 3, 3,
+	3, 3, 3, 3, 3, 3, 3, 3,
+};
 static const u32 sm8650_rt_pri_lvl[] = {4, 4, 5, 5, 5, 5, 5, 6};
 
 /*
@@ -523,7 +528,18 @@ static const u32 sm8650_rt_pri_lvl[] = {4, 4, 5, 5, 5, 5, 5, 6};
  * hardware priority 6 where sm8650_rt_pri_lvl leaves it at 5.  Programmed per
  * (XIN, level) into VBIF_XINL_QOS_RP_REMAP_000 and the matching LVL register.
  */
-static const u32 tuna_rt_pri_lvl[] = {4, 4, 5, 5, 5, 5, 6, 6};
+/*
+ * Sixteen entries, not eight: the factory device tree's
+ * qcom,sde-vbif-qos-rt-remap is <4 4 5 5 5 5 6 6 4 4 5 5 5 5 6 6> and its
+ * qcom,sde-sspp-xin-id is <0 4 1 5 9 13 14>, so xins 9, 13 and 14 sit past the
+ * eighth entry.  With only eight levels those xins kept whatever the bootloader
+ * left in their remap slots, which is the one per-xin difference in the read
+ * path that is not a QoS tuning value.
+ */
+static const u32 tuna_rt_pri_lvl[] = {
+	4, 4, 5, 5, 5, 5, 6, 6,
+	4, 4, 5, 5, 5, 5, 6, 6,
+};
 
 static const struct dpu_vbif_dynamic_ot_cfg msm8998_ot_rdwr_cfg[] = {
 	{
@@ -550,8 +566,8 @@ static const struct dpu_vbif_cfg milos_vbif = {
 		.priority_lvl = sdm845_rt_pri_lvl,
 		},
 	.qos_nrt_tbl = {
-		.npriority_lvl = ARRAY_SIZE(sdm845_nrt_pri_lvl),
-		.priority_lvl = sdm845_nrt_pri_lvl,
+		.npriority_lvl = ARRAY_SIZE(tuna_nrt_pri_lvl),
+		.priority_lvl = tuna_nrt_pri_lvl,
 		},
 	.memtype_count = 16,
 	.memtype = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3},
@@ -636,8 +652,8 @@ static const struct dpu_vbif_cfg sm8550_vbif = {
 		.priority_lvl = sdm845_rt_pri_lvl,
 		},
 	.qos_nrt_tbl = {
-		.npriority_lvl = ARRAY_SIZE(sdm845_nrt_pri_lvl),
-		.priority_lvl = sdm845_nrt_pri_lvl,
+		.npriority_lvl = ARRAY_SIZE(tuna_nrt_pri_lvl),
+		.priority_lvl = tuna_nrt_pri_lvl,
 		},
 	.memtype_count = 16,
 	.memtype = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3},
@@ -653,8 +669,8 @@ static const struct dpu_vbif_cfg sm8650_vbif = {
 		.priority_lvl = sm8650_rt_pri_lvl,
 		},
 	.qos_nrt_tbl = {
-		.npriority_lvl = ARRAY_SIZE(sdm845_nrt_pri_lvl),
-		.priority_lvl = sdm845_nrt_pri_lvl,
+		.npriority_lvl = ARRAY_SIZE(tuna_nrt_pri_lvl),
+		.priority_lvl = tuna_nrt_pri_lvl,
 		},
 	.memtype_count = 16,
 	.memtype = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3},
@@ -680,8 +696,8 @@ static const struct dpu_vbif_cfg tuna_vbif = {
 		.priority_lvl = tuna_rt_pri_lvl,
 		},
 	.qos_nrt_tbl = {
-		.npriority_lvl = ARRAY_SIZE(sdm845_nrt_pri_lvl),
-		.priority_lvl = sdm845_nrt_pri_lvl,
+		.npriority_lvl = ARRAY_SIZE(tuna_nrt_pri_lvl),
+		.priority_lvl = tuna_nrt_pri_lvl,
 		},
 	.memtype_count = 16,
 	.memtype = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3},

@@ -9,6 +9,7 @@
 #define __DPU_KMS_H__
 
 #include <linux/interconnect.h>
+#include <linux/string.h>
 
 #include <drm/drm_drv.h>
 
@@ -64,6 +65,17 @@ struct dpu_kms {
 
 	/* io/register spaces: */
 	void __iomem *mmio, *vbif;
+	/*
+	 * M2582: the MDP's regDMA engine.  On DPU 12 the DSPP's colour and
+	 * sub-pixel rendering blocks are programmed by handing the engine a
+	 * script (an "op") and kicking it off; the registers themselves are
+	 * shadows that never reach the datapath.  The block is a separate
+	 * register window (0xaf80000), outside the mdp range.
+	 */
+	void __iomem *reg_dma;
+
+	/* op buffers and state of that engine */
+	struct dpu_reg_dma *regdma;
 
 	struct regulator *vdd;
 	struct regulator *mmagic;
@@ -168,5 +180,21 @@ int dpu_enable_vblank(struct msm_kms *kms, struct drm_crtc *crtc);
 void dpu_disable_vblank(struct msm_kms *kms, struct drm_crtc *crtc);
 
 unsigned long dpu_kms_get_clk_rate(struct dpu_kms *dpu_kms, char *clock_name);
+
+/*
+ * m2582: the panel's modes carry the panel's nominal refresh rate in .clock
+ * (see panel-meizu-m2582.c) so that drm_mode_vrefresh() reports the rate the
+ * panel really scans at, and msm_dsi takes the DSI link clock from the panel
+ * node's qcom,mdss-dsi-panel-clockrate instead.  The DPU-side maths below was
+ * tuned against the synthetic 627.126 MHz clock that field used to hold, so it
+ * keeps asking for that number: this change must not move the DPU's core-clock
+ * vote or its line-time estimate.
+ */
+#define DPU_M2582_LINK_PCLK_KHZ		627126
+
+static inline bool dpu_mode_is_m2582(const struct drm_display_mode *mode)
+{
+	return strstr(mode->name, "1200x2670") != NULL;
+}
 
 #endif /* __dpu_kms_H__ */

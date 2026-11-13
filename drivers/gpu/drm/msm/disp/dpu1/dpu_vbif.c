@@ -8,6 +8,11 @@
 #include <linux/delay.h>
 
 #include "dpu_vbif.h"
+#include <linux/meizu-m2582.h>
+
+/* see _dpu_vbif_get_ot_limit(): read OT limit used by m2582.features=otlim */
+static unsigned int m2582_ot_lim_override = 0x28;
+module_param_named(m2582_ot_lim, m2582_ot_lim_override, uint, 0600);
 #include "dpu_hw_vbif.h"
 #include "dpu_trace.h"
 
@@ -119,6 +124,14 @@ static u32 _dpu_vbif_get_ot_limit(struct dpu_hw_vbif *vbif,
 	 */
 	if (ot_lim == 0)
 		goto exit;
+
+	/*
+	 * M2582: the read outstanding-transaction limit is the one arbitration
+	 * knob the fetch path has not been swept on.  If the frame loses every
+	 * other 256 B chunk because the VBIF throttles here, moving this number
+	 * changes the pattern; otlim=<n> pins it for that test.
+	 */
+
 
 	/* Modify the limits if the target and the use case requires it */
 	_dpu_vbif_apply_dynamic_ot_limit(vbif, &ot_lim, params);

@@ -3,6 +3,7 @@
  */
 
 #include <drm/drm_managed.h>
+#include <linux/meizu-m2582.h>
 
 #include "dpu_hwio.h"
 #include "dpu_hw_catalog.h"
@@ -26,6 +27,8 @@
 #define VBIF_OUT_WR_LIM_CONF0		0x00D4
 #define VBIF_OUT_AXI_AMEMTYPE_CONF0	0x0160
 #define VBIF_OUT_AXI_AMEMTYPE_CONF1	0x0164
+#define VBIF_OUT_AXI_ASHARED		0x0170
+#define VBIF_OUT_AXI_AINNERSHARED	0x0174
 #define VBIF_XIN_PND_ERR		0x0190
 #define VBIF_XIN_SRC_ERR		0x0194
 #define VBIF_XIN_CLR_ERR		0x019C
@@ -33,6 +36,13 @@
 #define VBIF_XIN_HALT_CTRL1		0x0204
 #define VBIF_XINL_QOS_RP_REMAP_000	0x0550
 #define VBIF_XINL_QOS_LVL_REMAP_000(vbif)	(VBIF_XINL_QOS_RP_REMAP_000 + (vbif)->cap->qos_rp_remap_size)
+
+static unsigned int m2582_halt_reads;
+static unsigned int m2582_halt_raw;
+static unsigned int m2582_halt_xin;
+module_param_named(m2582_halt_reads, m2582_halt_reads, uint, 0400);
+module_param_named(m2582_halt_raw, m2582_halt_raw, uint, 0400);
+module_param_named(m2582_halt_xin, m2582_halt_xin, uint, 0400);
 
 static void dpu_hw_clear_errors(struct dpu_hw_vbif *vbif,
 		u32 *pnd_errors, u32 *src_errors)
@@ -82,6 +92,7 @@ static void dpu_hw_set_mem_type(struct dpu_hw_vbif *vbif,
 	reg_val &= ~(0x7 << bit_off);
 	reg_val |= (value & 0x7) << bit_off;
 	DPU_REG_WRITE(c, reg_off, reg_val);
+
 }
 
 static void dpu_hw_set_limit_conf(struct dpu_hw_vbif *vbif,
@@ -150,6 +161,8 @@ static bool dpu_hw_get_halt_ctrl(struct dpu_hw_vbif *vbif,
 	u32 reg_val;
 
 	reg_val = DPU_REG_READ(c, VBIF_XIN_HALT_CTRL1);
+	/* Meizu DPU12.3 sde_hw_get_xin_halt_status reads ACK[31:16]. */
+
 
 	return (reg_val & BIT(xin_id)) ? true : false;
 }

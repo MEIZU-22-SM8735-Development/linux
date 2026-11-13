@@ -78,10 +78,20 @@ enum {
  * DSPP sub-blocks
  * @DPU_DSPP_PCC             Panel color correction block
  * @DPU_DSPP_GC              Gamma correction block
+ *
+ * These are identifiers only; the bit each one uses in the DSPP's flush
+ * register is hardware defined and lives in dpu_hw_ctl.c.
  */
 enum {
 	DPU_DSPP_PCC = 0x1,
 	DPU_DSPP_GC,
+	DPU_DSPP_VLUT,
+	DPU_DSPP_IGC,
+	DPU_DSPP_GAMUT,
+	DPU_DSPP_LTM,
+	DPU_DSPP_SPR,
+	DPU_DSPP_DEMURA,
+	DPU_DSPP_RC,
 	DPU_DSPP_MAX
 };
 
