@@ -248,25 +248,26 @@ static const struct qcom_ubwc_cfg_data sm8750_data = {
  * The GPU half is configured for real -- Mesa allocates UBWC buffers through
  * the encoder described here.
  *
- * The display half is deliberately NOT enabled: with ubwc_dec_version zero,
- * dpu_plane_format_mod_supported() stops advertising
- * DRM_FORMAT_MOD_QCOM_COMPRESSED and every client allocates linear buffers, so
- * the DPU never decodes UBWC.  This is a known gap, not a validated
- * configuration.  With decode enabled (dec_version = UBWC_5_0 and macrotile as
- * below) a Wayland client's scanout came out as a fine checkerboard over the
- * whole panel, and clearing macrotile_mode did not change that, so the register
- * composition itself -- MDSS_UBWC_STATIC, UBWC_CTRL_2 and
- * UBWC_PREDICTION_MODE, see spec 120.6 -- still has to be settled against a
- * readback of what the vendor stack leaves in those registers before decode can
- * be turned on.
+ * Display decode is disabled by default pending an end-to-end scanout check.
+ * Android's MDSS dump contains STATIC=0x103e and DEC_HW_VERSION=0x50000001;
+ * the current mainline readback also has STATIC=0x103e, CTRL_2=4 and PRED=1.
+ * Matching those words does not establish compatibility of the buffer layout.
  */
 static const struct qcom_ubwc_cfg_data tuna_data = {
 	.ubwc_enc_version = UBWC_5_0,
-	.ubwc_dec_version = 0,	/* see above: display decode not validated yet */
 	.ubwc_swizzle = UBWC_SWIZZLE_ENABLE_LVL2 | UBWC_SWIZZLE_ENABLE_LVL3,
+	/*
+	 * The earlier EGL window failure was a config/visual selection error,
+	 * not evidence that a825 cannot encode UBWC. Correct XRGB config matching
+	 * now produces compressed BOs with correct shader and detiled readback.
+	 * Keep the default off until the same verified BO passes DPU scanout;
+	 * m2582.features=ubwcprobe permits that controlled display experiment.
+	 */
+	.ubwc_dec_version = 0,
 	.ubwc_bank_spread = true,
 	.highest_bank_bit = 16,	/* vendor encodes 3; mainline writes hbb - 13 */
-	.macrotile_mode = true,	/* qcom,sde-macrotile-mode = <1> in the factory tree */
+	/* Factory STATIC bit12; leave unchanged for the buffer-layout test. */
+	.macrotile_mode = true,
 };
 
 static const struct qcom_ubwc_cfg_data glymur_data = {

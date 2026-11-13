@@ -20,12 +20,14 @@
 #include <linux/acpi.h>
 #include <linux/acpi_iort.h>
 #include <linux/bitfield.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/meizu-m2582.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -33,6 +35,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/ratelimit.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/string_choices.h>
 
@@ -656,6 +659,9 @@ void arm_smmu_write_context_bank(struct arm_smmu_device *smmu, int idx)
 	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
 		reg |= ARM_SMMU_SCTLR_E;
 
+	/* Factory dma-coherent transaction attributes, separate from PTE attrs. */
+
+
 	if (smmu->impl && smmu->impl->write_sctlr)
 		smmu->impl->write_sctlr(smmu, idx, reg);
 	else
@@ -945,6 +951,11 @@ static struct iommu_domain *arm_smmu_domain_alloc_paging(struct device *dev)
 	mutex_init(&smmu_domain->init_mutex);
 	spin_lock_init(&smmu_domain->cb_lock);
 	smmu_domain->domain.pgsize_bitmap = smmu->pgsize_bitmap;
+	smmu_domain->m2582_display =
+		of_device_is_compatible(dev->of_node, "qcom,tuna-mdss");
+
+	/* Allow the IOMMU core to install splash mappings before stream attach. */
+
 
 	return &smmu_domain->domain;
 }
@@ -1219,6 +1230,14 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev,
 	/* Looks ok, so add the device to the domain */
 	arm_smmu_master_install_s2crs(cfg, S2CR_TYPE_TRANS,
 				      smmu_domain->cfg.cbndx, fwspec);
+
+	/*
+	 * Diagnostic only: put the display stream in bypass so the DPU reads
+	 * physical addresses directly, matching the bootloader's splash path
+	 * (no SMMU translation).  The page table is still installed above, it
+	 * is simply ignored by hardware while bypassed.
+	 */
+
 rpm_put:
 	arm_smmu_rpm_put(smmu);
 	return ret;
@@ -2130,6 +2149,167 @@ static void arm_smmu_rmr_install_bypass_smr(struct arm_smmu_device *smmu)
 	iort_put_rmr_sids(dev_fwnode(smmu->dev), &rmr_list);
 }
 
+static int m2582_smmu_streams_show(struct seq_file *s, void *unused)
+{
+	struct arm_smmu_device *smmu = s->private;
+	unsigned int matches[4] = { 0 };
+	u32 i, sid, cr0;
+	int ret;
+
+	if (pm_runtime_enabled(smmu->dev)) {
+		ret = pm_runtime_get_if_active(smmu->dev);
+		if (ret <= 0)
+			return ret ?: -EAGAIN;
+	}
+
+	mutex_lock(&smmu->stream_map_mutex);
+	cr0 = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_sCR0);
+	seq_printf(s, "cr0=%08x clientpd=%u groups=%u banks=%u\n",
+		   cr0, !!(cr0 & ARM_SMMU_sCR0_CLIENTPD),
+		   smmu->num_mapping_groups, smmu->num_context_banks);
+	for (i = 0; i < min_t(u32, smmu->num_mapping_groups, 128); i++) {
+		struct arm_smmu_smr *sw_smr = &smmu->smrs[i];
+		struct arm_smmu_s2cr *sw_s2cr = &smmu->s2crs[i];
+		u32 smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
+		u32 s2cr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_S2CR(i));
+		u16 id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
+		u16 mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr & ~ARM_SMMU_SMR_VALID);
+		bool valid, relevant = false;
+
+		valid = smmu->features & ARM_SMMU_FEAT_EXIDS ?
+			s2cr & ARM_SMMU_S2CR_EXIDVALID : smr & ARM_SMMU_SMR_VALID;
+		for (sid = 0x800; sid <= 0x803; sid++) {
+			if (valid && !((sid ^ id) & ~mask)) {
+				matches[sid - 0x800]++;
+				relevant = true;
+			}
+			if (sw_smr->valid && !((sid ^ sw_smr->id) & ~sw_smr->mask))
+				relevant = true;
+		}
+		if (!relevant)
+			continue;
+		seq_printf(s, "slot=%u hw_smr=%08x hw_s2cr=%08x valid=%u id=%04x mask=%04x type=%u cb=%u "
+			   "sw_valid=%u sw_id=%04x sw_mask=%04x sw_type=%u sw_cb=%u refs=%d group=%d\n",
+			   i, smr, s2cr, valid, id, mask,
+			   (u32)FIELD_GET(ARM_SMMU_S2CR_TYPE, s2cr),
+			   (u32)FIELD_GET(ARM_SMMU_S2CR_CBNDX, s2cr),
+			   sw_smr->valid, sw_smr->id, sw_smr->mask,
+			   sw_s2cr->type, sw_s2cr->cbndx, sw_s2cr->count,
+			   sw_s2cr->group ? iommu_group_id(sw_s2cr->group) : -1);
+	}
+	for (sid = 0x800; sid <= 0x803; sid++)
+		seq_printf(s, "sid=%04x hardware_matches=%u\n", sid, matches[sid - 0x800]);
+	mutex_unlock(&smmu->stream_map_mutex);
+	arm_smmu_rpm_put(smmu);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(m2582_smmu_streams);
+
+/*
+ * M2582: read-only dump of the context bank that serves the display SID.
+ *
+ * The stream table was already compared (SMR/S2CR all match the software
+ * table), but the CB's own translation state -- SCTLR, TCR, TTBR0, MAIR -- is
+ * what decides how the DPU's reads are actually translated and attributed, and
+ * it has never been read back.  A wrong TCR/MAIR would not produce a fault, it
+ * would silently change how every access is issued.
+ */
+static int m2582_smmu_cb_show(struct seq_file *s, void *unused)
+{
+	struct arm_smmu_device *smmu = s->private;
+	u32 i, sid, cbndx = U32_MAX, s2cr = 0;
+	int ret;
+
+	if (pm_runtime_enabled(smmu->dev)) {
+		ret = pm_runtime_get_if_active(smmu->dev);
+		if (ret <= 0)
+			return ret ?: -EAGAIN;
+	}
+
+	mutex_lock(&smmu->stream_map_mutex);
+	for (i = 0; i < min_t(u32, smmu->num_mapping_groups, 128); i++) {
+		u32 smr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_SMR(i));
+		u16 id = FIELD_GET(ARM_SMMU_SMR_ID, smr);
+		u16 mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr & ~ARM_SMMU_SMR_VALID);
+		bool valid = smmu->features & ARM_SMMU_FEAT_EXIDS ?
+			arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_S2CR(i)) &
+				ARM_SMMU_S2CR_EXIDVALID :
+			smr & ARM_SMMU_SMR_VALID;
+
+		if (valid && !((0x800 ^ id) & ~mask)) {
+			s2cr = arm_smmu_gr0_read(smmu, ARM_SMMU_GR0_S2CR(i));
+			cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, s2cr);
+			seq_printf(s, "sid=0800 slot=%u s2cr=%08x cbndx=%u\n",
+				   i, s2cr, cbndx);
+			break;
+		}
+	}
+	if (cbndx < smmu->num_context_banks) {
+		seq_printf(s, "cb=%u sctlr=%08x actlr=%08x tcr2=%08x tcr=%08x\n",
+			   cbndx,
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_SCTLR),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_ACTLR),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_TCR2),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_TCR));
+		seq_printf(s, "cb=%u ttbr0=%08x ttbr0_hi=%08x mair0=%08x mair1=%08x\n",
+			   cbndx,
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_TTBR0),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_TTBR0 + 4),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_S1_MAIR0),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_S1_MAIR1));
+		seq_printf(s, "cb=%u contextidr=%08x fsr=%08x far=%08x fsynr0=%08x\n",
+			   cbndx,
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_CONTEXTIDR),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_FSR),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_FAR),
+			   arm_smmu_cb_read(smmu, cbndx, ARM_SMMU_CB_FSYNR0));
+	} else {
+		seq_printf(s, "no context bank mapped to sid 0800\n");
+	}
+	mutex_unlock(&smmu->stream_map_mutex);
+	arm_smmu_rpm_put(smmu);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(m2582_smmu_cb);
+
+/*
+ * M2582: read the display TBU (mdp_hf_qtb @ 0x17f6000) QoS/status registers.
+ * The factory runs a qsmmuv500-tbu/qtb500 on this block (SID 0x800, 2 ports);
+ * mainline has no such driver, so the block sits at reset.  Seeing whether its
+ * ports report outstanding transactions / idle vs fault is the cheapest way to
+ * decide whether this missing block is the fetch defect's cause.
+ */
+static int m2582_tbu_show(struct seq_file *s, void *unused)
+{
+	void __iomem *base;
+	int port;
+
+	base = ioremap(0x17f6000, 0x1000);
+	if (!base) {
+		seq_puts(s, "ioremap(0x17f6000) failed\n");
+		return 0;
+	}
+
+	seq_printf(s, "qsmstatus(0xc00)=%08x idlestatus(0xc08)=%08x\n",
+		   readl_relaxed(base + 0xc00),
+		   readl_relaxed(base + 0xc08));
+	for (port = 0; port < 2; port++) {
+		u32 lo = readl_relaxed(base + 0xc10 + port * 0x10);
+		u32 hi = readl_relaxed(base + 0xc14 + port * 0x10);
+
+		seq_printf(s, "port%d outstanding=%08x%08x\n", port, hi, lo);
+	}
+
+	iounmap(base);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(m2582_tbu);
+
+static void m2582_smmu_streams_remove(void *entry)
+{
+	debugfs_remove(entry);
+}
+
 static int arm_smmu_device_probe(struct platform_device *pdev)
 {
 	struct resource *res;
@@ -2290,6 +2470,7 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 		pm_runtime_enable(dev);
 		arm_smmu_rpm_use_autosuspend(smmu);
 	}
+
 
 	return 0;
 }
