@@ -19,8 +19,14 @@
  * the ST part looked plausible: it is in the tree, it is just turned off, on a
  * different board variant.
  *
- * The bus is SE4 of QUPV3 wrapper 1, which is the one engine on this board the
- * bootloader already leaves programmed the way we need it: it comes out as SPI.
+ * The bus is SE4 of QUPV3 wrapper 1, and it comes out as SPI.  That is not luck
+ * and not something this driver can pick: the QUPV3 serial engine's protocol is
+ * a property of the SE firmware, readable in GENI_FW_REVISION and decoded by
+ * geni_se_read_proto(); the driver only reads it.  XBL loads that firmware from
+ * the separate qupfw partition for every SE before any OS runs, and Android
+ * relies on exactly the same arrangement.  Mainline does have a loader
+ * (geni_load_se_firmware(), gated on a firmware-name property) but the SPI, I2C
+ * and UART drivers never call it.
  *
  * Pads: gpio16..19 as qup1_se4_l0..l3 (miso, mosi, clk, cs) -- the numbers
  * tuna-i2c.dtsi's header table already recorded for SE4.  An earlier version of

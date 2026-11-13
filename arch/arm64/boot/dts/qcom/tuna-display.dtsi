@@ -70,8 +70,9 @@
 		mdss_mdp: display-controller@ae01000 {
 			compatible = "qcom,tuna-dpu";
 			reg = <0x0 0x0ae01000 0x0 0x92800>,
-			      <0x0 0x0aeb0000 0x0 0x2008>;
-			reg-names = "mdp", "vbif";
+			      <0x0 0x0aeb0000 0x0 0x2008>,
+			      <0x0 0x0af80000 0x0 0x8000>;
+			reg-names = "mdp", "vbif", "reg_dma";
 			interrupts-extended = <&mdss 0>;
 			clocks = <&gcc GCC_DISP_HF_AXI_CLK>,
 				 <&dispcc DISP_CC_MDSS_AHB_CLK>,
@@ -186,6 +187,15 @@
 				vci-supply = <&vreg_ldob19>;
 				vdd-supply = <&vreg_ldod3>;
 				reset-gpios = <&tlmm 14 GPIO_ACTIVE_LOW>;
+
+				/*
+				 * The factory's own two numbers, and they are separate
+				 * on purpose: the PHY runs at this link rate, while the
+				 * panel's timing set decides the refresh rate.  msm_dsi
+				 * takes its clocks from here; the modes carry 120/90 Hz
+				 * in .clock so that userspace is told the real rate.
+				 */
+				qcom,mdss-dsi-panel-clockrate = <0x419fed40>;
 
 				/*
 				 * Pinctrl for the TE pin is not repeated here: the DPU

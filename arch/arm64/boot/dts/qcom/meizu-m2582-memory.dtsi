@@ -249,11 +249,12 @@
 			reg = <0x0 0xff800000 0x0 0x600000>;
 			no-map;
 		};
-		splash-region@fc800000 {
+		splash_mem: splash-region@fc800000 {
 			/* Not no-map: the bring-up console paints this buffer and
 			 * needs it reachable through the linear map. Reserved, so
 			 * the page allocator still never touches it. */
 			reg = <0x0 0xfc800000 0x0 0x2b00000>;
+			iommu-addresses = <&mdss 0x0 0xfc800000 0x0 0x2b00000>;
 		};
 	};
 };

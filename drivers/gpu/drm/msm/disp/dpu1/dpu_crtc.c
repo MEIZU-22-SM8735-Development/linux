@@ -27,6 +27,8 @@
 #include "dpu_hw_lm.h"
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
+#include "dpu_hw_reg_dma.h"
+#include <linux/meizu-m2582.h>
 #include "dpu_crtc.h"
 #include "dpu_plane.h"
 #include "dpu_encoder.h"
@@ -416,6 +418,10 @@ static void _dpu_crtc_blend_setup_pipe(struct drm_crtc *crtc,
 	sspp_idx = pipe->sspp->idx;
 
 	state = plane->state;
+	/* Independent halves share a stage but require distinct SSPP slots. */
+	if (m2582_feature_opt_in("srcsplitplanes") &&
+	    state->dst.x1 >= crtc->state->adjusted_mode.hdisplay / 2)
+		stage_idx = 1;
 
 	trace_dpu_crtc_setup_mixer(DRMID(crtc), DRMID(plane),
 				   state, to_dpu_plane_state(state), stage_idx,
@@ -848,6 +854,38 @@ static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
 	gc_lut->flags = 0;
 }
 
+
+/*
+ * M2582: stage a DSPP colour script for this commit.  The encoder starts it
+ * right before the CTL flush.  Off unless m2582.features=regdmatest: it is the
+ * experiment that tells us whether the engine is needed at all, given that a
+ * plain register write plus the DSPP flush bit is enough for the same effect.
+ */
+static void m2582_regdma_stage(struct drm_crtc *crtc)
+{
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
+	struct msm_drm_private *priv = crtc->dev->dev_private;
+	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
+
+	if (!dpu_kms || !dpu_kms->regdma)
+		return;
+
+	if (!m2582_feature_opt_in("regdmatest"))
+		return;
+
+	if (!cstate->num_mixers || !cstate->mixers[0].lm_ctl ||
+	    !cstate->mixers[0].hw_dspp)
+		return;
+
+	/* canary: write a recognisable word into the DSPP's SPR block */
+	dpu_reg_dma_begin(dpu_kms->regdma, DPU_REG_DMA_SEL_DSPP0);
+	dpu_reg_dma_write_reg(dpu_kms->regdma, 0x15404, 0x12345678);
+
+	pr_info_once("m2582-regdma: stage dspp idx %d, kick ret %d\n",
+		     cstate->mixers[0].hw_dspp->idx,
+		     dpu_reg_dma_kick(dpu_kms, cstate->mixers[0].lm_ctl));
+}
+
 static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 {
 	struct drm_crtc_state *state = crtc->state;
@@ -899,6 +937,27 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			ctl->ops.update_pending_flush_dspp(ctl,
 				mixer[i].hw_dspp->idx, DPU_DSPP_GC);
 		}
+
+		/*
+		 * Stage the sub-pixel rendering configuration.  Mainline has no
+		 * catalogue entry for it, so the block only has an op when the
+		 * driver was told the panel needs it (m2582.features=spr).
+		 */
+		if (dspp->ops.setup_spr) {
+			dspp->ops.setup_spr(dspp);
+
+			/*
+			 * SPR has its own flush bit: like every DSPP colour
+			 * block it stays shadowed until that bit is written to
+			 * the per-DSPP flush register at CTL flush time.
+			 */
+			ctl->ops.update_pending_flush_dspp(ctl,
+				mixer[i].hw_dspp->idx, DPU_DSPP_SPR);
+			/* the PCC probe needs PCC's own flush bit */
+			if (m2582_feature_opt_in("sprtest"))
+				ctl->ops.update_pending_flush_dspp(ctl,
+					mixer[i].hw_dspp->idx, DPU_DSPP_PCC);
+		}
 	}
 }
 
@@ -933,6 +992,13 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
 	_dpu_crtc_blend_setup(crtc);
 
 	_dpu_crtc_setup_cp_blocks(crtc);
+
+	/*
+	 * M2582: the DSPP colour blocks are programmed through the regDMA
+	 * engine; build the script here and let the encoder start it right
+	 * before the CTL flush.
+	 */
+	m2582_regdma_stage(crtc);
 
 	/*
 	 * PP_DONE irq is only used by command mode for now.
@@ -1427,7 +1493,13 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	if (crtc_state->ctm || crtc_state->gamma_lut)
+	/*
+	 * M2582: the sub-pixel renderer lives in the DSPP, so the block has to
+	 * be reserved even when no colour management property is set -- the
+	 * panel needs it for every composition, not just for CTM/gamma users.
+	 */
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    m2582_feature_opt_in("spr") || m2582_feature_opt_in("sprtest"))
 		topology.num_dspp = topology.num_lm;
 
 	return topology;

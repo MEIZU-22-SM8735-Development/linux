@@ -10,6 +10,8 @@
 #include "dpu_hw_mdss.h"
 #include "dpu_hw_util.h"
 
+#include <linux/meizu-m2582.h>
+
 /* using a file static variables for debugfs access */
 static u32 dpu_hw_util_log_mask = DPU_DBG_MASK_NONE;
 
@@ -471,7 +473,17 @@ void _dpu_hw_setup_qos_lut(struct dpu_hw_blk_reg_map *c, u32 offset,
 	DPU_REG_WRITE(c, offset + QOS_DANGER_LUT, cfg->danger_lut);
 	DPU_REG_WRITE(c, offset + QOS_SAFE_LUT, cfg->safe_lut);
 
-	if (qos_8lvl) {
+	/*
+	 * M2582: the chunk-request LUT the factory splash runs with.  The
+	 * bootloader leaves 0x44556666 / 0x00112233 where this driver computes
+	 * 0x22335777 / 0x00112222 for the same geometry, and CREQ is what
+	 * decides how many 256 B chunk requests a fetch of a given length
+	 * issues -- the one difference against a picture that is known correct.
+	 */
+	if (m2582_feature_opt_in("creqbl")) {
+		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_0, 0x44556666);
+		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_1, 0x00112233);
+	} else if (qos_8lvl) {
 		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_0, cfg->creq_lut);
 		DPU_REG_WRITE(c, offset + QOS_CREQ_LUT_1, cfg->creq_lut >> 32);
 	} else {

@@ -5,16 +5,20 @@
 
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/interconnect.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/meizu-m2582.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset-controller.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include "gdsc.h"
 
@@ -212,7 +216,9 @@ static int gdsc_toggle_logic(struct gdsc *sc, enum gdsc_status status,
 	 * request is honoured for the config-GDSCR flavour and give the hardware a
 	 * fixed settling delay instead of polling that bit.
 	 */
-	if (sc->flags & POLL_CFG_GDSCR) {
+	if ((sc->flags & POLL_CFG_GDSCR) &&
+	    !(sc->pd.name && !strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc") &&
+	      m2582_feature_opt_in("gdscpoll"))) {
 		udelay(50);
 		ret = 0;
 	} else {
@@ -340,9 +346,59 @@ static void gdsc_retain_ff_on(struct gdsc *sc)
 	regmap_update_bits(sc->regmap, sc->gdscr, mask, mask);
 }
 
+static bool m2582_gdsc_vendor_order(struct gdsc *sc)
+{
+	return sc->pd.name &&
+		!strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc") &&
+		m2582_feature_opt_in("gdscvendororder");
+}
+
+static void m2582_gdsc_cycle_state(struct gdsc *sc, const char *where)
+{
+	u32 gdscr, cfg;
+	int ret;
+
+	if (!sc->pd.name || strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc") ||
+	    !m2582_feature_opt_in("mdsscycle"))
+		return;
+	ret = regmap_read(sc->regmap, sc->gdscr, &gdscr);
+	if (!ret)
+		ret = regmap_read(sc->regmap, sc->gdscr + CFG_GDSCR_OFFSET, &cfg);
+	if (ret)
+		pr_info("m2582-gdsc-cycle: %s read-error=%d\n", where, ret);
+	else
+		pr_info("m2582-gdsc-cycle: %s gdscr=%08x cfg=%08x\n",
+			where, gdscr, cfg);
+}
+
+static int m2582_gdsc_state_show(struct seq_file *s, void *unused)
+{
+	struct gdsc *sc = s->private;
+	struct device *dev = regmap_get_device(sc->regmap);
+	u32 gdscr, cfg;
+	int ret = pm_runtime_get_if_active(dev);
+
+	if (ret <= 0)
+		return ret ? ret : -EAGAIN;
+	ret = regmap_read(sc->regmap, sc->gdscr, &gdscr);
+	if (!ret)
+		ret = regmap_read(sc->regmap, sc->gdscr + CFG_GDSCR_OFFSET, &cfg);
+	if (!ret)
+		seq_printf(s, "gdscr=%08x cfg=%08x\n", gdscr, cfg);
+	pm_runtime_put(dev);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(m2582_gdsc_state);
+
+static void m2582_gdsc_debug_remove(void *arg)
+{
+	debugfs_remove(arg);
+}
+
 static int gdsc_enable(struct generic_pm_domain *domain)
 {
 	struct gdsc *sc = domain_to_gdsc(domain);
+	bool m2582_vendor_order;
 	int ret;
 
 	if (sc->pwrsts == PWRSTS_ON)
@@ -364,6 +420,16 @@ static int gdsc_enable(struct generic_pm_domain *domain)
 	if (ret)
 		return ret;
 
+	/* Sample the power bit before HW_CONTROL can return the block to idle. */
+	m2582_gdsc_cycle_state(sc, "power-up-request");
+
+	/*
+	 * The factory display GDSCs enable HW_CONTROL before RETAIN_FF. Keep
+	 * this ordering change opt-in and limited to the CORE MDSS domain so the
+	 * normal power sequence remains unchanged unless explicitly measured.
+	 */
+	m2582_vendor_order = m2582_gdsc_vendor_order(sc);
+
 	if (sc->pwrsts & PWRSTS_OFF)
 		gdsc_force_mem_on(sc);
 
@@ -376,7 +442,7 @@ static int gdsc_enable(struct generic_pm_domain *domain)
 	 */
 	udelay(1);
 
-	if (sc->flags & RETAIN_FF_ENABLE)
+	if ((sc->flags & RETAIN_FF_ENABLE) && !m2582_vendor_order)
 		gdsc_retain_ff_on(sc);
 
 	/* Turn on HW trigger mode if supported */
@@ -393,6 +459,12 @@ static int gdsc_enable(struct generic_pm_domain *domain)
 		 * can't immediately poll the status bits.
 		 */
 		udelay(1);
+	}
+
+	if (m2582_vendor_order && (sc->flags & RETAIN_FF_ENABLE)) {
+		gdsc_retain_ff_on(sc);
+		pr_info("m2582-gdsc-order: %s used HW_CONTROL then RETAIN_FF\n",
+			sc->pd.name);
 	}
 
 	return 0;
@@ -443,6 +515,7 @@ static int gdsc_disable(struct generic_pm_domain *domain)
 
 	if (sc->flags & CLAMP_IO)
 		gdsc_assert_clamp_io(sc);
+	m2582_gdsc_cycle_state(sc, "disabled");
 
 	return 0;
 }
@@ -486,8 +559,20 @@ static bool gdsc_get_hwmode(struct generic_pm_domain *domain, struct device *dev
 
 static int gdsc_init(struct gdsc *sc)
 {
+	bool vendor_order = m2582_gdsc_vendor_order(sc);
+	u32 before_gdscr = 0, before_cfg = 0, after_gdscr, after_cfg;
 	u32 mask, val;
 	int on, ret;
+
+	if (vendor_order) {
+		ret = regmap_read(sc->regmap, sc->gdscr, &before_gdscr);
+		if (ret)
+			return ret;
+		ret = regmap_read(sc->regmap, sc->gdscr + CFG_GDSCR_OFFSET,
+				  &before_cfg);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Disable HW trigger: collapse/restore occur based on registers writes.
@@ -546,7 +631,7 @@ static int gdsc_init(struct gdsc *sc)
 		 * otherwise we end up turning off the GDSC and destroying all
 		 * the register contents that we thought we were saving.
 		 */
-		if (sc->flags & RETAIN_FF_ENABLE)
+		if ((sc->flags & RETAIN_FF_ENABLE) && !vendor_order)
 			gdsc_retain_ff_on(sc);
 
 		/* Turn on HW trigger mode if supported */
@@ -554,6 +639,20 @@ static int gdsc_init(struct gdsc *sc)
 			ret = gdsc_hwctrl(sc, true);
 			if (ret < 0)
 				goto err_disable_supply;
+		}
+
+		if (vendor_order && (sc->flags & RETAIN_FF_ENABLE)) {
+			gdsc_retain_ff_on(sc);
+			ret = regmap_read(sc->regmap, sc->gdscr, &after_gdscr);
+			if (ret)
+				goto err_disable_supply;
+			ret = regmap_read(sc->regmap,
+					  sc->gdscr + CFG_GDSCR_OFFSET, &after_cfg);
+			if (ret)
+				goto err_disable_supply;
+			pr_info("m2582-gdsc-init-order: %s before=%08x/%08x after=%08x/%08x HW_CONTROL then RETAIN_FF\n",
+				sc->pd.name, before_gdscr, before_cfg,
+				after_gdscr, after_cfg);
 		}
 
 	} else if (sc->flags & ALWAYS_ON) {
@@ -706,6 +805,16 @@ int gdsc_register(struct gdsc_desc *desc,
 		if (ret)
 			return ret;
 		data->domains[i] = &scs[i]->pd;
+		if (scs[i]->pd.name &&
+		    !strcmp(scs[i]->pd.name, "disp_cc_mdss_core_gdsc") &&
+		    m2582_feature_opt_in("mdsscycle")) {
+			struct dentry *entry;
+
+			entry = debugfs_create_file("m2582_gdsc_state", 0400, NULL,
+						    scs[i], &m2582_gdsc_state_fops);
+			if (!IS_ERR_OR_NULL(entry))
+				devm_add_action_or_reset(dev, m2582_gdsc_debug_remove, entry);
+		}
 	}
 
 	/* Add subdomains */

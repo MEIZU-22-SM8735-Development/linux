@@ -14,6 +14,11 @@
 #include "meizu-m2582-adsp.dtsi"
 /* dropped for the touch-only image (user priority): #include "meizu-m2582-pcie.dtsi" */
 #include "meizu-m2582-dp.dtsi"
+
+&mdss {
+	memory-region = <&splash_mem>;
+};
+
 /*
  * The PMK8550 sits on the SPMI bus declared in tuna.dtsi. This brings in the
  * PMIC node, its SDAM2 (whose restart-reason field the bootloader reads to pick
@@ -53,7 +58,7 @@
 	 * every make dtbs_check run on this board died at the root node and
 	 * looked like a tooling problem rather than a board one.
 	 */
-	model = "Meizu 22 (M2582) experimental Linux bring-up";
+	model = "MEIZU 22 (M2582)";
 	compatible = "meizu,m2582", "qcom,tuna";
 	chassis-type = "handset";
 	/* Live socinfo: SM8735 1.1, foundry 1, QRD platform 1.0. */
@@ -671,6 +676,7 @@
  * list not naming "pshold", nothing here is probed and reboot stays PSCI.
  */
 &soc {
+	/* Read-only LLCC identification for the optional display diagnostic. */
 	pm_pshold: restart@c264000 {
 		compatible = "qcom,pshold";
 		reg = <0 0x0c264000 0 0x4>;

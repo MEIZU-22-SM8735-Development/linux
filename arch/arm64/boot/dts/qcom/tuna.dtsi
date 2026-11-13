@@ -771,14 +771,29 @@
 			clock-names = "core_clk", "bus_aggr_clk", "iface_clk", "core_clk_unipro",
 				      "ref_clk", "tx_lane0_sync_clk", "rx_lane0_sync_clk", "rx_lane1_sync_clk";
 			/*
-			 * A non-zero min/max range makes the UFS core register a devfreq device,
-			 * and ufs_devfreq_scale() then walks of_parse_clkspec() every 60 ms -- a
-			 * path that oopses on this board in __pi_strcmp about two seconds into
-			 * boot. Collapsing each range to one value keeps the property present
-			 * while making scaling impossible. Pin to the top of the range: at 100 MHz
-			 * the link does not work at all.
+			 * 100-403 MHz for core_clk and core_clk_unipro -- exactly what the
+			 * factory runtime FDT ships (0x5f5e100 / 0x18054ac0), and the
+			 * factory has no OPP table either.
+			 *
+			 * These two entries were once collapsed to a single 403 MHz so the
+			 * UFS core could not register a devfreq device.  That was a
+			 * workaround for a symptom: with a real range the scaling path read
+			 * device-tree properties every 60 ms, and those reads faulted
+			 * because the built-in FDT had been unflattened in place and
+			 * free_initmem() unmapped it.  The root cause is fixed (setup.c now
+			 * calls unflatten_and_copy_device_tree()), so the collapse only
+			 * pinned UFS at full speed and cost idle power.
+			 *
+			 * Scaling down is safe without an OPP table: freq_to_gear_speed()
+			 * reports "no change", so ufshcd_scale_gear() takes its legacy path
+			 * and drops the gear to clk_scaling.min_gear (HS-G1) whenever the
+			 * clock drops, keeping the pair consistent.
+			 *
+			 * Do not pin both ends low: with min == max == 100 MHz the initial
+			 * link start-up runs HS-G5 against a 100 MHz core clock and every
+			 * descriptor query fails with -EIO.
 			 */
-			freq-table-hz = <403000000 403000000>, <0 0>, <0 0>, <403000000 403000000>,
+			freq-table-hz = <100000000 403000000>, <0 0>, <0 0>, <100000000 403000000>,
 					<0 0>, <0 0>, <0 0>, <0 0>;
 			interconnects = <&aggre1_noc MASTER_UFS_MEM QCOM_ICC_TAG_ALWAYS &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>,
 					<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS &config_noc SLAVE_UFS_MEM_CFG QCOM_ICC_TAG_ALWAYS>;
