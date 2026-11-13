@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Meizu M2582 VTDR6130A command-mode panel. Commands extracted from OEM DT. */
 #include <linux/backlight.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/meizu-m2582.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/regulator/consumer.h>
 #include <linux/string.h>
@@ -18,8 +20,8 @@
 struct m2582_cmd {
 	u8 type, delay_ms, len;
 	/*
-	 * Factory burst grouping: set on the last command of a burst.  With
-	 * m2582.features=cmdbatch every other packet of the burst is sent with
+	 * Factory burst grouping: set on the last command of a burst. Every
+	 * other packet of the burst is sent with
 	 * MIPI_DSI_MSG_BATCH_COMMAND, so the transport accumulates the group and
 	 * kicks off once on the marked packet.  The last element of a set is
 	 * always treated as a burst end.
@@ -34,12 +36,34 @@ struct m2582_cmd {
 #define M2582_CMD_BUF	(sizeof(((struct m2582_cmd *)0)->data))
 
 /*
- * First-line budget of the factory's model for this panel: DSC 1.1, 8 bpp,
- * 10 bpc, no SCR variant, so 12.  This is what the factory driver's own 1.1
- * branch (sde_dsc_populate_dsc_params()) and its 0x70 payload both carry.
- * m2582_verify_pps() below uses it to notice a model that drifted.
+ * First-line budget of the factory's model for this panel, and it depends on
+ * the advertised DSC version.
+ *
+ * The panel this board actually selects is the Visionox vtdr6130a node (the
+ * factory bootargs name it), and that node carries
+ * qcom,mdss-dsc-version = <0x12> with a 0x70 payload whose first byte is
+ * 0x12 -- DSC 1.2.  2026-10-28 concluded 1.1 from a different node in the
+ * dtbo (a CSOT NT37801 with the same 1200x2670 / 600x30 geometry but no
+ * version property); docs/notes/display-dscver-offline-1104.md retracted
+ * that.  So the two arms are:
+ *
+ *   1.1 (the retracted reading): flbo 12, PPS byte 0x11
+ *   1.2 (what the factory node says): flbo 13, PPS byte 0x12
+ *
+ * 13 for a 30-row slice is mainline's own 1.2 derivation
+ * (drm_dsc_populate_dsc_params) and matches the factory node's payload.
+ * m2582_verify_pps() below uses this to notice a model that drifted, so it
+ * has to follow the same switch dsi_host.c uses for dsc_version_minor.
+ *
+ * 1.2 is the default, because that is what the factory runs (encoder
+ * DSC_MAIN_CONF[31:28] and the node's 0x70 payload both say 1.2).  The 1.1
+ * arm is the deviation from the broken-supply era, kept behind an explicit
+ * opt-out for a controlled A/B only.
  */
-#define M2582_DSC_FLBO	12
+static u32 m2582_dsc_flbo(void)
+{
+	return m2582_feature_opt_in("dsc11") ? 12 : 13;
+}
 
 /*
  * Power-on sequence.  The first 102 packets are qcom,mdss-dsi-on-command of the
@@ -51,7 +75,9 @@ struct m2582_cmd {
  * packets, not 107.  It ends with Sleep Out (0x11, 121 ms) and Display On
  * (0x29).
  */
-static const struct m2582_cmd m2582_on_cmds[] = {
+/* not const: m2582_patch_pps_version() rewrites the 0x70 payload's
+ * version byte once, at the first prepare(). */
+static struct m2582_cmd m2582_on_cmds[] = {
 	{ .type = 0x39, .delay_ms = 21, .len = 3,
 	  .data = { 0xf0, 0xaa, 0x10 } },
 	{ .type = 0x39, .delay_ms = 0, .len = 2,
@@ -98,14 +124,15 @@ static const struct m2582_cmd m2582_on_cmds[] = {
 	  .data = { 0x03, 0x01 } },
 	/*
 	 * The factory's own DSC-parameter snapshot for this panel, verbatim from
-	 * its device-tree node.  Byte 0 of the payload is the DSC version, and
-	 * this panel's node declares no qcom,mdss-dsc-version, so dsi_panel.c
-	 * defaults it to 1.1 and the factory packet says 0x11.  The rest of the
-	 * payload is the placeholder model the panel tool generated (first-line
-	 * budget 1, nfl 71); the real model goes out later in the 0x0a PPS.
+	 * its device-tree node: byte 1 of the payload is the DSC version and the
+	 * factory packet says 0x12, which matches qcom,mdss-dsc-version = <0x12>
+	 * in that node.  The rest of the payload is the placeholder model the
+	 * panel tool generated (first-line budget 1, nfl 71); the real model goes
+	 * out later in the 0x0a PPS.  0x11 is only put here by the dsc11 opt-out,
+	 * in m2582_patch_pps_version().
 	 */
 	{ .type = 0x39, .delay_ms = 0, .len = 95,
-	  .data = { 0x70, 0x11, 0x00, 0x00, 0xab, 0x30, 0x80, 0x0a,
+	  .data = { 0x70, 0x12, 0x00, 0x00, 0xab, 0x30, 0x80, 0x0a,
 		    0x6e, 0x04, 0xb0, 0x00, 0x1e, 0x02, 0x58, 0x02,
 		    0x58, 0x02, 0x00, 0x01, 0x19, 0x00, 0x20, 0x05,
 		    0xd0, 0x00, 0x08, 0x00, 0x01, 0x00, 0x47, 0x03,
@@ -286,7 +313,7 @@ static const struct m2582_cmd m2582_on_cmds[] = {
 	 *
 	 * f0 aa 10 selects vendor page 0xAA10, 65 04 selects index 4, cf 4b writes
 	 * 0x4B there -- an undocumented register, on a page the kernel's list only
-	 * touches at index 1 (cf 09).  m2582.features=noabltail is the arm.
+	 * touches at index 1 (cf 09). Enable only with m2582.features=abltail.
 	 */
 	{ .type = 0x39, .delay_ms = 0, .len = 3, .abl_tail = 1,
 	  .data = { 0xf0, 0xaa, 0x10 } },
@@ -717,6 +744,8 @@ struct m2582_panel {
 	 * away, so the floor policy stops at the same moment.
 	 */
 	bool powered;
+	/* <debugfs>/m2582-panel/dcs, raw access to the DDIC's own command set. */
+	struct dentry *debugfs;
 
 	/*
 	 * Adaptive refresh (m2582.features=ltpo).  The DDIC drops from its
@@ -758,9 +787,10 @@ static const struct regulator_bulk_data m2582_supplies[] = {
 /*
  * The panel decodes what the PPS sent in prepare() describes and nothing
  * re-sends that PPS later, while the encoder's copy is reprogrammed on every
- * mode set.  These are the validated defaults for this panel: DSC 1.1,
+ * mode set.  These are the validated defaults for this panel: DSC 1.2,
  * 10 bpc in, 8 bpp on the wire, two 600 x 30 slices of 600 bytes each,
- * first-line budget 12.  A mismatch does not fail the modeset, which is why it has
+ * first-line budget 13 (DSC 1.2; 12 is the 1.1 opt-out arm).  A mismatch does
+ * not fail the modeset, which is why it has
  * to be reported: it is exactly the state that shows up as garbage on screen.
  */
 static void m2582_verify_pps(struct m2582_panel *ctx)
@@ -769,13 +799,14 @@ static void m2582_verify_pps(struct m2582_panel *ctx)
 
 	if (ctx->dsc_override)
 		return;
-	if (dsc->dsc_version_major == 1 && dsc->dsc_version_minor == 1 &&
+	if (dsc->dsc_version_major == 1 &&
+	    dsc->dsc_version_minor == (m2582_feature_opt_in("dsc11") ? 1 : 2) &&
 	    dsc->bits_per_component == 10 &&
 	    dsc->bits_per_pixel == (8 << 4) &&
 	    dsc->line_buf_depth == 11 &&
 	    dsc->slice_width == 600 && dsc->slice_height == 30 &&
 	    dsc->slice_count == 2 && dsc->slice_chunk_size == 600 &&
-	    dsc->first_line_bpg_offset == M2582_DSC_FLBO)
+	    dsc->first_line_bpg_offset == m2582_dsc_flbo())
 		return;
 
 	dev_warn_once(ctx->dev,
@@ -799,6 +830,26 @@ static void m2582_dsc_apply_pin(struct m2582_panel *ctx)
 	u32 bpp, ubpg;
 
 	/*
+	 * m2582.features=lbuf9: shrink the decoder's line buffer one step
+	 * (11 -> 9) with everything else at the validated 10 bpc 8 bpp model.
+	 * The 8 bpc arm changed both this and bpc, and the "missing sub-row at
+	 * the bottom of alternate 64-column strips" disappeared there; this arm
+	 * separates the two, and unlike bpc8 it should still show correct colour.
+	 * The rate-control model is recomputed from the new buffer size, because
+	 * the PPS carries it.
+	 */
+	/*
+	 * m2582.features=cvt0: stop the encoder from converting RGB to YUV before
+	 * DSC and tell the decoder the same.  convert_rgb is the field that says
+	 * how a source pixel is split into components, which is the same layer as
+	 * bpc; bpc 8 moved the per-64-column sub-row gap but also broke colour
+	 * (DSC and DDIC disagreed), so this arm changes the component model
+	 * instead, where both ends can stay consistent.
+	 */
+
+
+
+	/*
 	 * m2582.features=dtsnap pins the whole rate-control model to the values
 	 * in the vendor device tree's 0x70 PPS snapshot, which are self-consistent
 	 * but differ from what the driver derives: flbo 1 / nfl 71 / dec_delay
@@ -809,13 +860,7 @@ static void m2582_dsc_apply_pin(struct m2582_panel *ctx)
 	 * mismatch that would corrupt exactly one slice per affected row and
 	 * leave flat content untouched.
 	 */
-	if (m2582_feature_opt_in("dtsnap")) {
-		dsc->first_line_bpg_offset = 1;
-		dsc->nfl_bpg_offset = 71;
-		dsc->initial_dec_delay = 281;
-		dsc->scale_increment_interval = 1488;
-		return;
-	}
+
 	if (ctx->dsc_flbo_raw) {
 		dsc->first_line_bpg_offset = ctx->dsc_flbo_raw;
 		return;
@@ -832,35 +877,38 @@ static void m2582_dsc_apply_pin(struct m2582_panel *ctx)
 }
 
 /*
- * The factory sends the DSC picture parameter set a second time, as a MIPI
- * "Picture Parameter Set" packet (data type 0x0a) whose payload is the
- * 128-byte PPS itself, right after the power-on set rather than inside it
- * (dsi_display_enable() calls dsi_panel_update_pps() once dsi_panel_enable()
- * returns).  It is the only carrier of the rate-control model the encoder
- * actually runs: the device tree's 0x70 payload is the panel tool's snapshot
- * and disagrees with it in first_line_bpg_offset and nfl_bpg_offset, the two
- * fields that only affect the first line of a slice.
- *
- * Arms: m2582.features=nopps0a drops the packet (the snapshot then stays the
- * only carrier); ppslate moves it after the settle; ppsrepack makes the 0x70
- * payload agree with the generated model instead.
+ * Byte 1 of the 0x70 command's payload is the DSC version the DDIC is told to
+ * expect, and it has to agree with what the encoder advertises
+ * (dsi_host.c:dsc_version_minor) or the panel rejects the PPS outright.
+ * The factory node for this panel (vtdr6130a) carries 0x12; the 0x11 in the
+ * table below came from the 2026-10-28 reading of a different dtbo node that
+ * docs/notes/display-dscver-offline-1104.md retracted.  Patched once per boot
+ * rather than duplicated as a second table.
  */
-static bool m2582_send_pps0a(void)
+static void m2582_patch_pps_version(void)
 {
-	return !m2582_feature_opt_out("pps0a");
+	unsigned int i;
+	u8 v = m2582_feature_opt_in("dsc11") ? 0x11 : 0x12;
+
+	for (i = 0; i < ARRAY_SIZE(m2582_on_cmds); i++)
+		if (m2582_on_cmds[i].len >= 2 && m2582_on_cmds[i].data[0] == 0x70)
+			m2582_on_cmds[i].data[1] = v;
 }
 
-/*
- * dsc_version_minor appears in exactly two places: PPS byte 0
- * (drm_dsc_pps_payload_pack()) and the encoder's DSC_MAIN_CONF[31:28]; the
- * rate-control model itself is identical either way.  m2582.features=ppsv11
- * rewrites the PPS version byte on both carriers while
- * ctx->dsc.dsc_version_minor keeps the encoder at 1.2, so "PPS byte" and
- * "encoder nibble" can be told apart as levers.
- */
-static u8 m2582_pps_ver(u8 v)
+static void m2582_pack_pps(struct drm_dsc_picture_parameter_set *pps,
+			   const struct drm_dsc_config *dsc)
 {
-	return m2582_feature_opt_in("ppsv11") ? ((v & 0xf0) | 0x01) : v;
+	drm_dsc_pps_payload_pack(pps, dsc);
+
+	/*
+	 * Stock sde_dsc_create_pps_buf_cmd() retains PPS87 in PPS88 for 1.2
+	 * RGB (msm_drm.ko 0x1232dc). Match its complete payload, including this
+	 * reserved-bit quirk; the stock model is validated with memory DMA.
+	 */
+	if (dsc->dsc_version_minor == 2 && !dsc->native_422 && !dsc->native_420)
+		pps->native_422_420 =
+			((dsc->rc_range_params[14].range_max_qp & 3) << 6) |
+			(dsc->rc_range_params[14].range_bpg_offset & 0x3f);
 }
 
 static int m2582_send(struct m2582_panel *ctx, const struct m2582_cmd *cmds, size_t count)
@@ -872,24 +920,11 @@ static int m2582_send(struct m2582_panel *ctx, const struct m2582_cmd *cmds, siz
 		const struct m2582_cmd *cmd = &cmds[i];
 
 		/*
-		 * The last three packets are the factory bootloader's own tail
-		 * (DisplayDxe's cold-boot list ends with the same 107 packets),
-		 * re-sent here because prepare() runs the whole sequence from
-		 * reset instead of inheriting a panel the bootloader already
-		 * brought up.  m2582.features=noabltail drops them.
+		 * These three writes belong to DisplayDxe, not the running factory
+		 * kernel's 104-packet ON set. Keep them only as an explicit fallback.
 		 */
-		if (cmd->abl_tail && m2582_feature_opt_in("noabltail"))
+		if (cmd->abl_tail && !m2582_feature_opt_in("abltail"))
 			continue;
-		/*
-		 * The 0x70 packet is the panel tool's PPS snapshot: sending it is
-		 * what puts the DDIC on its compressed path.  The uncompressed arm
-		 * must not send it, or the decoder would start looking for DSC
-		 * slices in plain 24 bpp data.
-		 */
-		if (cmd->len && cmd->data[0] == 0x70 &&
-		    m2582_feature_opt_in("nodsc"))
-			continue;
-		u8 ppsbuf[M2582_CMD_BUF];
 		/*
 		 * One DSI transfer per command in LP mode (the factory marks every set
 		 * dsi_lp_mode): the framing a cold panel is known to accept.
@@ -920,35 +955,11 @@ static int m2582_send(struct m2582_panel *ctx, const struct m2582_cmd *cmds, siz
 		 * next transfer prepends them).
 		 */
 		if (!cmd->end && i != count - 1 &&
-		    m2582_feature_opt_in("cmdbatch"))
+		    !m2582_feature_opt_in("cmdsingle"))
 			/* msm's private flag (dsi_host.c: BIT(6)): the group
 			 * continues, accumulate it and kick off once. */
 			msg.flags |= BIT(6);
 
-		/*
-		 * The device tree's 0x70 payload carries the panel tool's snapshot
-		 * of the rate-control model (flbo 1, nfl 71, dec 281, scale_inc
-		 * 1488) while the encoder runs the derived one (13 / 919 / 581 /
-		 * 746).  The factory sends this payload verbatim and the generated
-		 * model as a separate 0x0a packet (m2582_send_pps0a()), so nothing
-		 * rewrites it by default.  m2582.features=ppsrepack overwrites it
-		 * with the generated model, ppsv11 only its version byte.
-		 */
-		if (cmd->data[0] == 0x70 && cmd->len > 1 &&
-		    (m2582_feature_opt_in("ppsrepack") ||
-		     m2582_feature_opt_in("ppsv11"))) {
-			struct drm_dsc_picture_parameter_set pps;
-			size_t n = min_t(size_t, cmd->len - 1, sizeof(pps));
-
-			drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
-			memcpy(ppsbuf, cmd->data, cmd->len);
-			if (m2582_feature_opt_in("ppsrepack"))
-				memcpy(ppsbuf + 1, &pps, n);
-			/* ppsv11: version byte only, payload otherwise verbatim */
-			ppsbuf[1] = m2582_pps_ver(ppsbuf[1]);
-			msg.tx_buf = ppsbuf;
-			m2582_verify_pps(ctx);
-		}
 		if (!dsi->host->ops->transfer)
 			return -EOPNOTSUPP;
 		ret = dsi->host->ops->transfer(dsi->host, &msg);
@@ -971,7 +982,6 @@ static int m2582_send(struct m2582_panel *ctx, const struct m2582_cmd *cmds, siz
  * 128-byte PPS itself; dsi_display_enable() sends it right after
  * dsi_panel_enable(), i.e. after the whole power-on set.  This is the factory's
  * own enable sequence and the default; m2582.features=nopps0a drops it and
- * ppsrepack makes the 0x70 carrier agree with the generated model instead.
  */
 static int m2582_send_pps_packet(struct m2582_panel *ctx)
 {
@@ -995,21 +1005,13 @@ static int m2582_send_pps_packet(struct m2582_panel *ctx)
 	 * dsi_lp_mode, and m2582_send() matches).  A DDIC fed the model only in LP
 	 * keeps decoding with the 0x70 snapshot while the encoder runs the
 	 * generated one -- a per-slice mismatch that starts on the first line.
-	 * m2582.features=ppslp restores the low-power send for an A/B.
 	 */
-	if (m2582_feature_opt_in("ppslp"))
-		msg.flags = MIPI_DSI_MSG_USE_LPM;
 
 	if (!ctx->dsi->host->ops->transfer)
 		return -EOPNOTSUPP;
 
-	/* m2582.features=nodsc: the DDIC must stay on its uncompressed path */
-	if (m2582_feature_opt_in("nodsc"))
-		return 0;
 
-	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
-	/* m2582.features=ppsv11: version byte only, model untouched */
-	pps.dsc_version = m2582_pps_ver(pps.dsc_version);
+	m2582_pack_pps(&pps, &ctx->dsc);
 	/* warns if the model being sent is not the factory's 600x30 8bpp one */
 	m2582_verify_pps(ctx);
 
@@ -1361,7 +1363,9 @@ static int m2582_backlight_update(struct backlight_device *bl)
  * TE, so only the mode name matters -- prepare() reads it for the rate.
  */
 static const struct drm_display_mode m2582_mode_90 = {
-	.clock = 627126,
+	/* nominal refresh, like m2582_mode below: 90 * 1244 * 3648 is the same
+	 * pixel product as 120 * 1244 * 2736, so one clock value covers both. */
+	.clock = 408430,
 	.hdisplay = 1200,
 	.hsync_start = 1220,
 	.hsync_end = 1224,
@@ -1376,14 +1380,25 @@ static const struct drm_display_mode m2582_mode_90 = {
 
 static const struct drm_display_mode m2582_mode = {
 	/*
-	 * The pixel clock sets the DSI link rate and must cover the panel's own
-	 * bandwidth: 1200 * 2670 * 120 Hz at 8 bpp (DSC) over four lanes is
-	 * 769 Mbps per lane. The factory panel node declares
-	 * qcom,mdss-dsi-panel-clockrate = 0x419fed40; worked back through this
-	 * driver's clock chain that gives the value below. The visible timings
-	 * are unchanged.
+	 * .clock is the panel's nominal refresh rate, not the DSI link clock.
+	 *
+	 * drm_mode_vrefresh() divides .clock by htotal*vtotal, and that is the
+	 * only number userspace sees as "the refresh rate".  msm_dsi used to
+	 * take the link rate from the same field, which is why both of this
+	 * panel's modes reported ~184 Hz / ~138 Hz for years: the field had to
+	 * carry the synthetic 627.126 MHz that produced the right DSI byte clock
+	 * (137.625 MHz), and 627.126 MHz over 1244x2736 is 184.26 Hz, not 120.
+	 *
+	 * The factory declares the two things separately --
+	 * qcom,mdss-dsi-panel-clockrate = 0x419fed40 for the PHY and
+	 * qcom,mdss-dsi-panel-framerate = 120 for the panel -- so they are split
+	 * here the same way: this field now carries the rate, and dsi_host.c
+	 * takes the link clock from the DT property above.
+	 *
+	 * 120 * 1244 * 2736 == 90 * 1244 * 3648 == 408430080, so one clock value
+	 * describes both modes exactly.
 	 */
-	.clock = 627126,
+	.clock = 408430,
 	.hdisplay = 1200,
 	.hsync_start = 1220,
 	.hsync_end = 1224,
@@ -1424,16 +1439,34 @@ static int m2582_prepare(struct drm_panel *panel)
 	}
 	ctx->powered = true;
 
+
 	/*
 	 * The factory's reset sequence, from the panel node's
 	 * qcom,mdss-dsi-reset-sequence <1 5 0 5 1 26>: 5/5/26 ms, active low.
+	 *
+	 * m2582.features=panelnoreset drops just the panel reset pulse.
+	 * The legacy noreset also skips the MDSS reset; use panelnoreset to
+	 * distinguish DDIC state inheritance from DPU state inheritance.
+	 * m2582.features=panelskip drops
+	 * the pulse *and* the whole power-on table + PPS below, i.e. the DDIC is
+	 * left exactly as the bootloader (DisplayDxe) programmed it.  The vendor
+	 * stack never resets this panel on a normal boot: Android inherits the
+	 * bootloader's DDIC state through the continuous-splash handoff, while
+	 * this driver starts from a hard reset and replays the table.  Anything
+	 * the bootloader writes that is not part of the 107-packet table (the
+	 * 0x70 PPS snapshot is part of it -- the bootloader's own XML ends with
+	 * the same three packets) therefore survives on Android and is lost here.
 	 */
-	gpiod_set_value_cansleep(ctx->reset, 0);
-	msleep(5);
-	gpiod_set_value_cansleep(ctx->reset, 1);
-	msleep(5);
-	gpiod_set_value_cansleep(ctx->reset, 0);
-	msleep(26);
+	if (!m2582_feature_opt_in("panelskip") &&
+	    !m2582_feature_opt_in("noreset") &&
+	    !m2582_feature_opt_in("panelnoreset")) {
+		gpiod_set_value_cansleep(ctx->reset, 0);
+		msleep(5);
+		gpiod_set_value_cansleep(ctx->reset, 1);
+		msleep(5);
+		gpiod_set_value_cansleep(ctx->reset, 0);
+		msleep(26);
+	}
 
 	/*
 	 * m2582.features=flbo15 keeps first_line_bpg_offset at 15 while nfl,
@@ -1441,8 +1474,7 @@ static int m2582_prepare(struct drm_panel *panel)
 	 * encoder whose own rate-control model is not self-consistent -- the
 	 * state the old table override produced.
 	 */
-	if (m2582_feature_opt_in("flbo15"))
-		ctx->dsc_flbo_raw = 15;
+
 
 	/*
 	 * m2582.features=flbo15full pins the same budget but re-derives the
@@ -1450,10 +1482,7 @@ static int m2582_prepare(struct drm_panel *panel)
 	 * 689), so the model the encoder runs and the one the PPS describes
 	 * stay equal.
 	 */
-	if (m2582_feature_opt_in("flbo15full")) {
-		ctx->dsc_flbo_pin = 15;
-		ctx->dsc_override = true;
-	}
+
 
 	/*
 	 * Block prediction off (m2582.features=nobp).  There is only one
@@ -1463,29 +1492,27 @@ static int m2582_prepare(struct drm_panel *panel)
 	 * the same field.  The encoder's registers only follow at the next
 	 * commit, because dsc_config() runs only when the encoder is dirty.
 	 */
-	if (m2582_feature_opt_in("nobp"))
-		ctx->dsc.block_pred_enable = false;
+
 
 	/* the DSI host has re-derived the model for this modeset by now */
 	m2582_dsc_apply_pin(ctx);
 
-	ret = m2582_send(ctx, m2582_on_cmds, ARRAY_SIZE(m2582_on_cmds));
+	m2582_patch_pps_version();
+
+	/* m2582.features=panelskip: keep the bootloader's DDIC programming */
+	ret = m2582_feature_opt_in("panelskip") ? 0 :
+	      m2582_send(ctx, m2582_on_cmds, ARRAY_SIZE(m2582_on_cmds));
 
 	/*
 	 * The generated PPS, where the factory sends it: after the whole power-on
 	 * set and before anything else (dsi_display_enable() calls
 	 * dsi_panel_update_pps() immediately after dsi_panel_enable() returns).
-	 * On by default -- see m2582_send_pps0a().  m2582.features=ppslate puts
-	 * it after the settle instead, which is where this driver used to send
-	 * it; that 300 ms gap is the A/B for "does the panel latch its decoder
-	 * model at display-on or only when the engine starts".
-	 *
 	 * A negative return is the only failure the transport can report: it
 	 * returns the size of its DMA buffer rather than the payload length
 	 * (dsi_cmds2buf_tx), so a "0" is no evidence of delivery either.
 	 */
 	pps_ret = 0;
-	if (!ret && m2582_send_pps0a() && !m2582_feature_opt_in("ppslate")) {
+	if (!ret) {
 		pps_ret = m2582_send_pps_packet(ctx);
 		if (pps_ret < 0)
 			dev_err(ctx->dev, "early PPS packet failed: %d\n",
@@ -1499,33 +1526,6 @@ static int m2582_prepare(struct drm_panel *panel)
 		 * boots read back 0x0c instead of 0x9c).
 		 */
 		msleep(300);
-
-		/*
-		 * m2582.features=ppslate: the old placement, after the settle.
-		 * Only useful as the A/B for "does the panel latch its decoder
-		 * model at display-on"; the default sends it before the settle.
-		 */
-		if (m2582_send_pps0a() &&
-		    m2582_feature_opt_in("ppslate")) {
-			pps_ret = m2582_send_pps_packet(ctx);
-
-			if (pps_ret < 0)
-				dev_err(ctx->dev,
-					"PPS packet failed: %d\n", pps_ret);
-		}
-
-		/*
-		 * m2582.features=vendorpanel: stop here, exactly where the factory's
-		 * dsi_display_enable() stops.  Its enable path sends the on-command
-		 * list and then the MIPI PPS and nothing else; every floor/adfr/
-		 * tear-on packet this driver adds is event-driven on the factory side
-		 * (backlight or minfps change), not part of the mode set.  Skipping
-		 * them here leaves the DDIC in the state the factory's kernel leaves
-		 * it in after a mode set, which is the only way to A/B "the extra
-		 * panel traffic" as a single variable.
-		 */
-		if (m2582_feature_opt_in("vendorpanel"))
-			goto out_unlock;
 
 		/*
 		 * The rate a modeset asks for is the one its mode carries: the
@@ -1545,7 +1545,15 @@ static int m2582_prepare(struct drm_panel *panel)
 				ctx->req_hz = 120;
 		}
 
-		mipi_dsi_dcs_set_tear_on(ctx->dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+		/*
+		 * The ON set already enables TE and selects the 120 Hz family.
+		 * Match the factory enable sequence; apply a timing/floor change
+		 * only when the requested mode or adaptive-refresh policy needs it.
+		 */
+		if (!ctx->ltpo_enabled && ctx->req_hz == 120)
+			goto out_unlock;
+
+
 		/*
 		 * Without adaptive refresh the floor stays at 30 Hz and
 		 * set_rate() also turns ADFR off; with it, the floor is the one
@@ -1563,20 +1571,15 @@ static int m2582_prepare(struct drm_panel *panel)
 	}
 
 	/*
-	 * m2582.features=ppslast: make the PPS the last thing the DDIC hears.
-	 * The factory's enable path ends with its PPS packet, while ours then
-	 * sends the rate/floor/adfr/tear-on set.  If the decoder latches its
-	 * model from the last PPS of a mode set, that ordering difference alone
-	 * would explain why the two carriers disagree about nfl/flbo here but
-	 * not on the factory's side.
+	 * m2582.features=dcsprobe: ask the DDIC a question before the SoC starts
+	 * pushing frames.  Nothing else in this driver reads from the panel, so
+	 * this is the window where a read cannot collide with the command
+	 * stream -- the same window the factory's own reg_read health check
+	 * runs in.
 	 */
-	if (m2582_feature_opt_in("ppslast") && !m2582_feature_opt_out("pps0a")) {
-		int again = m2582_send_pps_packet(ctx);
 
-		if (again < 0)
-			dev_err(ctx->dev, "trailing PPS failed: %d\n",
-				again);
-	}
+
+
 
 	/*
 	 * The power-on path stops where the factory bootloader's does: no page exit,
@@ -1633,26 +1636,6 @@ static int m2582_get_modes(struct drm_panel *panel, struct drm_connector *connec
 	mode = drm_mode_duplicate(connector->dev, &m2582_mode);
 	if (!mode)
 		return -ENOMEM;
-	/*
-	 * Uncompressed, the mode clock is the real pixel clock: 1200 pixels at
-	 * 24 bpp is 3600 bytes per line, the link the PHY already runs is four
-	 * lanes at 550.5 MB/s, so the pixel clock is 183.5 MHz (byte_clk * 4 / 3,
-	 * the same divider the compressed path uses).
-	 *
-	 * Blanking is what has to change.  With the panel's own 44-pixel hblank
-	 * a line spends 6.5 of its 6.8 us on payload, leaving no room for the
-	 * command engine's per-packet overhead ("DSI: cmd dma done timeout").
-	 * Widening hblank to 2400 pixels gives 15.2 Hz, which costs nothing: a
-	 * command-mode panel scans its own frame memory and simply underruns
-	 * while the host fills it.
-	 */
-	if (m2582_feature_opt_in("nodsc")) {
-		mode->clock = 183500;
-		mode->hsync_start = 4380;
-		mode->hsync_end = 4384;
-		mode->htotal = 4400;
-	}
-	drm_mode_set_name(mode);
 	mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
 	strscpy(mode->name, "1200x2670-120", sizeof(mode->name));
 	connector->display_info.width_mm = mode->width_mm;
@@ -1680,6 +1663,180 @@ static const struct drm_panel_funcs m2582_panel_funcs = {
 };
 
 static const struct backlight_ops m2582_bl_ops = { .update_status = m2582_backlight_update };
+
+/*
+ * m2582: raw access to the DDIC's own command set.
+ *
+ * The panel has no host-visible address space; everything goes through DCS, and
+ * the factory pages (0xaa10, 0xaa12, ...) are an index/data pair on top of it:
+ * 0xf0 0xaa <page> selects the page, 0x65 <index> the register, and 0xcf carries
+ * the byte -- the power-on table writes exactly that way.  Reading the pair back
+ * is what turns "the sequence was sent" into "the DDIC holds this value", so a
+ * claim about the panel's configuration can be checked instead of assumed.
+ *
+ *   w <b0> <b1> ...        one DCS write: 1-2 bytes short, 3+ long
+ *   r <cmd> <len>          DCS read, len 1..10
+ *   g <page> <idx> <len>   read len bytes at <page>/<idx>
+ *   s <page> <idx> <byte>  write one byte at <page>/<idx>
+ *   d <page> <idx> <count> read count consecutive indices, 16 per line
+ */
+#define M2582_DCS_MAX	256
+/* one DCS read answers a single payload, i.e. ten bytes */
+#define M2582_DCS_RD	10
+
+static int m2582_dcs_page_get(struct m2582_panel *ctx, u8 page, u8 idx,
+			      u8 *buf, size_t len)
+{
+	u8 sel[3] = { 0xf0, 0xaa, page };
+	u8 at[2] = { 0x65, idx };
+	int ret;
+
+	ret = mipi_dsi_dcs_write_buffer(ctx->dsi, sel, sizeof(sel));
+	if (ret < 0)
+		return ret;
+	ret = mipi_dsi_dcs_write_buffer(ctx->dsi, at, sizeof(at));
+	if (ret < 0)
+		return ret;
+
+	return mipi_dsi_dcs_read(ctx->dsi, 0xcf, buf, len);
+}
+
+static int m2582_dcs_page_set(struct m2582_panel *ctx, u8 page, u8 idx, u8 val)
+{
+	u8 sel[3] = { 0xf0, 0xaa, page };
+	u8 at[2] = { 0x65, idx };
+	u8 wr[2] = { 0xcf, val };
+	int ret;
+
+	ret = mipi_dsi_dcs_write_buffer(ctx->dsi, sel, sizeof(sel));
+	if (ret < 0)
+		return ret;
+	ret = mipi_dsi_dcs_write_buffer(ctx->dsi, at, sizeof(at));
+	if (ret < 0)
+		return ret;
+
+	return mipi_dsi_dcs_write_buffer(ctx->dsi, wr, sizeof(wr));
+}
+
+static ssize_t m2582_dcs_write(struct file *f, const char __user *ubuf,
+			       size_t len, loff_t *off)
+{
+	struct m2582_panel *ctx = file_inode(f)->i_private;
+	char buf[M2582_DCS_MAX + 32];
+	char *p, *cur, *tok;
+	unsigned int page, idx, arg, i;
+	u8 data[M2582_DCS_MAX], rx[M2582_DCS_RD];
+	int ret = 0, n = 0;
+
+	if (!ctx->powered)
+		return -ENODEV;
+	if (len == 0 || len >= sizeof(buf) - 1)
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+
+	p = strim(buf);
+	if (!*p)
+		return -EINVAL;
+	cur = p + 1;
+
+	mutex_lock(&ctx->lock);
+	switch (*p) {
+	case 'w':
+		while ((tok = strsep(&cur, " \t")) && n < M2582_DCS_MAX) {
+			u8 byte;
+
+			if (!*tok)
+				continue;
+			if (kstrtou8(tok, 16, &byte)) {
+				ret = -EINVAL;
+				break;
+			}
+			data[n++] = byte;
+		}
+		if (!ret && n) {
+			ret = mipi_dsi_dcs_write_buffer(ctx->dsi, data, n);
+			if (ret < 0)
+				pr_err("m2582-panel: dcs w failed %d\n", ret);
+			else
+				pr_info("m2582-panel: dcs w %d -> %*ph\n", n, n, data);
+		}
+		break;
+	case 'r':
+		if (sscanf(cur, "%x %u", &page, &arg) != 2 || !arg ||
+		    arg > M2582_DCS_RD) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = mipi_dsi_dcs_read(ctx->dsi, page, rx, arg);
+		if (ret < 0)
+			pr_err("m2582-panel: dcs r %02x failed %d\n", page, ret);
+		else
+			pr_info("m2582-panel: dcs r %02x -> %*ph\n", page, ret, rx);
+		break;
+	case 'g':
+		if (sscanf(cur, "%x %x %u", &page, &idx, &arg) != 3 || !arg ||
+		    arg > M2582_DCS_RD) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = m2582_dcs_page_get(ctx, page, idx, rx, arg);
+		if (ret < 0)
+			pr_err("m2582-panel: page %02x[%02x] read failed %d\n",
+			       page, idx, ret);
+		else
+			pr_info("m2582-panel: page %02x[%02x] -> %*ph\n",
+				page, idx, ret, rx);
+		break;
+	case 's':
+		if (sscanf(cur, "%x %x %x", &page, &idx, &arg) != 3) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = m2582_dcs_page_set(ctx, page, idx, arg);
+		if (ret < 0)
+			pr_err("m2582-panel: page %02x[%02x] write failed %d\n",
+			       page, idx, ret);
+		else
+			pr_info("m2582-panel: page %02x[%02x] = %02x\n",
+				page, idx, arg);
+		break;
+	case 'd':
+		if (sscanf(cur, "%x %x %u", &page, &idx, &arg) != 3 || !arg ||
+		    arg > M2582_DCS_MAX || idx + arg > M2582_DCS_MAX) {
+			ret = -EINVAL;
+			break;
+		}
+		for (i = 0; i < arg; i++) {
+			ret = m2582_dcs_page_get(ctx, page, idx + i, &data[i], 1);
+			if (ret < 0) {
+				pr_err("m2582-panel: page %02x[%02x] read failed %d\n",
+				       page, idx + i, ret);
+				break;
+			}
+		}
+		if (ret < 0)
+			break;
+		for (i = 0; i < arg; i += 16) {
+			unsigned int chunk = min_t(unsigned int, 16, arg - i);
+
+			pr_info("m2582-panel: page %02x[%02x] %*ph\n",
+				page, idx + i, chunk, &data[i]);
+		}
+		break;
+	default:
+		ret = -EINVAL;
+	}
+	mutex_unlock(&ctx->lock);
+
+	return ret < 0 ? ret : len;
+}
+
+static const struct file_operations m2582_dcs_fops = {
+	.write = m2582_dcs_write,
+	.llseek = noop_llseek,
+};
 
 static int m2582_probe(struct mipi_dsi_device *dsi)
 {
@@ -1739,43 +1896,22 @@ static int m2582_probe(struct mipi_dsi_device *dsi)
 	 * 10 bpp anywhere in the factory register set.
 	 */
 	ctx->dsc.dsc_version_major = 1;
-	/* DSC 1.1, like the factory: this panel's device-tree node has no
-	 * qcom,mdss-dsc-version, and vendor dsi_panel.c defaults that to 1.1.
-	 * The PPS this driver sends must carry the same version the encoder
-	 * advertises, or the two models disagree by construction.
-	 * m2582.features=dsc12 is the opt-out for a controlled A/B; see
-	 * dsi_populate_dsc_params() for the evidence.  Both arms assign: the
-	 * struct is zeroed, so the default is otherwise DSC 1.0. */
-	ctx->dsc.dsc_version_minor = m2582_feature_opt_in("dsc12") ? 2 : 1;
-	/*
-	 * sh15 / sh89 make the slice 15 or 89 lines tall instead of 30.  The
-	 * height has to divide the 2670-line picture (2670 = 2*3*5*89), which is
-	 * why 20 and 40 are rejected by dsi_populate_dsc_params() ("pic_height
-	 * 2670 has to be multiple of slice 20", after which panel init fails and
-	 * even the backlight write returns -EINVAL).  sh15 is the safe arm: a
-	 * shorter slice needs less of the DDIC's line buffer, not more.
+	/* DSC 1.2, like the factory: the vendor encoder's own
+	 * DSC_MAIN_CONF[31:28] reads 1.2 and this panel's 0x70 payload starts
+	 * with 0x12.  The PPS this driver sends must carry the same version the
+	 * encoder advertises, or the two models disagree by construction.
+	 * m2582.features=dsc11 is the opt-out for a controlled A/B.  Both arms
+	 * assign: the struct is zeroed, so the default is otherwise DSC 1.0. */
+	ctx->dsc.dsc_version_minor = m2582_feature_opt_in("dsc11") ? 1 : 2;
+	/* The factory geometry, byte for byte: 1200x2670, 10 bpc in, 8 bpp on the
+	 * wire, two 600x30 slices of 600 bytes each.  See m2582_verify_pps().
 	 */
-	if (m2582_feature_opt_in("sh15"))
-		ctx->dsc.slice_height = 15;
-	else if (m2582_feature_opt_in("sh89"))
-		ctx->dsc.slice_height = 89;
-	else
-		ctx->dsc.slice_height = 30;
-	/* The factory geometry: two 600-pixel DSC slices per line. */
+	ctx->dsc.slice_height = 30;
 	ctx->dsc.slice_count = 2;
 	ctx->dsc.slice_width = 1200 / ctx->dsc.slice_count;
 	ctx->dsc.bits_per_component = 10;
 	ctx->dsc.bits_per_pixel = 8 << 4;
-	/*
-	 * m2582.features=bpp10: the factory node asks for 8 bpp on a 10 bpc
-	 * 4:4:4 source, which is 3.75:1, above the 3:1 the DSC specification
-	 * allows; this arm runs the same geometry at 10 bpp (3:1, chunk 750) so
-	 * the only difference from the default image is how many bits a slice
-	 * line gets.  dsi_populate_dsc_params() derives the chunk size and the
-	 * model from this field, so the DSI framing follows along.
-	 */
-	if (m2582_feature_opt_in("bpp10"))
-		ctx->dsc.bits_per_pixel = 10 << 4;
+
 	/*
 	 * The factory panel node sets qcom,mdss-dsc-block-prediction-enable, so
 	 * block prediction is on: sde_dsc_populate_dsc_config() leaves the field
@@ -1784,33 +1920,22 @@ static int m2582_probe(struct mipi_dsi_device *dsi)
 	ctx->dsc.block_pred_enable = true;
 	ctx->dsc.first_line_bpg_offset = 0;
 	/*
-	 * No first-line pin by default: with DSC 1.1 the model
-	 * dsi_populate_dsc_params() derives is the factory's own (budget 12, and
+	 * No first-line pin by default: the model dsi_populate_dsc_params()
+	 * derives is the factory's rule (budget 13 at a 30-row slice, and
 	 * nfl/dec/scale_increment from the shared formula).  Pinning a larger
 	 * budget hides an encoder/decoder mismatch at the cost of coarser
 	 * quantisation on lines 2..30, so it stays an opt-in arm
 	 * (m2582.features=flbo15full).
 	 */
 	ctx->dsc_flbo_pin = 0;
-	/*
-	 * m2582.features=nodsc: leave the panel uncompressed.
-	 *
-	 * The bootloader drives this panel without DSC, so the panel, the DSI PHY
-	 * and the four lanes are known to carry a picture with no compression in
-	 * the path.  Not handing the DSC config to the DSI host makes the whole
-	 * compressed path disappear: msm_dsi_host keeps dsc == NULL, the DPU
-	 * encoder gets no DSC either (no DCE blocks, no SPLIT_PANEL/MULTIPLEX
-	 * wrapper bits, wide bus off), the DSI controller stays in plain 24 bpp
-	 * command mode and neither PPS packet is sent.
-	 */
-	if (!m2582_feature_opt_in("nodsc"))
-		dsi->dsc = &ctx->dsc;
+	dsi->dsc = &ctx->dsc;
 	/*
 	 * The power-on sequence must travel over a live DSI link, so the panel has
 	 * to be prepared after the DSI host is powered on; prepare_prev_first
 	 * flips the bridge walk to that order.
 	 */
 	ctx->panel.prepare_prev_first = true;
+
 	ctx->panel.backlight = devm_backlight_device_register(dev, dev_name(dev), dev, dsi, &m2582_bl_ops, &props);
 	if (IS_ERR(ctx->panel.backlight))
 		return PTR_ERR(ctx->panel.backlight);
@@ -1835,6 +1960,7 @@ static int m2582_probe(struct mipi_dsi_device *dsi)
 
 	ret = mipi_dsi_attach(dsi);
 	if (ret) {
+		debugfs_remove_recursive(ctx->debugfs);
 		drm_panel_remove(&ctx->panel);
 		return ret;
 	}
@@ -1846,6 +1972,8 @@ static void m2582_remove(struct mipi_dsi_device *dsi)
 {
 	struct m2582_panel *ctx = mipi_dsi_get_drvdata(dsi);
 
+	debugfs_remove_recursive(ctx->debugfs);
+	ctx->debugfs = NULL;
 	mipi_dsi_detach(dsi);
 	drm_panel_remove(&ctx->panel);
 }
