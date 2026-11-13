@@ -218,7 +218,7 @@ static int gdsc_toggle_logic(struct gdsc *sc, enum gdsc_status status,
 	 */
 	if ((sc->flags & POLL_CFG_GDSCR) &&
 	    !(sc->pd.name && !strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc") &&
-	      m2582_feature_opt_in("gdscpoll"))) {
+	      false)) {
 		udelay(50);
 		ret = 0;
 	} else {
@@ -350,7 +350,7 @@ static bool m2582_gdsc_vendor_order(struct gdsc *sc)
 {
 	return sc->pd.name &&
 		!strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc") &&
-		m2582_feature_opt_in("gdscvendororder");
+		false;
 }
 
 static void m2582_gdsc_cycle_state(struct gdsc *sc, const char *where)
@@ -358,8 +358,7 @@ static void m2582_gdsc_cycle_state(struct gdsc *sc, const char *where)
 	u32 gdscr, cfg;
 	int ret;
 
-	if (!sc->pd.name || strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc") ||
-	    !m2582_feature_opt_in("mdsscycle"))
+	if (!sc->pd.name || strcmp(sc->pd.name, "disp_cc_mdss_core_gdsc"))
 		return;
 	ret = regmap_read(sc->regmap, sc->gdscr, &gdscr);
 	if (!ret)
@@ -807,7 +806,7 @@ int gdsc_register(struct gdsc_desc *desc,
 		data->domains[i] = &scs[i]->pd;
 		if (scs[i]->pd.name &&
 		    !strcmp(scs[i]->pd.name, "disp_cc_mdss_core_gdsc") &&
-		    m2582_feature_opt_in("mdsscycle")) {
+		    false) {
 			struct dentry *entry;
 
 			entry = debugfs_create_file("m2582_gdsc_state", 0400, NULL,
