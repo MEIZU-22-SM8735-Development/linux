@@ -58,201 +58,11 @@ struct msm_mdss {
 static int msm_mdss_reset(struct device *dev);
 static int msm_mdss_disable(struct msm_mdss *msm_mdss);
 
-static int m2582_mdss_child_idle(struct device *child, void *unused)
-{
-	return pm_runtime_suspended(child) ? 0 : -EBUSY;
-}
-
-static int m2582_mdss_cycle_get(void *arg, u64 *value)
-{
-	struct msm_mdss *mdss = arg;
-
-	*value = mdss->probe_cycles;
-	return 0;
-}
-
-/* Drop and restore only the reference held by mdss_probe(), with idle children. */
-static int m2582_mdss_cycle_set(void *arg, u64 value)
-{
-	struct msm_mdss *mdss = arg;
-	struct device *dev = mdss->dev;
-	int ret, resume_ret;
-
-	if (value != 1)
-		return -EINVAL;
-	mutex_lock(&mdss->probe_lock);
-	if (!pm_runtime_active(dev) ||
-	    atomic_read(&dev->power.usage_count) != 1 ||
-	    atomic_read(&dev->power.child_count) ||
-	    device_for_each_child(dev, NULL, m2582_mdss_child_idle)) {
-		ret = -EBUSY;
-		goto out;
-	}
-
-	ret = pm_runtime_put_sync_suspend(dev);
-	dev_info(dev, "m2582-mdss-cycle: suspend=%d suspended=%u usage=%d kids=%d\n",
-		 ret, pm_runtime_suspended(dev),
-		 atomic_read(&dev->power.usage_count),
-		 atomic_read(&dev->power.child_count));
-	resume_ret = pm_runtime_resume_and_get(dev);
-	if (resume_ret < 0) {
-		/* resume_and_get() drops its reference on failure. Restore our pin. */
-		pm_runtime_get_noresume(dev);
-		ret = resume_ret;
-	} else if (ret >= 0) {
-		mdss->probe_cycles++;
-		ret = 0;
-	}
-	dev_info(dev, "m2582-mdss-cycle: resume=%d active=%u usage=%d kids=%d cycles=%u\n",
-		 resume_ret, pm_runtime_active(dev),
-		 atomic_read(&dev->power.usage_count),
-		 atomic_read(&dev->power.child_count), mdss->probe_cycles);
-out:
-	mutex_unlock(&mdss->probe_lock);
-	return ret;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(m2582_mdss_cycle_fops, m2582_mdss_cycle_get,
-			 m2582_mdss_cycle_set, "%llu\n");
-
-/* M2582 diagnostics: only access the owner's mapping while already active. */
-static int m2582_mdss_state_show(struct seq_file *s, void *unused)
-{
-	struct msm_mdss *mdss = s->private;
-	int ret = pm_runtime_get_if_active(mdss->dev);
-
-	if (ret <= 0)
-		return ret ? ret : -EAGAIN;
-	mutex_lock(&mdss->probe_lock);
-	seq_printf(s, "hw=%08x dec=%08x static=%08x ctrl2=%08x pred=%08x saved=%u\n",
-		readl_relaxed(mdss->mmio + REG_MDSS_HW_VERSION),
-		readl_relaxed(mdss->mmio + REG_MDSS_UBWC_DEC_HW_VERSION),
-		readl_relaxed(mdss->mmio + REG_MDSS_UBWC_STATIC),
-		readl_relaxed(mdss->mmio + REG_MDSS_UBWC_CTRL_2),
-		readl_relaxed(mdss->mmio + REG_MDSS_UBWC_PREDICTION_MODE),
-		mdss->probe_static_saved);
-	mutex_unlock(&mdss->probe_lock);
-	pm_runtime_put(mdss->dev);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(m2582_mdss_state);
-
-/*
- * M2582: full read-only dump of the MDSS top register block (0x0..0x1ff).
- * Only the five words in m2582_mdss_state have ever been compared against the
- * factory, and the factory's register snapshots carry further configured words
- * inside this window (0x5c, 0x84) that nothing here has verified.
- */
-static int m2582_mdss_dump_show(struct seq_file *s, void *unused)
-{
-	struct msm_mdss *mdss = s->private;
-	u32 off;
-	int ret = pm_runtime_get_if_active(mdss->dev);
-
-	if (ret <= 0)
-		return ret ? ret : -EAGAIN;
-	for (off = 0; off < 0x200; off += 16)
-		seq_printf(s, "0x%08x: %08x %08x %08x %08x\n", off,
-			   readl_relaxed(mdss->mmio + off + 0x0),
-			   readl_relaxed(mdss->mmio + off + 0x4),
-			   readl_relaxed(mdss->mmio + off + 0x8),
-			   readl_relaxed(mdss->mmio + off + 0xc));
-	pm_runtime_put(mdss->dev);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(m2582_mdss_dump);
-
-static int m2582_mdss_static_get(void *arg, u64 *value)
-{
-	struct msm_mdss *mdss = arg;
-	int ret = pm_runtime_get_if_active(mdss->dev);
-
-	if (ret <= 0)
-		return ret ? ret : -EAGAIN;
-	mutex_lock(&mdss->probe_lock);
-	*value = readl_relaxed(mdss->mmio + REG_MDSS_UBWC_STATIC);
-	mutex_unlock(&mdss->probe_lock);
-	pm_runtime_put(mdss->dev);
-	return 0;
-}
-
-static int m2582_mdss_static_set(void *arg, u64 value)
-{
-	struct msm_mdss *mdss = arg;
-	u32 target;
-	int ret;
-
-	/* Factory baseline, one-field controls, or exact saved-value restore. */
-	switch (value) {
-	case 0x103e:
-	case 0x003e:
-	case 0x1038:
-	case 0x100e:
-	case 0x113e:
-	case U32_MAX:
-		break;
-	default:
-		return -EINVAL;
-	}
-	ret = pm_runtime_get_if_active(mdss->dev);
-	if (ret <= 0)
-		return ret ? ret : -EAGAIN;
-	mutex_lock(&mdss->probe_lock);
-	if (value == U32_MAX) {
-		if (!mdss->probe_static_saved)
-			goto out;
-		target = mdss->probe_saved_static;
-	} else {
-		if (!mdss->probe_static_saved) {
-			mdss->probe_saved_static = readl_relaxed(mdss->mmio + REG_MDSS_UBWC_STATIC);
-			mdss->probe_static_saved = true;
-		}
-		target = value;
-	}
-	writel_relaxed(target, mdss->mmio + REG_MDSS_UBWC_STATIC);
-	if (readl_relaxed(mdss->mmio + REG_MDSS_UBWC_STATIC) != target)
-		ret = -EIO;
-	else if (value == U32_MAX)
-		mdss->probe_static_saved = false;
-out:
-	mutex_unlock(&mdss->probe_lock);
-	pm_runtime_put(mdss->dev);
-	return ret < 0 ? ret : 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(m2582_mdss_static_fops, m2582_mdss_static_get,
-			 m2582_mdss_static_set, "0x%08llx\n");
-
-static void m2582_mdss_debug_remove(void *arg)
-{
-	debugfs_remove(arg);
-}
-
 static void m2582_mdss_debug_init(struct msm_mdss *mdss)
 {
-	struct dentry *entry;
-
 	if (mdss->is_mdp5 || !mdss->mdss_data)
 		return;
 	mutex_init(&mdss->probe_lock);
-	if (m2582_feature_opt_in("mdsscycle")) {
-		entry = debugfs_create_file("m2582_mdss_cycle", 0600, NULL, mdss,
-					    &m2582_mdss_cycle_fops);
-		if (!IS_ERR_OR_NULL(entry))
-			devm_add_action_or_reset(mdss->dev, m2582_mdss_debug_remove, entry);
-	}
-	if (!m2582_feature_opt_in("mdssprobe"))
-		return;
-	entry = debugfs_create_file("m2582_mdss_state", 0400, NULL, mdss,
-				    &m2582_mdss_state_fops);
-	if (!IS_ERR_OR_NULL(entry))
-		devm_add_action_or_reset(mdss->dev, m2582_mdss_debug_remove, entry);
-	entry = debugfs_create_file("m2582_mdss_static", 0600, NULL, mdss,
-				    &m2582_mdss_static_fops);
-	if (!IS_ERR_OR_NULL(entry))
-		devm_add_action_or_reset(mdss->dev, m2582_mdss_debug_remove, entry);
-	entry = debugfs_create_file("m2582_mdss_dump", 0400, NULL, mdss,
-				    &m2582_mdss_dump_fops);
-	if (!IS_ERR_OR_NULL(entry))
-		devm_add_action_or_reset(mdss->dev, m2582_mdss_debug_remove, entry);
 }
 
 static int msm_mdss_parse_data_bus_icc_path(struct device *dev,
@@ -551,7 +361,7 @@ static int msm_mdss_reset(struct device *dev)
 	 * reset; the legacy noreset also skips the panel's reset pulse.
 	 */
 	if (!m2582_feature_opt_in("noreset") &&
-	    !m2582_feature_opt_in("mdssnoreset")) {
+	    true) {
 		reset_control_assert(reset);
 		/*
 		 * Tests indicate that reset has to be held for some period of
@@ -601,8 +411,8 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
 	const struct msm_mdss_data *mdss_data;
 	struct msm_mdss *msm_mdss;
 	bool reset_on_resume = of_device_is_compatible(pdev->dev.of_node, "qcom,tuna-mdss") &&
-			       m2582_feature_opt_in("mdsspm") &&
-			       m2582_feature_opt_in("mdssresetresume");
+			       !m2582_feature_opt_out("mdsspm") &&
+			       !m2582_feature_opt_out("mdssresetresume");
 	int ret;
 	int irq;
 
@@ -712,7 +522,7 @@ static int mdss_probe(struct platform_device *pdev)
 	bool is_mdp5 = of_device_is_compatible(pdev->dev.of_node, "qcom,mdss");
 	struct device *dev = &pdev->dev;
 	bool runtime_pm = of_device_is_compatible(dev->of_node, "qcom,tuna-mdss") &&
-			  m2582_feature_opt_in("mdsspm");
+			  !m2582_feature_opt_out("mdsspm");
 	int ret;
 
 	mdss = msm_mdss_init(pdev, is_mdp5);
@@ -740,7 +550,7 @@ static int mdss_probe(struct platform_device *pdev)
 	 */
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
 	if (runtime_pm) {
-		if (!m2582_feature_opt_in("mdsscyclebind")) {
+		if (true) {
 			pm_runtime_put_sync(dev);
 			dev_info(dev, "m2582-mdss-pm: released probe reference; usage=%d kids=%d suspended=%u\n",
 				 atomic_read(&dev->power.usage_count),
