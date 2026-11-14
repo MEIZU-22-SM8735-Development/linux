@@ -8,6 +8,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/extcon-provider.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -31,9 +32,17 @@
 #define EUD_INT_SAFE_MODE	BIT(4)
 #define EUD_INT_ALL		(EUD_INT_VBUS | EUD_INT_SAFE_MODE)
 
+static const unsigned int eud_extcon_cables[] = {
+	EXTCON_USB,
+	EXTCON_CHG_USB_SDP,
+	EXTCON_JIG,
+	EXTCON_NONE,
+};
+
 struct eud_chip {
 	struct device			*dev;
 	struct usb_role_switch		*role_sw;
+	struct extcon_dev		*extcon;
 	void __iomem			*base;
 	phys_addr_t			mode_mgr;
 	unsigned int			int_status;
@@ -41,6 +50,16 @@ struct eud_chip {
 	bool				enabled;
 	bool				usb_attached;
 };
+
+static bool eud_hw_enabled(struct eud_chip *priv)
+{
+	u32 value;
+
+	if (qcom_scm_io_readl(priv->mode_mgr + EUD_REG_EUD_EN2, &value))
+		return false;
+
+	return value & EUD_ENABLE;
+}
 
 static int enable_eud(struct eud_chip *priv)
 {
@@ -53,6 +72,8 @@ static int enable_eud(struct eud_chip *priv)
 	writel(EUD_ENABLE, priv->base + EUD_REG_CSR_EUD_EN);
 	writel(EUD_INT_VBUS | EUD_INT_SAFE_MODE,
 			priv->base + EUD_REG_INT1_EN_MASK);
+	extcon_set_state_sync(priv->extcon, EXTCON_USB, true);
+	extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_SDP, true);
 
 	return usb_role_switch_set_role(priv->role_sw, USB_ROLE_DEVICE);
 }
@@ -66,6 +87,8 @@ static int disable_eud(struct eud_chip *priv)
 		return ret;
 
 	writel(0, priv->base + EUD_REG_CSR_EUD_EN);
+	extcon_set_state_sync(priv->extcon, EXTCON_USB, false);
+	extcon_set_state_sync(priv->extcon, EXTCON_CHG_USB_SDP, false);
 	return 0;
 }
 
@@ -117,6 +140,9 @@ static void usb_attach_detach(struct eud_chip *chip)
 	/* read ctl_out_1[4] to find USB attach or detach event */
 	reg = readl(chip->base + EUD_REG_CTL_OUT_1);
 	chip->usb_attached = reg & EUD_INT_SAFE_MODE;
+	extcon_set_state_sync(chip->extcon, EXTCON_USB, chip->usb_attached);
+	extcon_set_state_sync(chip->extcon, EXTCON_CHG_USB_SDP,
+				 chip->usb_attached);
 }
 
 static void pet_eud(struct eud_chip *chip)
@@ -150,16 +176,16 @@ static irqreturn_t handle_eud_irq(int irq, void *data)
 	u32 reg;
 
 	reg = readl(chip->base + EUD_REG_INT_STATUS_1);
-	switch (reg & EUD_INT_ALL) {
-	case EUD_INT_VBUS:
+	if (reg & EUD_INT_VBUS) {
 		usb_attach_detach(chip);
 		return IRQ_WAKE_THREAD;
-	case EUD_INT_SAFE_MODE:
+	}
+	if (reg & EUD_INT_SAFE_MODE) {
 		pet_eud(chip);
 		return IRQ_HANDLED;
-	default:
-		return IRQ_NONE;
 	}
+
+	return IRQ_NONE;
 }
 
 static irqreturn_t handle_eud_irq_thread(int irq, void *data)
@@ -205,6 +231,15 @@ static int eud_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, PTR_ERR(chip->role_sw),
 					"failed to get role switch\n");
 
+	chip->extcon = devm_extcon_dev_allocate(chip->dev, eud_extcon_cables);
+	if (IS_ERR(chip->extcon))
+		return dev_err_probe(chip->dev, PTR_ERR(chip->extcon),
+					"failed to allocate extcon\n");
+
+	ret = devm_extcon_dev_register(chip->dev, chip->extcon);
+	if (ret)
+		return dev_err_probe(chip->dev, ret, "failed to register extcon\n");
+
 	ret = devm_add_action_or_reset(chip->dev, eud_role_switch_release, chip);
 	if (ret)
 		return ret;
@@ -228,6 +263,17 @@ static int eud_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, ret, "failed to allocate irq\n");
 
 	enable_irq_wake(chip->irq);
+
+	/* Match the factory driver: inherit a secure EUD state left by the
+	 * bootloader, but do not enable the block from Linux by default. */
+	if (eud_hw_enabled(chip)) {
+		writel(EUD_ENABLE, chip->base + EUD_REG_CSR_EUD_EN);
+		writel(EUD_INT_VBUS | EUD_INT_SAFE_MODE,
+			chip->base + EUD_REG_INT1_EN_MASK);
+		extcon_set_state_sync(chip->extcon, EXTCON_USB, true);
+		extcon_set_state_sync(chip->extcon, EXTCON_CHG_USB_SDP, true);
+		chip->enabled = true;
+	}
 
 	platform_set_drvdata(pdev, chip);
 

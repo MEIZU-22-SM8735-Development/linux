@@ -2,6 +2,19 @@
 /* USB peripheral (gadget) path, for early USB CDC ACM diagnostics. */
 #include <dt-bindings/phy/phy-qcom-qmp.h>
 &soc {
+	/* Meizu factory EUD attach/VBUS detector; data role stays peripheral here. */
+	eud: eud@88e0000 {
+		compatible = "qcom,msm-eud", "qcom,eud";
+		reg = <0 0x088e0000 0 0x2000>,
+		      <0 0x088e2000 0 0x1000>;
+		reg-names = "eud_base", "eud_mode_mgr2";
+		interrupts-extended = <&pdc 11 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "eud_irq";
+		qcom,secure-eud-en;
+		qcom,eud-utmi-delay = /bits/ 16 <0x00ff>;
+		status = "okay";
+	};
+
 	spmi_bus: spmi@c400000 {
 		compatible = "qcom,spmi-pmic-arb";
 		reg = <0 0x0c400000 0 0x3000>, <0 0x0c500000 0 0x400000>,
@@ -468,6 +481,7 @@
 
 		qcom,use-pdc-interrupts;
 		qcom,use-eusb2-phy;
+		usb-role-switch;
 		qcom,dis-sending-cm-l1-quirk;
 		qcom,core-clk-rate = <200000000>;
 		qcom,core-clk-rate-hs = <66666667>;
@@ -531,7 +545,8 @@
 			phys = <&usb_hsphy>, <&usb_qmpphy QMP_USB43DP_USB3_PHY>;
 			phy-names = "usb2-phy", "usb3-phy";
 
-			dr_mode = "peripheral";
+			dr_mode = "otg";
+			usb-role-switch;
 
 			/*
 			 * Do not advertise USB2 Link Power Management. The vendor's running kernel

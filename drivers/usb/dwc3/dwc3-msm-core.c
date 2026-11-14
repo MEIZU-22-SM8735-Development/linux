@@ -6350,6 +6350,18 @@ static int dwc3_msm_check_extcon_prop(struct platform_device *pdev)
 		}
 	}
 
+	/* A role switch is also used by UCSI on boards without an extcon.
+	 * Keep the factory peripheral boot path in that case; otherwise the
+	 * role-switch property suppresses the default vbus_active setup and
+	 * the gadget never asserts its pull-up until a later role event. */
+	if (mdwc->role_switch && !mdwc->extcon &&
+		mdwc->dr_mode == USB_DR_MODE_OTG &&
+		!of_property_read_bool(node, "qcom,default-mode-host") &&
+		!of_property_read_bool(node, "qcom,default-mode-none")) {
+		mdwc->vbus_active = true;
+		dwc3_ext_event_notify(mdwc);
+	}
+
 	if (!mdwc->role_switch && (!mdwc->extcon ||
 			!dwc3_msm_extcon_is_valid_source(mdwc))) {
 		switch (mdwc->dr_mode) {

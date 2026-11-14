@@ -52,6 +52,10 @@
 
 		/* Its own switch: the ADSP can be up without the battery stack. */
 		m2582,feature = "battery";
+		/* UCSI still reports the ADSP's PD contract when the boot USB path
+		 * intentionally remains peripheral-only. */
+		qcom,allow-no-role-switch;
+		qcom,keep-usb-device-role;
 
 		#address-cells = <1>;
 		#size-cells = <0>;
