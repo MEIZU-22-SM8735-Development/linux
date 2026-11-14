@@ -9,6 +9,7 @@
 #include <linux/debugfs.h>
 #include <linux/component.h>
 #include <linux/of_irq.h>
+#include <linux/gpio/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
 #include <linux/string_choices.h>
@@ -76,6 +77,9 @@ struct msm_dp_display_private {
 	bool wide_bus_supported;
 
 	struct msm_dp_audio *audio;
+
+	/* Optional board-level AUX/SBU steering GPIO (factory aux-sel-gpio). */
+	struct gpio_desc *aux_sel_gpio;
 
 	void __iomem *ahb_base;
 	size_t ahb_len;
@@ -362,6 +366,15 @@ static void msm_dp_display_host_init(struct msm_dp_display_private *dp)
 	msm_dp_ctrl_reset(dp->ctrl);
 	msm_dp_ctrl_enable_irq(dp->ctrl);
 	msm_dp_aux_init(dp->aux);
+	/*
+	 * The M2582 factory driver enables the AUX GPIO switch before
+	 * transactions are allowed.  Mainline's Type-C altmode path already
+	 * selects the USB-C data orientation; this GPIO is the board's fixed
+	 * AUX route selector.  Keep it optional so generic DP instances retain
+	 * their existing behaviour.
+	 */
+	if (dp->aux_sel_gpio)
+		gpiod_set_value_cansleep(dp->aux_sel_gpio, 0);
 	dp->core_initialized = true;
 }
 
@@ -1162,6 +1175,14 @@ static int msm_dp_display_probe(struct platform_device *pdev)
 	dp->msm_dp_display.is_edp =
 		(dp->msm_dp_display.connector_type == DRM_MODE_CONNECTOR_eDP);
 	dp->hpd_isr_status = 0;
+
+	dp->aux_sel_gpio = devm_gpiod_get_optional(&pdev->dev, "aux-sel",
+						GPIOD_OUT_LOW);
+	if (IS_ERR(dp->aux_sel_gpio)) {
+		rc = dev_err_probe(&pdev->dev, PTR_ERR(dp->aux_sel_gpio),
+					"failed to get AUX select GPIO\n");
+		return rc;
+	}
 
 	mutex_init(&dp->plugged_lock);
 

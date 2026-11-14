@@ -13,6 +13,7 @@
  * different board's base DTB and is not a source for anything here.
  */
 #include <dt-bindings/phy/phy-qcom-qmp.h>
+#include <dt-bindings/gpio/gpio.h>
 
 /*
  * DPU/DP link. The DPU does not look up the controller by name: it walks its
@@ -151,6 +152,9 @@
 		 */
 		pinctrl-names = "default";
 		pinctrl-0 = <&dp_aux_enable>, <&dp_uart_disable>;
+		/* Factory qcom,aux-sel-gpio: TLMM 149, active high. */
+		aux-sel-gpios = <&tlmm 149 GPIO_ACTIVE_HIGH>;
+		qcom,dp-gpio-aux-switch;
 
 		/*
 		 * The subsystem switch; see arch/arm64/kernel/meizu-m2582-features.c.
