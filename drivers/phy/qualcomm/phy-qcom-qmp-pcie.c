@@ -3398,6 +3398,7 @@ struct qmp_phy_cfg {
 	unsigned int phy_status;
 
 	bool skip_start_delay;
+	bool switch_pipe_clk_after_ready;
 
 	/* QMP PHY pipe clock interface rate */
 	unsigned long pipe_clock_rate;
@@ -4432,6 +4433,35 @@ static const struct qmp_phy_cfg sm8550_qmp_gen3x2_pciephy_cfg = {
 	.phy_status		= PHYSTATUS,
 };
 
+static const struct qmp_phy_cfg sm8735_qmp_gen3x2_pciephy_cfg = {
+	.lanes = 2,
+
+	.offsets		= &qmp_pcie_offsets_v5,
+
+	.tbls = {
+		.serdes		= sm8550_qmp_gen3x2_pcie_serdes_tbl,
+		.serdes_num	= ARRAY_SIZE(sm8550_qmp_gen3x2_pcie_serdes_tbl),
+		.tx		= sm8550_qmp_gen3x2_pcie_tx_tbl,
+		.tx_num		= ARRAY_SIZE(sm8550_qmp_gen3x2_pcie_tx_tbl),
+		.rx		= sm8550_qmp_gen3x2_pcie_rx_tbl,
+		.rx_num		= ARRAY_SIZE(sm8550_qmp_gen3x2_pcie_rx_tbl),
+		.pcs		= sm8550_qmp_gen3x2_pcie_pcs_tbl,
+		.pcs_num	= ARRAY_SIZE(sm8550_qmp_gen3x2_pcie_pcs_tbl),
+		.pcs_misc	= sm8550_qmp_gen3x2_pcie_pcs_misc_tbl,
+		.pcs_misc_num	= ARRAY_SIZE(sm8550_qmp_gen3x2_pcie_pcs_misc_tbl),
+	},
+	.reset_list		= sdm845_pciephy_reset_l,
+	.num_resets		= ARRAY_SIZE(sdm845_pciephy_reset_l),
+	.vreg_list		= qmp_phy_vreg_l,
+	.num_vregs		= ARRAY_SIZE(qmp_phy_vreg_l),
+	.regs			= pciephy_v5_regs_layout,
+
+	.pwrdn_ctrl		= SW_PWRDN | REFCLK_DRV_DSBL,
+	.phy_status		= PHYSTATUS,
+	.pipe_clock_rate	= 125000000,
+	.switch_pipe_clk_after_ready = true,
+};
+
 static const struct qmp_phy_cfg sm8750_qmp_gen3x2_pciephy_cfg = {
 	.lanes = 2,
 
@@ -5009,6 +5039,13 @@ skip_serdes_start:
 		goto err_disable_pipe_clk;
 	}
 
+	/* The reference parent must remain selected until the PHY is ready. */
+	if (cfg->switch_pipe_clk_after_ready) {
+		ret = clk_set_rate(qmp->pipe_clks[0].clk, cfg->pipe_clock_rate);
+		if (ret)
+			goto err_disable_pipe_clk;
+	}
+
 	return 0;
 
 err_disable_pipe_clk:
@@ -5023,6 +5060,8 @@ static int qmp_pcie_power_off(struct phy *phy)
 	const struct qmp_phy_cfg *cfg = qmp->cfg;
 
 	clk_bulk_disable_unprepare(qmp->num_pipe_clks, qmp->pipe_clks);
+	if (cfg->switch_pipe_clk_after_ready)
+		clk_set_rate(qmp->pipe_clks[0].clk, clk_get_rate(qmp->clks[2].clk));
 
 	/*
 	 * While powering off the PHY, only qmp->nocsr_reset needs to be checked. In
@@ -5642,6 +5681,9 @@ static const struct of_device_id qmp_pcie_of_match_table[] = {
 	}, {
 		.compatible = "qcom,sm8650-qmp-gen4x2-pcie-phy",
 		.data = &sm8650_qmp_gen4x2_pciephy_cfg,
+	}, {
+		.compatible = "qcom,sm8735-qmp-gen3x2-pcie-phy",
+		.data = &sm8735_qmp_gen3x2_pciephy_cfg,
 	}, {
 		.compatible = "qcom,sm8750-qmp-gen3x2-pcie-phy",
 		.data = &sm8750_qmp_gen3x2_pciephy_cfg,
