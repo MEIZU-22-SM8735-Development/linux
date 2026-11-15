@@ -1372,10 +1372,14 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 		UCSI_CONSTAT(con, PARTNER_FLAG_USB4_GEN4)))))
 		u_role = USB_ROLE_NONE;
 
-	ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
-	if (ret)
-		dev_err(con->ucsi->dev, "con:%d: failed to set usb role:%d\n",
-			con->num, u_role);
+	if (!(u_role == USB_ROLE_NONE &&
+	      device_property_read_bool(con->ucsi->dev,
+					 "qcom,keep-usb-device-role"))) {
+		ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
+		if (ret)
+			dev_err(con->ucsi->dev, "con:%d: failed to set usb role:%d\n",
+				con->num, u_role);
+	}
 }
 
 static int ucsi_check_connection(struct ucsi_connector *con)
@@ -1834,9 +1838,20 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 
 	cap->fwnode = ucsi_find_fwnode(con);
 	con->usb_role_sw = fwnode_usb_role_switch_get(cap->fwnode);
-	if (IS_ERR(con->usb_role_sw))
-		return dev_err_probe(ucsi->dev, PTR_ERR(con->usb_role_sw),
-			"con%d: failed to get usb role switch\n", con->num);
+	if (IS_ERR(con->usb_role_sw)) {
+		ret = PTR_ERR(con->usb_role_sw);
+		if (ret == -ENODEV &&
+		    device_property_read_bool(ucsi->dev, "qcom,allow-no-role-switch")) {
+			dev_warn(ucsi->dev,
+				 "con%d: no USB role switch; keeping the boot peripheral path\n",
+				 con->num);
+			con->usb_role_sw = NULL;
+		} else {
+			return dev_err_probe(ucsi->dev, ret,
+					     "con%d: failed to get usb role switch\n",
+					     con->num);
+		}
+	}
 
 	/* Delay other interactions with the con until registration is complete */
 	mutex_lock(&con->lock);
@@ -1954,11 +1969,15 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 	if (!(UCSI_CONSTAT(con, PARTNER_FLAG_USB)))
 		u_role = USB_ROLE_NONE;
 
-	ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
-	if (ret) {
-		dev_err(ucsi->dev, "con:%d: failed to set usb role:%d\n",
-			con->num, u_role);
-		ret = 0;
+	if (!(u_role == USB_ROLE_NONE &&
+	      device_property_read_bool(ucsi->dev,
+					 "qcom,keep-usb-device-role"))) {
+		ret = usb_role_switch_set_role(con->usb_role_sw, u_role);
+		if (ret) {
+			dev_err(ucsi->dev, "con:%d: failed to set usb role:%d\n",
+				con->num, u_role);
+			ret = 0;
+		}
 	}
 
 	if (con->partner && UCSI_CONSTAT(con, PWR_OPMODE) == UCSI_CONSTAT_PWR_OPMODE_PD) {
