@@ -260,6 +260,7 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 	const struct msm_dsi_cfg_handler *cfg_hnd = NULL;
 	struct device *dev = &msm_host->pdev->dev;
 	struct clk *ahb_clk;
+	struct clk *core_clk = NULL;
 	int ret;
 	u32 major = 0, minor = 0;
 
@@ -270,7 +271,20 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 		goto exit;
 	}
 
-	pm_runtime_get_sync(dev);
+	if (of_device_is_compatible(dev->of_node, "qcom,tuna-dsi-ctrl")) {
+		/* Version registers also require the controller core clock. */
+		core_clk = msm_clk_get(msm_host->pdev, "core");
+		if (IS_ERR(core_clk)) {
+			dev_err_probe(dev, PTR_ERR(core_clk), "cannot get core clock\n");
+			goto exit;
+		}
+	}
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret < 0) {
+		dev_err_probe(dev, ret, "cannot resume DSI for version read\n");
+		goto exit;
+	}
 
 	ret = clk_prepare_enable(ahb_clk);
 	if (ret) {
@@ -278,16 +292,24 @@ dsi_get_config(struct msm_dsi_host *msm_host)
 		goto runtime_put;
 	}
 
+	ret = clk_prepare_enable(core_clk);
+	if (ret) {
+		dev_err_probe(dev, ret, "cannot enable core clock for version read\n");
+		goto disable_clks;
+	}
+
 	ret = dsi_get_version(msm_host->ctrl_base, &major, &minor);
 	if (ret) {
 		dev_err_probe(dev, ret, "%s: Invalid version\n", __func__);
-		goto disable_clks;
+		goto disable_core;
 	}
 
 	cfg_hnd = msm_dsi_cfg_get(major, minor);
 
 	DBG("%s: Version %x:%x\n", __func__, major, minor);
 
+disable_core:
+	clk_disable_unprepare(core_clk);
 disable_clks:
 	clk_disable_unprepare(ahb_clk);
 runtime_put:
