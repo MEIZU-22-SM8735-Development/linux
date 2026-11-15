@@ -49,6 +49,7 @@
 	 */
 	pmic-glink {
 		compatible = "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
+		qcom,broken-battery-power;
 
 		/* Its own switch: the ADSP can be up without the battery stack. */
 		m2582,feature = "battery";
