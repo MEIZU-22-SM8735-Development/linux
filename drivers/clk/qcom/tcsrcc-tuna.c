@@ -126,9 +126,48 @@ static const struct qcom_cc_desc tcsr_cc_tuna_desc = {
 	.num_clks = ARRAY_SIZE(tcsr_cc_tuna_clocks),
 };
 
+/* Exclude protected TCSR registers from the PCIe clock provider. */
+static struct clk_branch sm8735_pcie_clkref = {
+	.halt_reg = 0,
+	.halt_check = BRANCH_HALT_DELAY,
+	.clkr = {
+		.enable_reg = 0,
+		.enable_mask = BIT(0),
+		.hw.init = &(const struct clk_init_data) {
+			.name = "sm8735_pcie_clkref",
+			.parent_data = &(const struct clk_parent_data) {
+				.fw_name = "xo",
+			},
+			.num_parents = 1,
+			/* Preserve the reference gate across PHY power-off. */
+			.ops = &clk_branch2_aon_ops,
+		},
+	},
+};
+
+static struct clk_regmap *sm8735_pcie_clkref_clocks[] = {
+	[TCSR_PCIE_0_CLKREF_EN] = &sm8735_pcie_clkref.clkr,
+};
+
+static const struct regmap_config sm8735_pcie_clkref_regmap = {
+	.reg_bits = 32,
+	.reg_stride = 4,
+	.val_bits = 32,
+	.max_register = 0,
+	.max_register_is_0 = true,
+	.fast_io = true,
+};
+
+static const struct qcom_cc_desc sm8735_pcie_clkref_desc = {
+	.config = &sm8735_pcie_clkref_regmap,
+	.clks = sm8735_pcie_clkref_clocks,
+	.num_clks = ARRAY_SIZE(sm8735_pcie_clkref_clocks),
+};
+
 static const struct of_device_id tcsr_cc_tuna_match_table[] = {
-	{ .compatible = "qcom,tuna-tcsrcc" },
-	{ .compatible = "qcom,kera-tcsrcc" },
+	{ .compatible = "qcom,tuna-tcsrcc", .data = &tcsr_cc_tuna_desc },
+	{ .compatible = "qcom,kera-tcsrcc", .data = &tcsr_cc_tuna_desc },
+	{ .compatible = "qcom,sm8735-pcie-clkref", .data = &sm8735_pcie_clkref_desc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, tcsr_cc_tuna_match_table);
@@ -153,10 +192,11 @@ static int tcsr_cc_tuna_fixup(struct platform_device *pdev)
 
 static int tcsr_cc_tuna_probe(struct platform_device *pdev)
 {
+	const struct qcom_cc_desc *desc = of_device_get_match_data(&pdev->dev);
 	struct regmap *regmap;
 	int ret;
 
-	regmap = qcom_cc_map(pdev, &tcsr_cc_tuna_desc);
+	regmap = qcom_cc_map(pdev, desc);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
@@ -164,13 +204,11 @@ static int tcsr_cc_tuna_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = qcom_cc_really_probe(&pdev->dev, &tcsr_cc_tuna_desc, regmap);
+	ret = qcom_cc_really_probe(&pdev->dev, desc, regmap);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to register TCSR CC clocks\n");
 		return ret;
 	}
-
-	dev_info(&pdev->dev, "Registered TCSR CC clocks\n");
 
 	return ret;
 }
