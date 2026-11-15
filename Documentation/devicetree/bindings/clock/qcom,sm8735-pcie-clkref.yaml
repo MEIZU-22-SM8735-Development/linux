@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/qcom,sm8735-pcie-clkref.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm SM8735 PCIe reference clock gate
+
+maintainers:
+  - 14185638 <98950213+14185638@users.noreply.github.com>
+
+description: |
+  A restricted view of TCSR exposing only the PCIe reference clock gate.
+  The four-byte resource excludes USB and UFS clock registers which may
+  be inaccessible to the non-secure kernel.
+
+properties:
+  compatible:
+    const: qcom,sm8735-pcie-clkref
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: xo
+
+  '#clock-cells':
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - '#clock-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    clock-controller@1fbf000 {
+      compatible = "qcom,sm8735-pcie-clkref";
+      reg = <0x1fbf000 0x4>;
+      clocks = <&xo_board>;
+      clock-names = "xo";
+      #clock-cells = <1>;
+    };
