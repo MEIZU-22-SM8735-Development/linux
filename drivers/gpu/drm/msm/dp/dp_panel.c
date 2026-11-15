@@ -434,7 +434,8 @@ static void msm_dp_panel_tpg_enable(struct msm_dp_panel *msm_dp_panel,
 	msm_dp_write_p0(panel, MMSS_DP_BIST_ENABLE,
 				DP_BIST_ENABLE_DPBIST_EN);
 	msm_dp_write_p0(panel, MMSS_DP_TIMING_ENGINE_EN,
-				DP_TIMING_ENGINE_EN_EN);
+			msm_dp_read_p0(panel, MMSS_DP_TIMING_ENGINE_EN) |
+			DP_TIMING_ENGINE_EN_EN);
 	drm_dbg_dp(panel->drm_dev, "%s: enabled tpg\n", __func__);
 }
 
@@ -445,7 +446,9 @@ static void msm_dp_panel_tpg_disable(struct msm_dp_panel *msm_dp_panel)
 
 	msm_dp_write_p0(panel, MMSS_DP_TPG_MAIN_CONTROL, 0x0);
 	msm_dp_write_p0(panel, MMSS_DP_BIST_ENABLE, 0x0);
-	msm_dp_write_p0(panel, MMSS_DP_TIMING_ENGINE_EN, 0x0);
+	msm_dp_write_p0(panel, MMSS_DP_TIMING_ENGINE_EN,
+			msm_dp_read_p0(panel, MMSS_DP_TIMING_ENGINE_EN) &
+			~DP_TIMING_ENGINE_EN_EN);
 }
 
 void msm_dp_panel_tpg_config(struct msm_dp_panel *msm_dp_panel, bool enable)
@@ -678,6 +681,16 @@ int msm_dp_panel_timing_cfg(struct msm_dp_panel *msm_dp_panel, bool wide_bus_en)
 	drm_dbg_dp(panel->drm_dev, "wide_bus_en=%d reg=%#x\n", wide_bus_en, reg);
 
 	msm_dp_write_p0(panel, MMSS_DP_INTF_CONFIG, reg);
+
+	/* Match the v1.5.1 controller's factory stream setup, not the TPG. */
+	if (msm_dp_panel->hw_revision == DP_HW_VERSION_1_5_1) {
+		reg = msm_dp_read_link(panel, REG_DP_MAINLINK_CTRL);
+		msm_dp_write_p0(panel, MMSS_DP_ASYNC_FIFO_CONFIG,
+				!!(reg & BIT(8)));
+		reg = msm_dp_read_p0(panel, MMSS_DP_TIMING_ENGINE_EN);
+		msm_dp_write_p0(panel, MMSS_DP_TIMING_ENGINE_EN,
+				reg | DP_TIMING_ENGINE_EN_STREAM);
+	}
 
 	if (msm_dp_panel->msm_dp_mode.out_fmt_is_yuv_420)
 		msm_dp_panel_setup_vsc_sdp_yuv_420(msm_dp_panel);

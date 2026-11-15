@@ -28,7 +28,7 @@
 #include "dp_audio.h"
 #include "dp_debug.h"
 
-static bool psr_enabled = false;
+static bool psr_enabled;
 module_param(psr_enabled, bool, 0);
 MODULE_PARM_DESC(psr_enabled, "enable PSR for eDP and DP displays");
 
@@ -709,6 +709,7 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	u32 mode_rate_khz = 0, supported_rate_khz = 0, mode_bpp = 0;
 	struct msm_dp *dp;
 	int mode_pclk_khz = mode->clock;
+	int stream_pclk_khz;
 
 	dp = to_dp_bridge(bridge)->msm_dp_display;
 
@@ -720,12 +721,16 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
 	link_info = &msm_dp_display->panel->link_info;
 
-	if ((drm_mode_is_420_only(&dp->connector->display_info, mode) &&
-	     msm_dp_display->panel->vsc_sdp_supported) ||
-	     msm_dp_wide_bus_available(dp))
+	if (drm_mode_is_420_only(&dp->connector->display_info, mode) &&
+	    msm_dp_display->panel->vsc_sdp_supported)
 		mode_pclk_khz /= 2;
 
-	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
+	/* Widebus halves the internal clock, not the transmitted pixel data. */
+	stream_pclk_khz = mode_pclk_khz;
+	if (msm_dp_wide_bus_available(dp))
+		stream_pclk_khz = mode->clock / 2;
+
+	if (stream_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
 		return MODE_CLOCK_HIGH;
 
 	mode_bpp = dp->connector->display_info.bpc * num_components;

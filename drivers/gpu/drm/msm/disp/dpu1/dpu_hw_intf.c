@@ -121,26 +121,11 @@
 #define INTF_CFG2_PROG_DYNREF           BIT(28)
 
 /*
- * INTF_TIMING_ENGINE_ALIGN_CTRL has no upstream name.  It is the *esync* / AVR
- * alignment control, not a wide-bus one: the vendor's own source writes it only
- * when the display info has esync enabled, with 0x451, or 0x46 when AVR is on as
- * well, and sets CONFIG2 BIT(23) in the same block (sde_hw_intf.c:660-676,
- * fed from `info->esync_enabled, avr_enabled` at sde_encoder_phys_vid.c:695).
- * An earlier reading of the disassembly ("0x46 with compression, 0x451 without")
- * confused the AVR flag with compression.
- *
- * This board runs esync off, so neither register has to be programmed.  That is
- * now a property of the reset state rather than of whatever the bootloader left:
- * MDSS performs a CORE reset on every resume (mdssresetresume), and after it
- * ALIGN_CTRL reads 0x1 -- the hardware's own reset value, since nothing in this
- * driver writes it -- while CONFIG2 reads 0x110, which IS written here by
- * dpu_hw_intf_setup_intf_cfg().  Measured 2026-11-12 on build 1112-2345 after
- * several suspend/resume rounds.  Earlier notes calling 0x1 "the bootloader's
- * value" predate the reset-on-resume fix and should not be relied on.
+ * ALIGN_CTRL configures eSync/AVR, which this board does not enable.
+ * Leave it at its reset value; it does not control widebus or DSC.
  */
 #define INTF_TIMING_ENGINE_ALIGN_CTRL   0x06C
 #define INTF_CFG2_ALIGN_CTRL_EN         BIT(23)
-
 
 static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 		const struct dpu_hw_intf_timing_params *p,
@@ -212,15 +197,6 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 	if (p->wide_bus_en)
 		intf_cfg2 |= INTF_CFG2_DATABUS_WIDEN;
 
-	/*
-	 * Must be part of intf_cfg2 before the INTF_CONFIG2 write below.
-	 * Upstream gates these two on core version >= 7; the factory gates them
-	 * on capability bits that its INTF_CONFIG2 = 0x110 shows clear for this
-	 * panel.  BIT(24) is the peripheral-flush handshake to the DSI, BIT(28)
-	 * programmable dynamic refresh -- both matter for an ADFR panel, so the
-	 * difference is real.  m2582.features=nopfdyn clears them; programmed at
-	 * enable time, so a runtime switch needs a real mode switch.
-	 */
 	if (!dp_intf && intf->mdss_ver->core_major_ver >= 7)
 		intf_cfg2 |= INTF_CFG2_PERIPHERAL_FLUSH | INTF_CFG2_PROG_DYNREF;
 
@@ -309,40 +285,6 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 	DPU_REG_WRITE(c, INTF_HSYNC_SKEW, p->hsync_skew);
 	DPU_REG_WRITE(c, INTF_POLARITY_CTL, polarity_ctl);
 	DPU_REG_WRITE(c, INTF_FRAME_LINE_COUNT_EN, 0x3);
-	/*
-	 * m2582.features=intfsnap: reproduce the factory's *live* INTF1 state for
-	 * this panel.  The vendor block bases are mainline + 0x1000
-	 * (qcom,sde-intf-off = <0x35000 0x36000 ...> in the factory DT), so the
-	 * panel's interface is mainline INTF_1 = factory 0x36000, and the
-	 * recovery dump of that window reads
-	 *   INTF_CONFIG  = 0x00800000  bit 23 -- set on Android, never by us
-	 *   INTF_CONFIG2 = 0x00001111  bits 0/4/8/12 -- we have 0/4/12 plus the
-	 *                              24/28 pair Android does not set, and we
-	 *                              never set bit 8
-	 *   ALIGN_CTRL   = 0x00000001  (0x3606c) -- we leave it at 0
-	 * Bits 0 (widebus), 4 (data hctl) and 12 (DCE compress) already match.
-	 * "intfalign"/"nopfdyn"/"nowidebus" each cover one of the others; this is
-	 * the whole factory combination behind a single switch, including
-	 * CONFIG2[8], which nothing in mainline or in the factory source names.
-	 */
-
-
-	/*
-	 * m2582.features=intfrmw: program INTF_CONFIG the way the factory driver
-	 * does, i.e. read-modify-write instead of writing a value built from zero.
-	 *
-	 * sde_hw_intf_setup_timing_engine() opens with
-	 *     intf_cfg = SDE_REG_READ(c, INTF_CONFIG);
-	 * in both vendor drops we have (sm8735 techpack and the current
-	 * qualcomm-linux/display-driver), so every bit the vendor does not model
-	 * survives: the recovery dump of this panel's interface reads
-	 * INTF_CONFIG = 0x00800000, i.e. bit 23, for which there is no writer
-	 * anywhere in the vendor source.  Mainline builds the register from zero
-	 * and therefore clears it.
-	 *
-	 * Bits 29/30 (active H/V) and 31 (programmable fetch) are ours, so they
-	 * are masked out of the preserved value rather than carried over.
-	 */
 
 	DPU_REG_WRITE(c, INTF_CONFIG, intf_cfg);
 	DPU_REG_WRITE(c, INTF_PANEL_FORMAT, panel_format);
@@ -355,19 +297,7 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 		if (!(p->compression_en && !p->wide_bus_en))
 			intf_cfg2 |= INTF_CFG2_DATA_HCTL_EN;
 
-		/*
-		 * m2582.features=intfalign: drive the esync/AVR alignment pair
-		 * (0x06C + CONFIG2 BIT(23)) with the values the factory uses when
-		 * esync is enabled.  Kept as an experiment only: the factory does
-		 * not program this pair for a command-mode panel (their live
-		 * ALIGN_CTRL is the bootloader's 1 and their CONFIG2 has BIT(23)
-		 * clear), so writing 0x46/0x451 is not "the factory state".
-		 */
-
-
 		DPU_REG_WRITE(c, INTF_CONFIG2, intf_cfg2);
-
-
 
 		DPU_REG_WRITE(c, INTF_DISPLAY_DATA_HCTL, display_data_hctl);
 		DPU_REG_WRITE(c, INTF_ACTIVE_DATA_HCTL, active_data_hctl);
@@ -379,15 +309,10 @@ static void dpu_hw_intf_enable_timing_engine(
 		u8 enable)
 {
 	struct dpu_hw_blk_reg_map *c = &intf->hw;
-	/*
-	 * Note: Display interface select is handled in top block hw layer.
-	 *
-	 * 0x1801011 is what keeps the tear check running.  With a bare 1 --
-	 * the value the vendor writes in sde_hw_intf_enable_timing_engine() --
-	 * it never latches a frame, so every command-mode kickoff times out in
-	 * wait_for_idle.  The disable path must stay 0.
-	 */
-	DPU_REG_WRITE(c, INTF_TIMING_ENGINE_EN, enable ? 0x1801011 : 0);
+
+	/* DSI command mode needs tear-check control; DP uses video timing. */
+	DPU_REG_WRITE(c, INTF_TIMING_ENGINE_EN,
+		     enable ? (intf->cap->type == INTF_DP ? 1 : 0x1801011) : 0);
 
 	/*
 	 * The timestamp block has to be enabled together with the timing
@@ -395,7 +320,7 @@ static void dpu_hw_intf_enable_timing_engine(
 	 * struct dpu_intf_cfg does not model, so the value they select for
 	 * this interface is written directly.
 	 */
-	if (enable)
+	if (enable && intf->cap->type != INTF_DP)
 		DPU_REG_WRITE(c, INTF_VSYNC_TIMESTAMP_CTRL, 0x11);
 }
 
@@ -570,7 +495,6 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 	 * mis-route the two halves, so it stays opt-in.
 	 */
 
-
 	/*
 	 * The factory also sets the timestamp source from inside its tear-check
 	 * setup, i.e. on every command-mode enable (sde_hw_intf.c: it writes
@@ -591,14 +515,8 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 	{
 		void __iomem *mdp = c->blk_addr - intf->cap->base;
 		/*
-		 * Every colour block the factory DT declares inside the DSPP, at
-		 * its base word (qcom,sde-dspp-* in the runtime DT).  IGC is the
-		 * first stage in the chain and maps every component through a
-		 * 256-entry table, so a stale IGC enable is the one way a block
-		 * nobody on the host owns can still warp every pixel that
-		 * reaches the DSC encoder.  None of these blocks is used by this
-		 * driver, so clearing their base word cannot collide with a
-		 * register we write.
+		 * Disable unowned DSPP colour stages before feeding DSC. A retained
+		 * IGC enable would remap every component through a stale LUT.
 		 */
 		static const u32 offs[] = {
 			0x800,	/* HIST/HSIC; not an op-mode word, write is inert */
@@ -622,18 +540,6 @@ static int dpu_hw_intf_enable_te(struct dpu_hw_intf *intf,
 		/* make the clears land before the pipe starts fetching */
 		wmb();
 	}
-
-	/*
-	 * m2582.features=gcinv2: diagnostic plumbing check.  The factory's
-	 * gamma template uses channel bases 0x1808/0x1a08/0x1c08 (0x200 stride,
-	 * 512 entries), not the 0x04/0x0c/0x14 window dpu_hw_dspp.c writes.
-	 * An inverted ramp written here must invert the picture if the block and
-	 * the layout are right.  The two words in front of the first channel are
-	 * the enable/swap attempt; every address stays inside the gap between
-	 * DSPP0 (0x54000) and DSPP1 (0x56000).
-	 */
-
-
 
 	return 0;
 }
@@ -684,15 +590,9 @@ static int dpu_hw_intf_disable_te(struct dpu_hw_intf *intf)
 }
 
 /*
- * M2582: put the tear-check write pointer back at the start position.
- *
- * This is the factory's sde_hw_intf_v1_check_and_reset_tearcheck: it keeps the
- * frame count from INTF_TEAR_SYNC_WRCOUNT, takes the line from START_POS, and
- * writes both back.  The factory calls it from its autorefresh-disable
- * sequence, whose comment is "replace te write count with start_pos to meet
- * trigger window" -- i.e. without this the write pointer sits outside the
- * window in which the interface may trigger the control block, and the panel
- * then takes the first frame of a session and none after it.
+ * Restore the tear-check line to START_POS while preserving its frame
+ * count, matching the factory autorefresh-disable sequence. This keeps
+ * the write pointer inside the control-block trigger window.
  */
 static void dpu_hw_intf_reset_tearcheck(struct dpu_hw_intf *intf)
 {
@@ -871,27 +771,9 @@ static void dpu_hw_intf_program_intf_cmd_cfg(struct dpu_hw_intf *intf,
 	if (cmd_mode_cfg->wide_bus_en)
 		intf_cfg2 |= INTF_CFG2_DATABUS_WIDEN;
 
-	/*
-	 * The factory RMWs BIT(12) (compressed input) and BIT(0) (wide bus) but
-	 * never sets DATA_HCTL_EN (BIT(4)) nor programs the two DATA_HCTL
-	 * registers.  We reset MDSS and do not call the video path that sets
-	 * those bounds, so BIT(4) here could enable a window whose bounds are
-	 * never written.  m2582.features=vendorintf suppresses only this
-	 * addition; it cannot restore the pre-reset bootloader contents.
-	 */
 	intf_cfg2 |= INTF_CFG2_DATA_HCTL_EN;
 
 	/* Isolate DATA_HCTL_EN without changing wide bus or compression. */
-
-
-	/*
-	 * m2582.features=intf110 is a diagnostic full-register value, not a
-	 * factory-matched setting.  The often-cited factory readback 0x110 came
-	 * from vendor offset 0x35060, which the factory DT identifies as DP0;
-	 * DSI0 is at vendor offset 0x36000.  This arm also clears BIT(0) and
-	 * BIT(12), so its worse picture cannot isolate DATA_HCTL_EN.
-	 */
-
 
 	DPU_REG_WRITE(&intf->hw, INTF_CONFIG2, intf_cfg2);
 }
