@@ -15,6 +15,7 @@
 #include "meizu-m2582-adsp.dtsi"
 #include "meizu-m2582-pcie.dtsi"
 #include "meizu-m2582-dp.dtsi"
+#include "meizu-m2582-audio.dtsi"
 
 &mdss {
 	memory-region = <&splash_mem>;

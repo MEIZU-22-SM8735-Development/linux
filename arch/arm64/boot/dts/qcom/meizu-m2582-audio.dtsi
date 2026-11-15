@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include <dt-bindings/soc/qcom,gpr.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+
+&remoteproc_adsp_glink {
+	gpr {
+		compatible = "qcom,gpr";
+		qcom,glink-channels = "adsp_apps";
+		qcom,domain = <GPR_DOMAIN_ID_ADSP>;
+		qcom,intents = <512 20>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		q6apm: service@1 {
+			compatible = "qcom,q6apm";
+			reg = <GPR_APM_MODULE_IID>;
+			#sound-dai-cells = <0>;
+			qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
+
+			q6apmbedai: bedais {
+				compatible = "qcom,q6apm-lpass-dais";
+				#sound-dai-cells = <1>;
+			};
+
+			q6apmdai: dais {
+				compatible = "qcom,q6apm-dais";
+				/* Meizu runtime DT: msm-audio-ion stream IDs. */
+				iommus = <&apps_smmu 0x1001 0x80>,
+					 <&apps_smmu 0x1041 0x20>;
+				dma-coherent;
+			};
+		};
+	};
+};
+
+/ {
+	sound {
+		compatible = "qcom,tuna-sndcard", "qcom,sm8450-sndcard";
+		model = "MEIZU-22-DP";
+
+		dp-dai-link {
+			link-name = "DisplayPort Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai DISPLAY_PORT_RX_0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+
+			codec {
+				sound-dai = <&mdss_dp0>;
+			};
+		};
+	};
+};
