@@ -64,6 +64,13 @@ properties:
       Preserve the USB peripheral role when firmware reports no USB partner,
       including while connecting a charger or a DisplayPort-only partner.
 
+  qcom,broken-battery-power:
+    type: boolean
+    description:
+      The Android-style firmware battery power property is invalid. Derive
+      instantaneous battery power from the live voltage and signed current
+      properties instead.
+
   '#address-cells':
     const: 1
 
