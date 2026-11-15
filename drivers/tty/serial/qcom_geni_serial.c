@@ -95,6 +95,7 @@
 #define IO_MACRO_IO0_SEL		0x3
 #define DEFAULT_IO_MACRO_IO2_IO3_MASK	GENMASK(15, 4)
 #define IO_MACRO_IO2_IO3_SWAP		0x4640
+#define SM8735_UART_IO_MACRO_CTRL		0x431c
 
 /* We always configure 4 bytes per FIFO word */
 #define BYTES_PER_FIFO_WORD		4U
@@ -107,6 +108,7 @@ static DEFINE_IDA(port_ida);
 
 struct qcom_geni_device_data {
 	bool console;
+	u32 io_macro_ctrl;
 	enum geni_se_xfer_mode mode;
 	struct dev_pm_domain_attach_data pd_data;
 	int (*resources_init)(struct uart_port *uport);
@@ -1143,6 +1145,7 @@ static int setup_fifos(struct qcom_geni_serial_port *port)
 {
 	struct uart_port *uport;
 	u32 old_rx_fifo_depth = port->rx_fifo_depth;
+	size_t rx_buf_size;
 
 	uport = &port->uport;
 	port->tx_fifo_depth = geni_se_get_tx_fifo_depth(&port->se);
@@ -1155,10 +1158,13 @@ static int setup_fifos(struct qcom_geni_serial_port *port)
 		/*
 		 * Use krealloc rather than krealloc_array because rx_buf is
 		 * accessed as 1 byte entries as well as 4 byte entries so it's
-		 * not necessarily an array.
+		 * not necessarily an array. SE DMA still maps DMA_RX_BUF_SIZE
+		 * bytes regardless of the hardware FIFO depth.
 		 */
+		rx_buf_size = max_t(size_t, DMA_RX_BUF_SIZE,
+				    port->rx_fifo_depth * sizeof(u32));
 		port->rx_buf = devm_krealloc(uport->dev, port->rx_buf,
-					     port->rx_fifo_depth * sizeof(u32),
+					     rx_buf_size,
 					     GFP_KERNEL);
 		if (!port->rx_buf)
 			return -ENOMEM;
@@ -1194,36 +1200,14 @@ static int qcom_geni_serial_port_setup(struct uart_port *uport)
 	int ret;
 
 	proto = geni_se_read_proto(&port->se);
-	/*
-	 * M2582: same as the I2C driver -- see the comment there.  A stale but
-	 * valid protocol used to be a warning and nothing else, which left the
-	 * UART registered and non-functional.  Measured on this board: SE4
-	 * (a90000) comes out of the bootloader as SPI and SE5 (a94000) as I2C;
-	 * the Bluetooth UART is on SE14 (898000), where the bootloader leaves
-	 * UART mode behind for the vendor stack to use.
-	 *
-	 * Note what happens when this path is taken with proto == 0
-	 * (GENI_SE_NONE) or any other non-UART value and the firmware cannot be
-	 * loaded: geni_load_se_firmware() reads firmware-name off the *wrapper*
-	 * (qcom-geni-se.c:1558) and this board's wrapper has none, so it returns
-	 * -EINVAL before writing anything -- and the caller only warns and
-	 * carries on, programming FIFOs, watermarks and the baud divisor onto an
-	 * engine whose protocol was never established.
-	 */
+	/* Boot firmware may leave another protocol configured in this engine. */
 	if (proto != GENI_SE_UART) {
 		if (proto != GENI_SE_INVALID_PROTO)
 			dev_dbg(uport->dev, "reprogramming SE, stale proto %d\n", proto);
 
 		ret = geni_load_se_firmware(&port->se, GENI_SE_UART);
 		if (ret) {
-			/*
-			 * Do not fail the port over this.  With no firmware-name
-			 * on the wrapper there is nothing to load and the call
-			 * returns -EINVAL, which is the normal state of affairs on
-			 * a platform whose bootloader programs the serial engines
-			 * itself -- and a registered-but-idle UART is still better
-			 * than no UART at all.
-			 */
+			/* Platforms with bootloader-provided firmware may have no image. */
 			dev_warn(uport->dev, "UART firmware load failed ret: %d\n", ret);
 		}
 	}
@@ -1236,7 +1220,9 @@ static int qcom_geni_serial_port_setup(struct uart_port *uport)
 
 	writel(rxstale, uport->membase + SE_UART_RX_STALE_CNT);
 
-	pin_swap = readl(uport->membase + SE_UART_IO_MACRO_CTRL);
+	/* The SM8735 boot firmware leaves the UART input routing incomplete. */
+	pin_swap = port->dev_data->io_macro_ctrl ?:
+		readl(uport->membase + SE_UART_IO_MACRO_CTRL);
 	if (port->rx_tx_swap) {
 		pin_swap &= ~DEFAULT_IO_MACRO_IO2_IO3_MASK;
 		pin_swap |= IO_MACRO_IO2_IO3_SWAP;
@@ -1246,7 +1232,7 @@ static int qcom_geni_serial_port_setup(struct uart_port *uport)
 		pin_swap |= IO_MACRO_IO0_SEL;
 	}
 	/* Configure this register if RX-TX, CTS-RTS pins are swapped */
-	if (port->rx_tx_swap || port->cts_rts_swap)
+	if (port->dev_data->io_macro_ctrl || port->rx_tx_swap || port->cts_rts_swap)
 		writel(pin_swap, uport->membase + SE_UART_IO_MACRO_CTRL);
 
 	/*
@@ -2055,6 +2041,15 @@ static const struct qcom_geni_device_data qcom_geni_uart_data = {
 	.power_state = geni_serial_resource_state,
 };
 
+static const struct qcom_geni_device_data sm8735_qcom_geni_uart_data = {
+	.console = false,
+	.io_macro_ctrl = SM8735_UART_IO_MACRO_CTRL,
+	.mode = GENI_SE_DMA,
+	.resources_init = geni_serial_resource_init,
+	.set_rate = geni_serial_set_rate,
+	.power_state = geni_serial_resource_state,
+};
+
 static const struct qcom_geni_device_data sa8255p_qcom_geni_uart_data = {
 	.console = false,
 	.mode = GENI_SE_DMA,
@@ -2087,6 +2082,10 @@ static const struct of_device_id qcom_geni_serial_match_table[] = {
 	{
 		.compatible = "qcom,geni-uart",
 		.data = &qcom_geni_uart_data,
+	},
+	{
+		.compatible = "qcom,sm8735-geni-uart",
+		.data = &sm8735_qcom_geni_uart_data,
 	},
 	{
 		.compatible = "qcom,sa8255p-geni-uart",
