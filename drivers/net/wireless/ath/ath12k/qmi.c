@@ -2248,6 +2248,32 @@ int ath12k_qmi_host_cap_send(struct ath12k_base *ab)
 	if (ret < 0)
 		goto out;
 
+	/*
+	 * OEM WCN7850 firmware omits the single-chip MLO PHY capability,
+	 * but requires these HOST_CAP link descriptors to size WMI resources.
+	 */
+	if (ab->hw_rev == ATH12K_HW_WCN7850_HW20 && !req.mlo_capable_valid) {
+		int link;
+
+		req.mlo_capable_valid = 1;
+		req.mlo_capable = 1;
+		req.mlo_chip_id_valid = 1;
+		req.mlo_chip_id = 0;
+		req.mlo_group_id_valid = 1;
+		req.mlo_group_id = 0;
+		req.max_mlo_peer_valid = 1;
+		req.max_mlo_peer = ab->hw_params->max_mlo_peer;
+		req.mlo_num_chips_valid = 1;
+		req.mlo_num_chips = 1;
+		req.mlo_chip_info_valid = 1;
+		req.mlo_chip_info[0].chip_id = 0;
+		req.mlo_chip_info[0].num_local_links = ab->hw_params->def_num_link;
+		for (link = 0; link < req.mlo_chip_info[0].num_local_links; link++) {
+			req.mlo_chip_info[0].hw_link_id[link] = link;
+			req.mlo_chip_info[0].valid_mlo_link_id[link] = 1;
+		}
+	}
+
 	ret = qmi_txn_init(&ab->qmi.handle, &txn,
 			   qmi_wlanfw_host_cap_resp_msg_v01_ei, &resp);
 	if (ret < 0)
