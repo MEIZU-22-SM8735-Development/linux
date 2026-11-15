@@ -85,6 +85,12 @@ properties:
     description:
       See include/dt-bindings/phy/phy-qcom-qmp.h
 
+  aux-sel-gpios:
+    maxItems: 1
+    description:
+      Selects external AUX/SBU routing according to Type-C orientation.
+      The active level selects reversed orientation.
+
   mode-switch: true
   orientation-switch: true
 
