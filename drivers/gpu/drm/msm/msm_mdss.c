@@ -5,7 +5,6 @@
 
 #include <linux/bitfield.h>
 #include <linux/clk.h>
-#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/interconnect.h>
 #include <linux/irq.h>
@@ -13,12 +12,10 @@
 #include <linux/irqdesc.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/meizu-m2582.h>
-#include <linux/mutex.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
-#include <linux/seq_file.h>
 
 #include <linux/soc/qcom/ubwc.h>
 
@@ -48,22 +45,11 @@ struct msm_mdss {
 	struct icc_path *mdp_path[2];
 	u32 num_mdp_paths;
 	struct icc_path *reg_bus_path;
-	struct mutex probe_lock;
-	u32 probe_saved_static;
-	bool probe_static_saved;
-	u32 probe_cycles;
 	bool reset_on_resume;
 };
 
 static int msm_mdss_reset(struct device *dev);
 static int msm_mdss_disable(struct msm_mdss *msm_mdss);
-
-static void m2582_mdss_debug_init(struct msm_mdss *mdss)
-{
-	if (mdss->is_mdp5 || !mdss->mdss_data)
-		return;
-	mutex_init(&mdss->probe_lock);
-}
 
 static int msm_mdss_parse_data_bus_icc_path(struct device *dev,
 					    struct msm_mdss *msm_mdss)
@@ -346,22 +332,8 @@ static int msm_mdss_reset(struct device *dev)
 				     "failed to acquire mdss reset\n");
 	}
 
-	/*
-	 * M2582: the factory's device tree carries no MDSS reset, so its driver
-	 * inherits whatever the bootloader left programmed and only overwrites
-	 * what its own catalog knows.  Two blocks are in that category and have
-	 * no upstream counterpart at all: the MDSS uidle block (the vendor's
-	 * driver programs it from sde_hw_uidle.c) and the per-pipe system-cache
-	 * client (SSPP_SYS_CACHE_MODE, fed by the LLCC_DISP use case).  Resetting
-	 * the core returns both to their reset values -- disabled, which is the
-	 * safe state -- but it also throws away anything else the bootloader set
-	 * up that this driver never writes.  Keep upstream's reset as the default
-	 * and let the board opt out with m2582.features=noreset, which is what
-	 * the vendor's own stack effectively does.  mdssnoreset skips only this
-	 * reset; the legacy noreset also skips the panel's reset pulse.
-	 */
-	if (!m2582_feature_opt_in("noreset") &&
-	    true) {
+	/* Reset clears stale UIDLE and SSPP system-cache state on SM8735. */
+	if (!m2582_feature_opt_in("noreset")) {
 		reset_control_assert(reset);
 		/*
 		 * Tests indicate that reset has to be held for some period of
@@ -531,8 +503,6 @@ static int mdss_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mdss);
 
-	m2582_mdss_debug_init(mdss);
-
 	/* Child probes may need their parent while this probe is still running. */
 	if (runtime_pm) {
 		ret = pm_runtime_resume_and_get(dev);
@@ -549,16 +519,8 @@ static int mdss_probe(struct platform_device *pdev)
 	 * the interfaces to our components list.
 	 */
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
-	if (runtime_pm) {
-		if (true) {
-			pm_runtime_put_sync(dev);
-			dev_info(dev, "m2582-mdss-pm: released probe reference; usage=%d kids=%d suspended=%u\n",
-				 atomic_read(&dev->power.usage_count),
-				 atomic_read(&dev->power.child_count), pm_runtime_suspended(dev));
-		} else {
-			dev_info(dev, "m2582-mdss-pm: retaining probe reference until DRM bind\n");
-		}
-	}
+	if (runtime_pm)
+		pm_runtime_put_sync(dev);
 	if (ret) {
 		DRM_DEV_ERROR(dev, "failed to populate children devices\n");
 		msm_mdss_destroy(mdss);

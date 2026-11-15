@@ -9,7 +9,7 @@
 
 #include <linux/types.h>
 
-struct dentry;
+struct dpu_hw_ctl;
 struct dpu_kms;
 struct drm_gem_object;
 
@@ -45,12 +45,9 @@ int dpu_reg_dma_write_reg(struct dpu_reg_dma *rdma, u32 blk_off, u32 val);
 int dpu_reg_dma_write_block(struct dpu_reg_dma *rdma, u32 blk_off,
 			    const u32 *data, u32 len);
 
-int dpu_reg_dma_commit(struct dpu_kms *dpu_kms, u32 ctl_idx, u32 ctl_base,
-		       u32 db_base, u32 queue, int trigger_at_mdp);
 int dpu_reg_dma_kick(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl);
 int dpu_reg_dma_flush(struct dpu_kms *dpu_kms, struct dpu_hw_ctl *ctl);
 
-void dpu_reg_dma_debugfs_init(struct dpu_kms *dpu_kms, struct dentry *dir);
 #else
 static inline struct dpu_reg_dma *dpu_reg_dma_init(struct dpu_kms *dpu_kms)
 {
@@ -58,8 +55,6 @@ static inline struct dpu_reg_dma *dpu_reg_dma_init(struct dpu_kms *dpu_kms)
 }
 
 static inline void dpu_reg_dma_destroy(struct dpu_kms *dpu_kms) { }
-static inline void dpu_reg_dma_debugfs_init(struct dpu_kms *kms,
-					    struct dentry *dir) { }
 #endif
 
 #endif /* __DPU_HW_REG_DMA_H__ */

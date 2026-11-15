@@ -7,9 +7,7 @@
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
 
-#include <linux/debugfs.h>
 #include <linux/dma-buf.h>
-#include <linux/moduleparam.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_uapi.h>
@@ -29,7 +27,6 @@
 #include "dpu_trace.h"
 #include "dpu_crtc.h"
 #include "dpu_vbif.h"
-#include <linux/meizu-m2582.h>
 #include "dpu_plane.h"
 
 #define DPU_DEBUG_PLANE(pl, fmt, ...) DRM_DEBUG_ATOMIC("plane%d " fmt,\
@@ -61,10 +58,6 @@
 
 #define DEFAULT_REFRESH_RATE	60
 
-/* Diagnostic only: hold unchanged SSPP state while still committing frames. */
-static bool m2582_src_static;
-module_param_named(m2582_src_static, m2582_src_static, bool, 0600);
-
 static const uint32_t qcom_compressed_supported_formats[] = {
 	DRM_FORMAT_ABGR8888,
 	DRM_FORMAT_ARGB8888,
@@ -91,10 +84,6 @@ struct dpu_plane {
 	enum dpu_sspp pipe;
 
 	uint32_t color_fill;
-	struct dentry *m2582_debugfs;
-	u32 m2582_src_programs;
-	u32 m2582_src_skips;
-	bool m2582_src_valid;
 	bool is_error;
 	bool is_rt_pipe;
 	const struct dpu_mdss_cfg *catalog;
@@ -163,7 +152,6 @@ static u64 _dpu_plane_calc_bw(const struct dpu_mdss_cfg *catalog,
 		do_div(plane_prefill_bw, (vbp+vpw+vfp));
 	else
 		do_div(plane_prefill_bw, hw_latency_lines);
-
 
 	return max(plane_bw, plane_prefill_bw);
 }
@@ -455,7 +443,6 @@ static void _dpu_plane_setup_scaler3(struct dpu_hw_sspp *pipe_hw,
 		mult_frac((1 << PHASE_STEP_SHIFT), src_w, dst_w);
 	scale_cfg->phase_step_y[DPU_SSPP_COMP_0] =
 		mult_frac((1 << PHASE_STEP_SHIFT), src_h, dst_h);
-
 
 	scale_cfg->phase_step_y[DPU_SSPP_COMP_1_2] =
 		scale_cfg->phase_step_y[DPU_SSPP_COMP_0] / chroma_subsmpl_v;
@@ -1115,7 +1102,6 @@ static bool dpu_plane_try_multirect_parallel(struct dpu_sw_pipe *pipe, struct dp
 	 * makes the caller reserve a second SSPP and leave both pipes RECT_SOLO.
 	 */
 
-
 	pipe->multirect_index = DPU_SSPP_RECT_SOLO;
 	pipe->multirect_mode = DPU_SSPP_MULTIRECT_NONE;
 
@@ -1148,7 +1134,6 @@ static int dpu_plane_try_multirect_shared(struct dpu_plane_state *pstate,
 	struct dpu_sw_pipe_cfg *pipe_cfg, *prev_pipe_cfg;
 	const struct msm_format *prev_fmt = msm_framebuffer_format(prev_adjacent_pstate->base.fb);
 	u16 max_tile_height = 1;
-
 
 
 	if (!dpu_plane_get_single_pipe_in_stage(pstate, &pipe,
@@ -1494,37 +1479,6 @@ void dpu_plane_set_error(struct drm_plane *plane, bool error)
 
 	pdpu = to_dpu_plane(plane);
 	pdpu->is_error = error;
-	if (error)
-		pdpu->m2582_src_valid = false;
-}
-
-static bool m2582_source_unchanged(struct drm_plane *plane,
-				 struct drm_plane_state *old_state)
-{
-	struct dpu_plane *pdpu = to_dpu_plane(plane);
-	struct drm_plane_state *state = plane->state;
-	struct dpu_plane_state *pstate = to_dpu_plane_state(state);
-	struct dpu_plane_state *old;
-
-	if (!READ_ONCE(m2582_src_static) ||
-	    !pdpu->m2582_src_valid || pdpu->color_fill || pdpu->is_error ||
-	    !old_state || !old_state->visible || !state->visible ||
-	    old_state->fb != state->fb || old_state->crtc != state->crtc ||
-	    !state->crtc || drm_atomic_crtc_needs_modeset(state->crtc->state) ||
-	    old_state->rotation != state->rotation ||
-	    old_state->alpha != state->alpha ||
-	    old_state->pixel_blend_mode != state->pixel_blend_mode ||
-	    old_state->color_encoding != state->color_encoding ||
-	    old_state->color_range != state->color_range ||
-	    !drm_rect_equals(&old_state->src, &state->src) ||
-	    !drm_rect_equals(&old_state->dst, &state->dst) ||
-	    pstate->needs_qos_remap)
-		return false;
-
-	old = to_dpu_plane_state(old_state);
-	return !memcmp(old->pipe, pstate->pipe, sizeof(pstate->pipe)) &&
-		!memcmp(old->pipe_cfg, pstate->pipe_cfg, sizeof(pstate->pipe_cfg)) &&
-		!memcmp(&old->layout, &pstate->layout, sizeof(pstate->layout));
 }
 
 static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
@@ -1538,7 +1492,6 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 	struct dpu_plane *pdpu = to_dpu_plane(plane);
 	struct drm_plane_state *state = plane->state;
 	struct dpu_plane_state *pstate = to_dpu_plane_state(state);
-
 
 
 	/*
@@ -1566,7 +1519,6 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 	}
 
 	/* Factory pipe-order semantics: only the right half carries bit 4. */
-
 
 	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg);
 
@@ -1610,8 +1562,7 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
 }
 
 static void dpu_plane_sspp_atomic_update(struct drm_plane *plane,
-					 struct drm_plane_state *new_state,
-					 struct drm_plane_state *old_state)
+					 struct drm_plane_state *new_state)
 {
 	struct dpu_plane *pdpu = to_dpu_plane(plane);
 	struct drm_plane_state *state = plane->state;
@@ -1622,7 +1573,6 @@ static void dpu_plane_sspp_atomic_update(struct drm_plane *plane,
 	const struct msm_format *fmt =
 		msm_framebuffer_format(fb);
 	int i;
-	bool skip_source;
 
 	pstate->pending = true;
 
@@ -1632,17 +1582,11 @@ static void dpu_plane_sspp_atomic_update(struct drm_plane *plane,
 
 	dpu_format_populate_addrs(new_state->fb, &pstate->layout);
 
-	skip_source = m2582_source_unchanged(plane, old_state);
-
 	DPU_DEBUG_PLANE(pdpu, "FB[%u] " DRM_RECT_FP_FMT "->crtc%u " DRM_RECT_FMT
 			", %p4cc ubwc %d\n", fb->base.id, DRM_RECT_FP_ARG(&state->src),
 			crtc->base.id, DRM_RECT_ARG(&state->dst),
 			&fmt->pixel_format, MSM_FORMAT_IS_UBWC(fmt));
 
-	if (skip_source) {
-		pdpu->m2582_src_skips++;
-		goto source_done;
-	}
 	for (i = 0; i < PIPES_PER_PLANE; i++) {
 		if (!drm_rect_width(&pstate->pipe_cfg[i].src_rect))
 			continue;
@@ -1651,10 +1595,6 @@ static void dpu_plane_sspp_atomic_update(struct drm_plane *plane,
 					   drm_mode_vrefresh(&crtc->mode),
 					   &pstate->layout);
 	}
-	pdpu->m2582_src_programs++;
-	pdpu->m2582_src_valid = !pdpu->color_fill;
-
-source_done:
 	if (pstate->needs_qos_remap)
 		pstate->needs_qos_remap = false;
 
@@ -1678,8 +1618,6 @@ static void _dpu_plane_atomic_disable(struct drm_plane *plane)
 	struct dpu_plane_state *pstate = to_dpu_plane_state(state);
 	struct dpu_sw_pipe *pipe;
 	int i;
-
-	to_dpu_plane(plane)->m2582_src_valid = false;
 
 	for (i = 0; i < PIPES_PER_PLANE; i += 1) {
 		pipe = &pstate->pipe[i];
@@ -1719,8 +1657,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
 	if (!new_state->visible) {
 		_dpu_plane_atomic_disable(plane);
 	} else {
-		dpu_plane_sspp_atomic_update(plane, new_state,
-				drm_atomic_get_old_plane_state(state, plane));
+		dpu_plane_sspp_atomic_update(plane, new_state);
 	}
 }
 
@@ -1885,25 +1822,11 @@ static bool dpu_plane_format_mod_supported(struct drm_plane *plane,
 	if (modifier == DRM_FORMAT_MOD_LINEAR)
 		return true;
 
-
 	if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED && !has_no_ubwc)
 		return dpu_find_format(format, qcom_compressed_supported_formats,
 				ARRAY_SIZE(qcom_compressed_supported_formats));
 
 	return false;
-}
-
-static int dpu_plane_late_register(struct drm_plane *plane)
-{
-	return 0;
-}
-
-static void dpu_plane_early_unregister(struct drm_plane *plane)
-{
-	struct dpu_plane *pdpu = to_dpu_plane(plane);
-
-	debugfs_remove_recursive(pdpu->m2582_debugfs);
-	pdpu->m2582_debugfs = NULL;
 }
 
 static const struct drm_plane_funcs dpu_plane_funcs = {
@@ -1914,8 +1837,6 @@ static const struct drm_plane_funcs dpu_plane_funcs = {
 		.atomic_destroy_state = dpu_plane_destroy_state,
 		.atomic_print_state = dpu_plane_atomic_print_state,
 		.format_mod_supported = dpu_plane_format_mod_supported,
-		.late_register = dpu_plane_late_register,
-		.early_unregister = dpu_plane_early_unregister,
 };
 
 static const struct drm_plane_helper_funcs dpu_plane_helper_funcs = {
@@ -2010,7 +1931,6 @@ struct drm_plane *dpu_plane_init(struct drm_device *dev,
 		DPU_ERROR("[%u]SSPP is invalid\n", pipe);
 		return ERR_PTR(-EINVAL);
 	}
-
 
 	plane = dpu_plane_init_common(dev, type, possible_crtcs,
 				      pipe_hw->cap->features & BIT(DPU_SSPP_INLINE_ROTATION),

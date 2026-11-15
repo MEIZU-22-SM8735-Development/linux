@@ -10,7 +10,6 @@
 #include <linux/spinlock.h>
 #include <linux/shmem_fs.h>
 #include <linux/dma-buf.h>
-#include <linux/meizu-m2582.h>
 
 #include <drm/drm_dumb_buffers.h>
 #include <drm/drm_prime.h>
@@ -23,14 +22,6 @@
 #include "msm_gem.h"
 #include "msm_gpu.h"
 #include "msm_kms.h"
-
-static unsigned int m2582_scanout_syncs;
-module_param_named(m2582_scanout_syncs, m2582_scanout_syncs, uint, 0400);
-static unsigned int m2582_scanout_dma_syncs;
-module_param_named(m2582_scanout_dma_syncs, m2582_scanout_dma_syncs, uint, 0400);
-static unsigned int m2582_scanout_dma_fallbacks;
-module_param_named(m2582_scanout_dma_fallbacks, m2582_scanout_dma_fallbacks,
-			   uint, 0400);
 
 static void update_device_mem(struct msm_drm_private *priv, ssize_t size)
 {
@@ -198,21 +189,8 @@ void msm_gem_sync_for_device(struct drm_gem_object *obj,
 			dma_dev = msm_obj->dma_dev ?: obj->dev->dev;
 		else if (msm_obj->dma_dev)
 			dma_dev = msm_obj->dma_dev;
-		if (msm_obj->flags & MSM_BO_SCANOUT) {
-			struct device *display_dev =
-				msm_gem_display_dma_device(msm_obj);
-
-			if (display_dev && dma_dev == display_dev)
-				WRITE_ONCE(m2582_scanout_dma_syncs,
-					   READ_ONCE(m2582_scanout_dma_syncs) + 1);
-			else
-				WRITE_ONCE(m2582_scanout_dma_fallbacks,
-					   READ_ONCE(m2582_scanout_dma_fallbacks) + 1);
-		}
 		dma_sync_sgtable_for_device(dma_dev, msm_obj->sgt,
 					    DMA_BIDIRECTIONAL);
-		WRITE_ONCE(m2582_scanout_syncs,
-			   READ_ONCE(m2582_scanout_syncs) + 1);
 	}
 }
 

@@ -8,11 +8,7 @@
 #include <linux/delay.h>
 
 #include "dpu_vbif.h"
-#include <linux/meizu-m2582.h>
 
-/* see _dpu_vbif_get_ot_limit(): read OT limit used by m2582.features=otlim */
-static unsigned int m2582_ot_lim_override = 0x28;
-module_param_named(m2582_ot_lim, m2582_ot_lim_override, uint, 0600);
 #include "dpu_hw_vbif.h"
 #include "dpu_trace.h"
 

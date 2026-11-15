@@ -3,8 +3,6 @@
  */
 
 #include <linux/debugfs.h>
-#include <linux/meizu-m2582.h>
-#include <linux/moduleparam.h>
 
 #include "dpu_hwio.h"
 #include "dpu_hw_catalog.h"
@@ -18,15 +16,6 @@
 #include <linux/soc/qcom/ubwc.h>
 
 #define DPU_FETCH_CONFIG_RESET_VALUE   0x00000087
-
-static unsigned int m2582_cdp_override = ~0u;
-module_param_named(m2582_cdp_override, m2582_cdp_override, uint, 0600);
-
-/* see dpu_hw_sspp_setup_sourceaddress(): duplicate the pitch into both
- * YSTRIDE0 halves so the "high half is read as zero" theory can be tested */
-static bool m2582_stride_both;
-module_param_named(m2582_stride_both, m2582_stride_both, bool, 0600);
-
 
 /* SSPP registers */
 #define SSPP_SRC_SIZE                      0x00
@@ -497,38 +486,6 @@ static void dpu_hw_sspp_setup_rects(struct dpu_sw_pipe *pipe,
 
 	dpu_hw_setup_rects_impl(pipe, cfg, ctx, src_size_off,
 				src_xy_off, out_size_off, out_xy_off);
-
-	if (false && cfg->plane_pitch[0]) {
-		u32 ystride0, ystride1;
-
-		if (pipe->multirect_index == DPU_SSPP_RECT_SOLO) {
-			ystride0 = cfg->plane_pitch[0] |
-				(cfg->plane_pitch[1] << 16);
-			ystride1 = cfg->plane_pitch[2] |
-				(cfg->plane_pitch[3] << 16);
-		} else {
-			ystride0 = DPU_REG_READ(&ctx->hw, SSPP_SRC_YSTRIDE0);
-			ystride1 = DPU_REG_READ(&ctx->hw, SSPP_SRC_YSTRIDE1);
-			if (pipe->multirect_index == DPU_SSPP_RECT_0) {
-				ystride0 = (ystride0 & 0xffff0000) |
-					(cfg->plane_pitch[0] & 0xffff);
-				ystride1 = (ystride1 & 0xffff0000) |
-					(cfg->plane_pitch[2] & 0xffff);
-			} else {
-				ystride0 = (ystride0 & 0xffff) |
-					((cfg->plane_pitch[0] << 16) & 0xffff0000);
-				ystride1 = (ystride1 & 0xffff) |
-					((cfg->plane_pitch[2] << 16) & 0xffff0000);
-			}
-		}
-
-		if (READ_ONCE(m2582_stride_both))
-			ystride0 = (ystride0 & 0xffff) | ((ystride0 & 0xffff) << 16);
-
-		DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE0, ystride0);
-		DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE1, ystride1);
-	}
-
 }
 
 static void dpu_hw_sspp_setup_sourceaddress(struct dpu_sw_pipe *pipe,
@@ -586,23 +543,8 @@ static void dpu_hw_sspp_setup_sourceaddress(struct dpu_sw_pipe *pipe,
 		}
 	}
 
-	/*
-	 * YSTRIDE0 is two 16-bit fields -- the low half is rect 0's pitch and the
-	 * high half is rect 1's.  A solo pipe leaves the high half at zero, so
-	 * anything that ends up taking the high half reads a pitch of 0.  This
-	 * knob duplicates the pitch into both halves so that possibility can be
-	 * ruled in or out with the fetch oracle.
-	 */
-	if (READ_ONCE(m2582_stride_both)) {
-		u32 lo = ystride0 & 0xffff;
-
-		ystride0 = lo | (lo << 16);
-	}
-
-	if (true) {
-		DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE0, ystride0);
-		DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE1, ystride1);
-	}
+	DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE0, ystride0);
+	DPU_REG_WRITE(&ctx->hw, SSPP_SRC_YSTRIDE1, ystride1);
 }
 
 void dpu_hw_sspp_setup_csc(struct dpu_hw_sspp *ctx,
@@ -654,36 +596,11 @@ void dpu_hw_setup_solidfill_impl(struct dpu_sw_pipe *pipe,
 	DPU_REG_WRITE(&ctx->hw, const_clr_off, color);
 }
 
-/*
- * The factory stack leaves different danger/safe LUTs in the DSSP: 0xffff and
- * 0xff00 against the 0x3ffff / 0xfe00 this catalogue produces, a factor of
- * four apart on the danger table.  They are rewritten on every commit, so they
- * cannot be poked -- the only way to test what they do to the fetch is to make
- * them parameters.
- */
-static uint m2582_danger_lut = ~0u;
-module_param_named(m2582_danger_lut, m2582_danger_lut, uint, 0600);
-static uint m2582_safe_lut = ~0u;
-module_param_named(m2582_safe_lut, m2582_safe_lut, uint, 0600);
-
 static void dpu_hw_sspp_setup_qos_lut(struct dpu_hw_sspp *ctx,
 				      struct dpu_hw_qos_cfg *cfg)
 {
-	struct dpu_hw_qos_cfg override;
-	u32 danger = READ_ONCE(m2582_danger_lut);
-	u32 safe = READ_ONCE(m2582_safe_lut);
-
 	if (!ctx || !cfg)
 		return;
-
-	if (danger != ~0u || safe != ~0u) {
-		override = *cfg;
-		if (danger != ~0u)
-			override.danger_lut = danger;
-		if (safe != ~0u)
-			override.safe_lut = safe;
-		cfg = &override;
-	}
 
 	_dpu_hw_setup_qos_lut(&ctx->hw, SSPP_DANGER_LUT,
 			      ctx->mdss_ver->core_major_ver >= 4,

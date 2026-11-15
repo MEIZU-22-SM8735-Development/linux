@@ -418,11 +418,6 @@ static void _dpu_crtc_blend_setup_pipe(struct drm_crtc *crtc,
 	sspp_idx = pipe->sspp->idx;
 
 	state = plane->state;
-	/* Independent halves share a stage but require distinct SSPP slots. */
-	if (false &&
-	    state->dst.x1 >= crtc->state->adjusted_mode.hdisplay / 2)
-		stage_idx = 1;
-
 	trace_dpu_crtc_setup_mixer(DRMID(crtc), DRMID(plane),
 				   state, to_dpu_plane_state(state), stage_idx,
 				   format->pixel_format, pipe,
@@ -923,10 +918,6 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			 */
 			ctl->ops.update_pending_flush_dspp(ctl,
 				mixer[i].hw_dspp->idx, DPU_DSPP_SPR);
-			/* the PCC probe needs PCC's own flush bit */
-			if (false)
-				ctl->ops.update_pending_flush_dspp(ctl,
-					mixer[i].hw_dspp->idx, DPU_DSPP_PCC);
 		}
 	}
 }
