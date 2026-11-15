@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 /*
- * M2582: DisplayPort output over the USB-C connector.
- *
- * The controller sits at 0x0af54000, the same block mainline drives as
- * qcom,sm8650-dp, and there is no separate DP PHY on this board: DP is the
- * second half of the USB3/DP combo QMP PHY that tuna-usb.dtsi already has.
- * What the board adds on top of that is the AUX/SBU steering, which is three
- * TLMM pins rather than an I2C part (live-fdt.dts:33561-33609).
- *
- * Values come from the running device tree of this handset
- * (artifacts/meizu22/android-live-ON/live-fdt.dts); vendor-ref/factory is a
- * different board's base DTB and is not a source for anything here.
+ * M2582 DisplayPort uses the USB3/DP combo PHY and GPIO AUX/SBU routing.
+ * Register windows, clocks and pin states follow the factory runtime DT.
  */
 #include <dt-bindings/phy/phy-qcom-qmp.h>
 #include <dt-bindings/gpio/gpio.h>
@@ -79,14 +70,8 @@
 		interrupts-extended = <&mdss 12>;
 
 		/*
-		 * The factory names thirteen clocks (live-fdt.dts:33591-33592);
-		 * eight of them are dispcc cells that decode exactly onto
-		 * qcom,dispcc-tuna.h and six onto the names below --
-		 * core_aux_clk=19, link_clk=22, link_iface_clk=25,
-		 * strm0_pixel_clk=26, strm1_pixel_clk=28 (:29-38), plus the AHB
-		 * clock for core_iface. The *_src cells are the assigned-clocks.
-		 * The rest (rpmh_cxo, tcsr ref, gcc pipe) are the combo PHY's own
-		 * clocks, not the controller's.
+		 * Controller clocks come from DISPCC plus the core AHB interface.
+		 * The combo PHY owns the remaining reference and PIPE clocks.
 		 */
 		clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
 			 <&dispcc DISP_CC_MDSS_DPTX0_AUX_CLK>,
@@ -141,19 +126,12 @@
 		#sound-dai-cells = <0>;
 
 		/*
-		 * The board's AUX switch, to the extent mainline can express it:
-		 * the factory drives TLMM 130 (aux-en, active low) and TLMM 79
-		 * (the USB-C debug-UART / D+/D- mux) as its mdss_dp_active state
-		 * (live-fdt.dts:7491-7537), which is what these two states do.
-		 * The third pin, TLMM 149, is a plain GPIO in the factory tree
-		 * (qcom,aux-sel-gpio, live-fdt.dts:33608-33609) and mainline parses
-		 * neither that property nor qcom,dp-gpio-aux-switch, so it stays in
-		 * its reset state; see artifacts/meizu22/dp-implementation-report.md.
+		 * The factory active state drives AUX enable (TLMM130) low and
+		 * disables the debug UART route with TLMM79 high. The combo PHY
+		 * selects TLMM149 according to Type-C orientation.
 		 */
 		pinctrl-names = "default";
 		pinctrl-0 = <&dp_aux_enable>, <&dp_uart_disable>;
-		/* Factory qcom,aux-sel-gpio: TLMM 149, active high. */
-		aux-sel-gpios = <&tlmm 149 GPIO_ACTIVE_HIGH>;
 		qcom,dp-gpio-aux-switch;
 
 		/*

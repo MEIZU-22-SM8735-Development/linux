@@ -7,6 +7,7 @@
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/err.h>
+#include <linux/gpio/consumer.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -2318,6 +2319,7 @@ struct qmp_combo {
 
 	struct typec_switch_dev *sw;
 	enum typec_orientation orientation;
+	struct gpio_desc *aux_sel_gpio;
 
 	struct typec_mux_dev *mux;
 };
@@ -2361,22 +2363,7 @@ static inline void qphy_clrbits(void __iomem *base, u32 offset, u32 val)
 	readl(base + offset);
 }
 
-/*
- * list of clocks required by phy
- *
- * M2582: the vendor's msm_ssphy_qmp_enable_clks() does clk_prepare()+clk_enable()
- * on eight clocks individually -- aux_clk, cfg_ahb_clk, pipe_clk, pipe_clk_mux,
- * pipe_clk_ext_src, ref_clk_src, ref_clk, com_aux_clk -- whereas this list only
- * covered four, and qmp_combo_com_init() enables exactly what is listed here via
- * clk_bulk_prepare_enable(). So pipe_clk_mux, pipe_clk_ext_src, ref_clk_src and
- * ref_clk were declared in the device tree but never enabled at all.
- *
- * pipe_clk_mux is the PIPE clock's parent selector: with it off the PIPE clock
- * path does not reach the PHY's digital block.
- *
- * The names have to match the device tree's clock-names; pipe_clk is still
- * fetched separately by name ("usb3_pipe") for this driver.
- */
+/* Clock names include the PIPE parent mux and all reference clock gates. */
 static const char * const qmp_combo_phy_clk_l[] = {
 	"aux", "cfg_ahb", "ref", "com_aux",
 	"pipe_clk_mux", "pipe_clk_ext_src", "ref_clk_src", "ref_clk",
@@ -2960,18 +2947,9 @@ static const struct qmp_phy_cfg sm8650_usb3dpphy_cfg = {
 };
 
 /*
- * Meizu 22 (M2582) / Qualcomm tuna QMP USB3+DP combo PHY initialisation
- * sequence, taken verbatim from the factory device tree:
- *   vendor_boot.img -> board10.dtb ("Tuna SoC") /soc/ssphy@88e8000
- *   qcom,qmp-phy-init-seq = <165 register/value pairs>
- * Cross-checked against dtc output and against OnePlusOSS'
- * qcom/tuna-usb.dtsi, which carries the identical table.
- *
- * The factory offsets are absolute within the PHY (0x1000..0x1f44) and
- * the serdes sub-block starts at 0x1000, so each offset is rebased by
- * 0x1000 and the whole sequence is applied through the serdes base.
- * That is why this configuration leaves the tx/rx/pcs tables empty:
- * they would overwrite registers this sequence already covers.
+ * Factory SM8735 USB3 sequence, covering serdes, TX/RX and PCS together.
+ * Offsets are rebased from the PHY's 0x1000 serdes window; separate TX/RX/PCS
+ * tables would overwrite this sequence.
  */
 static const struct qmp_phy_init_tbl tuna_usb3_serdes_tbl[] = {
 	QMP_PHY_INIT_CFG(0x0000, 0xc0),
@@ -3194,21 +3172,8 @@ static const struct qmp_phy_cfg sm8750_usb3dpphy_cfg = {
  * Everything else keeps the sm8750 layout.
  */
 /*
- * tuna's QMP USB3+DP combo PHY register blocks, taken from the factory device
- * tree (vendor_boot.img -> board10.dtb, qcom,qmp-phy-reg-offset):
- *
- *   PCS control block   0x1c00   SW_RESET 0x1c00, STATUS1 0x1c14,
- *                                POWER_DOWN_CONTROL 0x1c40, START_CONTROL 0x1c44
- *   PCS USB3 block      0x1f00   AUTONOMOUS_MODE_CTRL 0x1f08,
- *                                LFPS_RXTERM_IRQ_CLEAR 0x1f14
- *   PCS AON clamp       0x1e00
- *   COM block           0x0000   COM_PHY_MODE_CTRL 0x00, COM_SW_RESET 0x04, ...
- *
- * The v8/sm8750 layout puts the PCS blocks at 0x1e00, 0x1c00 and 0x2100
- * instead. Using it here means qmp_combo_usb_power_on() clears SW_RESET and
- * sets START_CTRL at 0x1e00-relative addresses, i.e. the wrong registers, so
- * the SerDes/PLL never start, no PIPE clock is produced, and DCTL.CSFTRST can
- * never synchronise.
+ * Factory SM8735 layout: PCS control at 0x1c00, USB3 PCS at 0x1f00
+ * and AON clamp at 0x1e00. The SM8750 offsets address different blocks.
  */
 static const struct qmp_combo_offsets qmp_combo_offsets_tuna = {
 	.com		= 0x0000,
@@ -3222,14 +3187,8 @@ static const struct qmp_combo_offsets qmp_combo_offsets_tuna = {
 	.usb3_pcs_aon	= 0x1e00,
 	.usb3_pcs_usb	= 0x1f00,
 	/*
-	 * The DP half is the v3 layout, not the v8 one the USB3 half is close
-	 * to. The factory's DP controller node splits this same PHY into
-	 * dp_pll 0x88ea000, dp_ln_tx0 0x88ea200, dp_ln_tx1 0x88ea600 and
-	 * dp_phy 0x88eaa00, i.e. +0x2000/+0x2200/+0x2600/+0x2a00 from this
-	 * base; the v8 values would start at 0x3000, past the end of the
-	 * 0x3000-byte window the factory PHY node maps. The tables stay the v6
-	 * ones: the factory driver writes qmp_v6_dp_serdes_tbl into dp_pll and
-	 * qmp_v6_dp_tx_tbl into each dp_ln_tx window.
+	 * DP PLL/TX0/TX1/PHY windows are at 0x2000/0x2200/0x2600/0x2a00.
+	 * The factory driver programs these windows with the v6 DP tables.
 	 */
 	.dp_serdes	= 0x2000,
 	.dp_txa		= 0x2200,
@@ -3238,18 +3197,8 @@ static const struct qmp_combo_offsets qmp_combo_offsets_tuna = {
 };
 
 /*
- * Offsets are relative to the block each call site uses: qmp->pcs for the
- * control registers (0x1c00 here), qmp->pcs_usb for the USB3 ones (0x1f00),
- * qmp->dp_serdes for the DP PLL/COM ones (0x2000), qmp->dp_dp_phy for the
- * DP PHY ones (0x2a00) and qmp->dp_tx/dp_tx2 for the DP TX lanes
- * (0x2200/0x2600).
- *
- * The DP entries are the v6 ones, as in qmp_v6_usb3phy_regs_layout: the
- * factory's 4nm DP driver writes 0x0f to dp_phy+0x14, 0x20 to dp_pll+0x118,
- * 0x17 to dp_pll+0x0dc, polls dp_pll+0x1f8/0x1d0 and dp_phy+0x0e4 for the
- * same bits, and drives the TX lanes at +0x0c/+0x14/+0x54/+0x58/+0x5c
- * (msm_drm.ko: dp_pll_prepare, dp_config_vco_rate_4nm,
- * dp_4nm_pll_get_status, dp_catalog_ctrl_late_phy_init).
+ * Register offsets are relative to their PCS, USB3, DP PLL, DP PHY
+ * or TX lane window. DP register fields follow the factory 4 nm layout.
  */
 static const u32 tuna_usb3phy_regs_layout[QPHY_LAYOUT_SIZE] = {
 	/* applied through qmp->pcs, which is 0x1c00 on this part */
@@ -3260,7 +3209,7 @@ static const u32 tuna_usb3phy_regs_layout[QPHY_LAYOUT_SIZE] = {
 	[QPHY_PCS_CLAMP_ENABLE]		= 0x00,
 	/* applied through qmp->pcs_usb, which is 0x1f00 on this part */
 	[QPHY_PCS_AUTONOMOUS_MODE_CTRL]	= 0x08,   /* 0x1f08 */
-	[QPHY_PCS_LFPS_RXTERM_IRQ_CLEAR]= 0x14,   /* 0x1f14 */
+	[QPHY_PCS_LFPS_RXTERM_IRQ_CLEAR] = 0x14,   /* 0x1f14 */
 	/* DP PLL/COM block, applied through qmp->dp_serdes (0x2000) */
 	[QPHY_COM_RESETSM_CNTRL]	= 0x118,  /* 0x2118 */
 	[QPHY_COM_C_READY_STATUS]	= 0x1f8,  /* 0x21f8 */
@@ -4012,25 +3961,15 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 		return 0;
 
 	/*
-	 * The GCC's USB3 BCR block (0x50000..0x5001c) must not be ioremapped and
-	 * poked: it is secure-only from the non-secure kernel and reading it
-	 * raises a synchronous external abort. Reset lines therefore have to go
-	 * through reset_control rather than raw writes. The TCSR block is
-	 * equally restricted, hence the raw ioremap of its gates only.
+	 * The GCC USB3 reset registers are protected; use reset_control.
+	 * Only the required TCSR reference gates may be accessed directly.
 	 */
 	ret = regulator_bulk_enable(cfg->num_vregs, qmp->vregs);
 	if (ret) {
 		dev_err(qmp->dev, "failed to enable regulators, err=%d\n", ret);
 		goto err_decrement_count;
 	}
-	/*
-	 * M2582: set the PHY rail voltage and load, as the vendor driver does.
-	 *
-	 * phy-msm-ssusb-qmp.ko's msm_ssusb_qmp_ldo_enable() reads
-	 * qcom,vdd-voltage-level / qcom,vdd-max-load-uA and calls
-	 * regulator_set_voltage() / regulator_set_load(); mainline only enables
-	 * the bulk regulators, leaving the rail at whatever voltage it had.
-	 */
+	/* Apply the factory PHY voltage and load constraints before startup. */
 	{
 		struct device_node *np = qmp->dev->of_node;
 		u32 vdd[3], load = 0;
@@ -4048,12 +3987,8 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 	}
 
 	/*
-	 * The two reset lines are driven as three assert/deassert pulse groups,
-	 * the way the vendor driver drives them, instead of the single release
-	 * mainline performs. The bootloader has already brought the PHY up (it
-	 * runs USB for fastboot), and without the pulses the register file stays
-	 * inert: every block reads back a static replicated byte and discards
-	 * writes, even with all clocks and regulators enabled.
+	 * Match the factory reset pulses to release a PHY retained by the
+	 * bootloader before applying the register initialization table.
 	 */
 	{
 		int i;
@@ -4100,16 +4035,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 		goto err_disable_clocks;
 	}
 
-	/*
-	 * M2582: make sure the PHY's clock references are actually enabled in
-	 * the TCSR block.
-	 *
-	 * The device tree models them as fixed-clocks, which is a software
-	 * fiction: they report 19.2 MHz and write nothing.  Without the gate
-	 * open the PHY has no reference and its PLL cannot lock.
-	 *
-	 * Read, set bit 0, write back.
-	 */
+	/* Fixed reference clocks do not program the TCSR enable bits. */
 	{
 		void __iomem *tcsr = ioremap(0x01fbf000, 0x20);
 
@@ -4185,13 +4111,6 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
 
 	qphy_clrbits(com, QPHY_V3_DP_COM_SWI_CTRL, 0x03);
 	qphy_clrbits(com, QPHY_V3_DP_COM_SW_RESET, SW_RESET);
-
-	/*
-	 * com+0x00 is a read-only status register reporting the COM reset state
-	 * machine, so it cannot be set. com+0x10 is the writable control
-	 * register, and the vendor driver leaves bits 0 and 1 set there.
-	 */
-	qphy_setbits(com, 0x10, BIT(0) | BIT(1));
 
 	qphy_setbits(qmp->pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
 			SW_PWRDN);
@@ -4335,7 +4254,6 @@ static int qmp_combo_usb_power_on(struct phy *phy)
 	qmp_configure(qmp->dev, pcs, cfg->pcs_tbl, cfg->pcs_tbl_num);
 	qmp_configure(qmp->dev, qmp->pcs_misc, cfg->pcs_misc_tbl, cfg->pcs_misc_tbl_num);
 
-
 	if (pcs_usb)
 		qmp_configure(qmp->dev, pcs_usb, cfg->pcs_usb_tbl,
 			      cfg->pcs_usb_tbl_num);
@@ -4346,22 +4264,7 @@ static int qmp_combo_usb_power_on(struct phy *phy)
 	/* Pull PHY out of reset state */
 	qphy_clrbits(pcs, cfg->regs[QPHY_SW_RESET], SW_RESET);
 
-	/*
-	 * M2582: pulse the COM block's software reset, as the vendor does.
-	 *
-	 * msm_ssphy_qmp_init() writes, in this order:
-	 *   reg_offset[7] = COM_POWER_DOWN_CTRL (0x08)  <- 1
-	 *   reg_offset[8] = COM_SW_RESET        (0x04)  <- 1   then 0   (a pulse)
-	 *   reg_offset[7] = COM_POWER_DOWN_CTRL (0x08)  <- 1   again
-	 *   (0xf written to the override register)
-	 *   reg_offset[4] = PCS_SW_RESET        (0x1c00) <- 1
-	 *   reg_offset[5] = PCS_START_CONTROL   (0x1c44) <- 3
-	 *
-	 * mainline never writes COM_SW_RESET at all. Without that pulse the COM
-	 * block's internal logic is never reset, so the PLL does not start and
-	 * PCS_STATUS1 never reports ready. Note COM_POWER_DOWN_CTRL is *set* to 1
-	 * by both drivers, so it is not a power-down to clear.
-	 */
+	/* COM software reset must be pulsed before starting the PCS/SerDes. */
 	qphy_setbits(qmp->com, QPHY_V3_DP_COM_SW_RESET, SW_RESET);
 	udelay(1);
 	qphy_clrbits(qmp->com, QPHY_V3_DP_COM_SW_RESET, SW_RESET);
@@ -4369,16 +4272,7 @@ static int qmp_combo_usb_power_on(struct phy *phy)
 	/* start SerDes and Phy-Coding-Sublayer */
 	qphy_setbits(pcs, cfg->regs[QPHY_START_CTRL], SERDES_START | PCS_START);
 
-	/*
-	 * M2582: configure autonomous mode now, not at runtime suspend.
-	 *
-	 * The vendor driver calls msm_ssusb_qmp_enable_autonomous() from its init
-	 * path, which programs AUTONOMOUS_MODE_CTRL, LFPS_RXTERM_IRQ_CLEAR and
-	 * AON_CLAMP_ENABLE -- and the factory's qcom,qmp-phy-reg-offset lists all
-	 * three, so they are part of bring-up. mainline only calls the equivalent
-	 * from qmp_combo_runtime_suspend(), and qmp_combo_probe() calls
-	 * pm_runtime_forbid(), so on this board it never runs at all.
-	 */
+	/* Match the factory autonomous-mode setup even before runtime suspend. */
 	qmp_combo_enable_autonomous_mode(qmp);
 
 	status = pcs + cfg->regs[QPHY_PCS_STATUS];
@@ -4415,18 +4309,7 @@ static int qmp_combo_usb_power_off(struct phy *phy)
 			SERDES_START | PCS_START);
 
 	/* Put PHY into POWER DOWN state: active low */
-	/*
-	 * M2582: the vendor keeps this asserted. Disassembly of
-	 * msm_ssphy_qmp_init() shows, in order:
-	 *   b54: writel(1, reg_offset[3])   ; 0x1c40 = PCS_POWER_DOWN_CONTROL
-	 *   b8c: (writes the 165 init-seq pairs)
-	 *   bc0: writel(0, reg_offset[4])   ; 0x1c00 = PCS_SW_RESET
-	 *   bd8: writel(3, reg_offset[5])   ; 0x1c44 = PCS_START_CONTROL
-	 * i.e. it never writes 0 to the power-down control. mainline does, right
-	 * here, immediately before starting the PHY -- which on a part where this
-	 * bit is active low would power the block down just as it is meant to come
-	 * up, and PCS_STATUS1 would then never report ready.
-	 */
+	/* This PCS power-control bit remains asserted throughout PHY startup. */
 	if (!cfg->no_pcs_pwrdn_clear)
 		qphy_clrbits(qmp->pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
 				SW_PWRDN);
@@ -4928,6 +4811,9 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
 
 	mutex_lock(&qmp->phy_mutex);
 	qmp->orientation = orientation;
+	if (qmp->aux_sel_gpio)
+		gpiod_set_value_cansleep(qmp->aux_sel_gpio,
+					orientation == TYPEC_ORIENTATION_REVERSE);
 
 	if (qmp->init_count) {
 		if (qmp->usb_init_count)
@@ -5240,20 +5126,7 @@ static int qmp_combo_parse_dt(struct qmp_combo *qmp)
 				"failed to get usb3_pipe clock\n");
 	}
 
-	/*
-	 * M2582: set the clock rate the way the vendor's probe does.
-	 *
-	 * Its disassembly shows, right after the devm_clk_get calls:
-	 *
-	 *     a0: bl devm_clk_get
-	 *     d0: mov x1, #-1              ; ULONG_MAX, i.e. "any rate"
-	 *     d4: bl clk_round_rate
-	 *     d8: mov x1, x0               ; use whatever it returned
-	 *     e0: bl clk_set_rate
-	 *
-	 * We never call either, so a clock that needs an explicit rate is left at
-	 * whatever the bootloader set -- or at nothing at all.
-	 */
+	/* Select a supported PIPE rate before enabling the clock. */
 	{
 		unsigned long cur = clk_get_rate(qmp->pipe_clk);
 		long r = clk_round_rate(qmp->pipe_clk, ULONG_MAX);
@@ -5383,6 +5256,11 @@ static int qmp_combo_probe(struct platform_device *pdev)
 	dev_set_drvdata(dev, qmp);
 
 	qmp->orientation = TYPEC_ORIENTATION_NORMAL;
+	qmp->aux_sel_gpio = devm_gpiod_get_optional(dev, "aux-sel",
+						GPIOD_OUT_LOW);
+	if (IS_ERR(qmp->aux_sel_gpio))
+		return dev_err_probe(dev, PTR_ERR(qmp->aux_sel_gpio),
+				     "failed to get AUX select GPIO\n");
 
 	qmp->cfg = of_device_get_match_data(dev);
 	if (!qmp->cfg)
@@ -5471,7 +5349,6 @@ static int qmp_combo_probe(struct platform_device *pdev)
 	ret = qmp_combo_register_clocks(qmp, usb_np, dp_np);
 	if (ret)
 		goto err_node_put;
-
 
 	qmp->usb_phy = devm_phy_create(dev, usb_np, &qmp_combo_usb_phy_ops);
 	if (IS_ERR(qmp->usb_phy)) {
