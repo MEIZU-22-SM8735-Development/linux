@@ -5,6 +5,8 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/auxiliary_bus.h>
+#include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
@@ -324,6 +326,7 @@ struct qcom_battmgr {
 	struct completion ack;
 
 	bool service_up;
+	bool broken_battery_power;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;
@@ -455,6 +458,8 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 					  enum power_supply_property psp)
 {
 	unsigned int prop;
+	u32 voltage;
+	s64 power;
 	int ret;
 
 	if (psp >= ARRAY_SIZE(sm8350_bat_prop_map))
@@ -463,10 +468,34 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 	prop = sm8350_bat_prop_map[psp];
 
 	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
+	if (psp == POWER_SUPPLY_PROP_POWER_NOW && battmgr->broken_battery_power) {
+		/* Some firmware reports an invalid power value despite valid V/I. */
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						    BATT_VOLT_NOW, 0);
+		if (ret)
+			goto out_unlock;
+		voltage = battmgr->status.voltage_now;
+
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						    BATT_CURR_NOW, 0);
+		if (ret)
+			goto out_unlock;
+
+		/* Convert uV * signed uA to uW, preserving the current direction. */
+		power = div_s64((s64)voltage * battmgr->status.current_now, MICRO);
+		if (power > INT_MAX || power < INT_MIN) {
+			ret = -ERANGE;
+			goto out_unlock;
+		}
+		battmgr->status.power_now = power;
+	} else {
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						    prop, 0);
+	}
+out_unlock:
 	mutex_unlock(&battmgr->lock);
 
-	return ret;
+	return ret > 0 ? -EIO : ret;
 }
 
 static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
@@ -1639,6 +1668,8 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	battmgr->dev = dev;
+	battmgr->broken_battery_power =
+		device_property_read_bool(dev->parent, "qcom,broken-battery-power");
 
 	psy_cfg.drv_data = battmgr;
 	psy_cfg.fwnode = dev_fwnode(&adev->dev);
