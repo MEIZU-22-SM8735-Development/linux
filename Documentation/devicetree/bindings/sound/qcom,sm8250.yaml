@@ -28,6 +28,7 @@ properties:
               - qcom,sm8550-sndcard
               - qcom,sm8650-sndcard
               - qcom,sm8750-sndcard
+              - qcom,tuna-sndcard
           - const: qcom,sm8450-sndcard
       - enum:
           - fairphone,fp4-sndcard

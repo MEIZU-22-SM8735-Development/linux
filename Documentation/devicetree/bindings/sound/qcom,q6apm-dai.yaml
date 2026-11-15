@@ -20,6 +20,8 @@ properties:
     minItems: 1
     maxItems: 2
 
+  dma-coherent: true
+
 required:
   - compatible
   - iommus
