@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Meizu 22 (M2582) WCN power domain controller init table
 
 maintainers:
-  - The Meizu 22 mainline port
+  - 14185638 <98950213+14185638@users.noreply.github.com>
 
 description: |
   The WCN7750's power domain controller has to be programmed through the AOP
@@ -37,10 +37,12 @@ properties:
 
   qcom,pdc-init-table:
     $ref: /schemas/types.yaml#/definitions/string-array
-    description:
+    minItems: 1
+    maxItems: 16
+    description: |
       The PDC init table, one entry per message, in the vendor's declarative
       form: "{class: <class>, ss: <subsystem>, res: <resource>, <key>: <value>}".
-      The "ss" field is validated and not sent; the message put on the wire
+      The "ss" field is omitted; the message put on the wire
       carries class, res and the single value field.
 
   "#power-domain-cells":
@@ -48,9 +50,9 @@ properties:
 
   m2582,feature:
     $ref: /schemas/types.yaml#/definitions/string
-    description:
-      The project's subsystem gate: the node is disabled unless this name is in
-      the m2582.features= command line list.
+    description: |
+      The subsystem gate name. The node is enabled by default; m2582.features
+      and m2582.disable command line overrides can restrict its availability.
 
 required:
   - compatible
