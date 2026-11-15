@@ -19,12 +19,17 @@ properties:
     enum:
       - qcom,geni-uart
       - qcom,geni-debug-uart
+      - qcom,sm8735-geni-uart
 
   clocks:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
 
   clock-names:
-    const: se
+    minItems: 1
+    items:
+      - const: se
+      - const: core
 
   interconnects:
     maxItems: 2
@@ -63,6 +68,23 @@ required:
   - clock-names
   - interrupts
   - reg
+
+if:
+  properties:
+    compatible:
+      const: qcom,sm8735-geni-uart
+then:
+  properties:
+    clocks:
+      minItems: 2
+    clock-names:
+      minItems: 2
+else:
+  properties:
+    clocks:
+      maxItems: 1
+    clock-names:
+      maxItems: 1
 
 unevaluatedProperties: false
 
