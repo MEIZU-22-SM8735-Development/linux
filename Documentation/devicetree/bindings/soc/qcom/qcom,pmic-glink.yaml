@@ -52,6 +52,18 @@ properties:
           - const: qcom,sm8550-pmic-glink
           - const: qcom,pmic-glink
 
+  qcom,allow-no-role-switch:
+    type: boolean
+    description:
+      Allow UCSI registration when the platform retains a USB peripheral
+      path without exposing a role switch.
+
+  qcom,keep-usb-device-role:
+    type: boolean
+    description:
+      Preserve the USB peripheral role when firmware reports no USB partner,
+      including while connecting a charger or a DisplayPort-only partner.
+
   '#address-cells':
     const: 1
 
