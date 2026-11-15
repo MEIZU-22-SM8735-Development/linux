@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+/*
+ * Shared WCN7750 rails. Voltages are the M2582 runtime DT's WLAN/BT
+ * consumer minima, not the lower idle values of the regulator nodes.
+ */
+&apps_rsc {
+	regulators-0 {
+		vreg_s1b: smps1 {
+			m2582,feature = "wcn-rails";
+			regulator-name = "pmxr2230_s1";
+			regulator-min-microvolt = <1863000>;
+			/* FTSMPS525 rounds the vendor's 1863 mV minimum to 1864. */
+			regulator-max-microvolt = <1864000>;
+			regulator-always-on;
+		};
+
+		vreg_s2b: smps2 {
+			m2582,feature = "wcn-rails";
+			regulator-name = "pmxr2230_s2";
+			regulator-min-microvolt = <1316000>;
+			regulator-max-microvolt = <1316000>;
+			regulator-always-on;
+		};
+
+		vreg_s3b: smps3 {
+			m2582,feature = "wcn-rails";
+			regulator-name = "pmxr2230_s3";
+			regulator-min-microvolt = <976000>;
+			regulator-max-microvolt = <976000>;
+			regulator-always-on;
+		};
+	};
+
+	regulators-2 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "g";
+		m2582,feature = "wcn-rails";
+
+		vreg_s1g: smps1 {
+			m2582,feature = "wifi-rails";
+			regulator-name = "pm_v6g_s1";
+			regulator-min-microvolt = <940000>;
+			regulator-max-microvolt = <940000>;
+			regulator-always-on;
+		};
+
+		vreg_l2g: ldo2 {
+			regulator-name = "pm_v6g_l2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-always-on;
+		};
+
+		vreg_l3g: ldo3 {
+			regulator-name = "pm_v6g_l3";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-always-on;
+		};
+	};
+};

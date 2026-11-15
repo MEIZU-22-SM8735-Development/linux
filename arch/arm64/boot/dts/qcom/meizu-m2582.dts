@@ -10,9 +10,10 @@
 #include "tuna-i2c.dtsi"
 #include "meizu-m2582-i2c.dtsi"
 #include "meizu-m2582-touch.dtsi"
-/* dropped for the touch-only image (user priority): #include "meizu-m2582-bt.dtsi" */
+#include "meizu-m2582-wcn-power.dtsi"
+#include "meizu-m2582-bt.dtsi"
 #include "meizu-m2582-adsp.dtsi"
-/* dropped for the touch-only image (user priority): #include "meizu-m2582-pcie.dtsi" */
+#include "meizu-m2582-pcie.dtsi"
 #include "meizu-m2582-dp.dtsi"
 
 &mdss {
@@ -31,18 +32,7 @@
 #include "pmk8550.dtsi"
 /* 需要 &pmk8550 标签，必须放在 pmk8550.dtsi 之后 */
 #include "meizu-m2582-vadc.dtsi"
-/*
- * The rest of the PMIC complex this board carries. The factory tree puts
- * thirteen PMICs on the SPMI bus; PMK8550 at USID 0 and PMIH010X at USID 7
- * were already reachable, and this adds PM8550VE at USIDs 3, 5 and 6 and
- * PM8550VS at USID 9 -- what sm8750-pmics.dtsi describes for this SoC.
- *
- * Deliberately included for what it does not contain: no regulators.
- * Declaring a rail is what can reset this board, because the RPMh path
- * stalls the RSC; see meizu-m2582-power.dtsi. This adds only the PMICs, their
- * GPIO blocks and their thermal zones, so there is nothing that can take a
- * rail away.
- */
+/* PMIC GPIO and thermal nodes are separate from the RPMh regulator providers. */
 #include "sm8750-pmics.dtsi"
 #include "pmd8028.dtsi"
 #include "meizu-m2582-amoled.dtsi"
@@ -75,20 +65,8 @@
 	};
 };
 /*
- * Merge a "normal" mode into the reboot-mode node pmk8550.dtsi creates.
- * Without it the kernel writes nothing on a plain reboot: the framework only
- * writes when the magic is non-zero, a plain reboot passes cmd == NULL, and
- * pmk8550.dtsi defines no mode for "normal" -- so the restart-reason field
- * kept the last fastboot value and every warm reset went back to fastboot.
- * Zero cannot be used either, since zero is what the framework refuses to
- * write.
- *
- * The SDAM2 field at offset 0x48 is seven bits wide (bits = <1 7>). Writing
- * 0x04 (0x02 << 1, "bootloader") enters fastboot 6 s later; writing 0xfe
- * (0x7f << 1) reaches Linux 18 s later, because ABL defaults to a normal boot
- * for a reason value it does not recognise and 0x7f is outside the set it
- * knows. mode-recovery (0x01) and mode-bootloader (0x02) come from
- * pmk8550.dtsi.
+ * A nonzero normal reboot reason clears a retained fastboot request.
+ * The seven-bit SDAM field uses 0x7f, which ABL treats as a normal boot.
  */
 / {
 	reboot-mode {
@@ -96,18 +74,7 @@
 	};
 };
 
-/*
- * The power and volume buttons.
- *
- * pmk8550.dtsi declares both of the PMK8550's PON inputs but leaves them
- * disabled, because not every board wires them to anything. This one does, and
- * they are the only input devices the board has: with them enabled
- * /sys/class/input stops being empty and the power button works as a real key
- * rather than resetting the board in hardware.
- *
- * pwrkey is the power button (KEY_POWER). resin is the volume-down line. Both
- * deliver events; both were confirmed with evtest.
- */
+/* PMK8550 PON inputs provide KEY_POWER and volume-down events. */
 &pon_pwrkey {
 	status = "okay";
 };
@@ -123,20 +90,7 @@
 	linux,code = <KEY_VOLUMEDOWN>;
 };
 
-/*
- * The volume-up button, and with it the PMXR2230.
- *
- * The factory device tree splits the buttons across two places. The power button
- * and volume-down are the PMK8550's PON inputs (pwrkey and resin, enabled
- * above). Volume-up is not on the PON at all: it hangs off GPIO 6 of the
- * PMXR2230, the PMIC at SPMI USID 1, active low with a pull-up.
- *
- * The PMXR2230 is the one part on this board that upstream has no binding for,
- * so its node is written out here. The GPIO controller itself needs nothing
- * new: pinctrl-spmi-gpio.c already lists "qcom,pmxr2230-gpio" with twelve
- * GPIOs. It is also the rail the two USB PHYs are fed from (ldob3), so having
- * it on the bus is worth something beyond the button.
- */
+/* Volume-up is active-low on PMXR2230 GPIO6; the other buttons use PMK8550 PON. */
 &spmi_bus {
 	pmxr2230: pmic@1 {
 		compatible = "qcom,pmxr2230", "qcom,spmi-pmic";
@@ -204,69 +158,19 @@
 };
 
 /*
- * The PON block, named the way this board names it.
- *
- * The factory tree calls the PON "qcom,pm8998-pon" with reg-names
- * "pon_hlos"/"pon_pbs", while upstream's pmk8550.dtsi calls it
- * "qcom,pmk8350-pon" with "hlos"/"pbs". The driver resolves its register
- * windows by reg-name, so the two spellings are not interchangeable; this
- * follows the factory, which is what the hardware on this board was described
- * by. The keys work with it -- pwrkey and resin both report events -- though
- * they also worked before this change was made, so it is alignment with the
- * vendor description rather than a proven fix.
- *
- * Only these properties are overridden; the children (pwrkey, resin) stay as
- * pmk8550.dtsi declares them.
+ * Use the factory PON compatible and register names; the driver resolves
+ * its two windows by name. The key children are inherited from pmk8550.dtsi.
  */
 &pmk8550_pon {
 	compatible = "qcom,pm8998-pon";
 	reg-names = "pon_hlos", "pon_pbs";
 };
 
-/*
- * Bring the GENI I2C buses up.
- *
- * tuna-i2c.dtsi declares six of them (SE0-SE4 and SE6 in qupv3 wrap 1) but
- * leaves them disabled, since a bus with nothing on it is not free. Enabling
- * them costs nothing here and gives userspace /dev/i2c-N through I2C_CHARDEV,
- * which is what makes a bus probeable with i2cdetect.
- *
- * No pinctrl state is attached yet, so the SDA/SCL pads are still in their reset
- * configuration and traffic is not expected to work. The point of this step is
- * to confirm the controllers themselves probe; the pad configuration follows.
- */
-/*
- * The GENI I2C buses stay disabled.
- *
- * Enabling them panics the board at 0.4 s, every boot, before userspace:
- *
- *     geni_i2c a80000.i2c: Bus frequency not specified, default to 100kHz.
- *     Internal error: synchronous external abort: 0000000096000010
- *     pc : geni_i2c_probe+0x2b4/0x534
- *
- * A synchronous external abort on a register access means the SE window is not
- * reachable at all, so the qupv3_1 wrapper needs something we have not given it.
- * Note that uart7, the only other block in that wrapper, is disabled and has
- * therefore never proved the wrapper works. The nodes in tuna-i2c.dtsi stay for
- * whoever picks this up; what they need is to be worked out first -- upstream's
- * geniqup nodes carry more than the two AHB clocks ours has -- rather than
- * guessed at with a probe that takes the whole board down.
- */
+
 
 /*
- * Bring up one GENI I2C bus: SE0 at 0xa80000, not SE6.
- *
- * SE6 was the obvious pick -- the factory tree puts a WCD939x codec on SE3
- * and leaves SE6 free -- but SE6's register window does not exist as far as
- * the application processor is concerned. A single 4-byte read of 0xa98000
- * through /dev/mem returns BUS ERROR, so the kernel's first register access
- * after ioremap aborts with a synchronous external abort before any clock,
- * pinctrl or interconnect code runs. Five earlier attempts blamed the clock
- * numbers, the pin numbers, the interconnects and a closed GCC block; none of
- * them could have worked, because the window itself never answers.
- *
- * SE0 is reachable (0xa80000 reads 0x00000009) and its pads are on gpio52/53.
- * SE1 and SE6 are the only dead windows in wrap 1 -- measured, not guessed.
+ * Unused GENI engines remain disabled. Some register windows in wrap1
+ * are inaccessible to the application processor and abort on access.
  */
 
 /*
@@ -330,40 +234,17 @@
 	nvmem-cell-names = "speed_bin";
 
 	/*
-	 * The GPU's DDR path, exactly the node pair the phone's own live tree
-	 * carries: gem_noc MASTER_GFX3D (16) to mc_virt SLAVE_EBI1 (512).
-	 * With this in place the OPP core owns the AP-side vote, so every
-	 * dev_pm_opp_set_rate() (enable_clk at power-up, disable_clk at
-	 * power-down) publishes that level's opp-peak-kBps to the NoC while the
-	 * GMU firmware keeps doing its own per-perf-level vote. The two
-	 * aggregate by max, which is what the vendor does as well: kgsl votes
-	 * gpu_icc_path per power level and the firmware augments it.
+	 * The OPP bandwidth vote follows the factory GFX3D-to-EBI path and
+	 * aggregates with the GMU firmware vote.
 	 */
 	interconnects = <&gem_noc MASTER_GFX3D QCOM_ICC_TAG_ALWAYS
 			 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
 	interconnect-names = "gpu_icc_path";
 
 	/*
-	 * GPU DVFS table: frequencies, RPMh corners and ACD levels are the vendor's
-	 * power-levels@0 from the factory kgsl node (highest 1150 MHz, its
-	 * initial-pwrlevel = 10).
-	 *
-	 * opp-supported-hw is not optional once the speed bin is readable:
-	 * a6xx_set_supported_hw() then calls dev_pm_opp_set_supported_hw() with
-	 * BIT(0), and _opp_is_supported() drops every OPP that does not carry a
-	 * matching version mask -- that is exactly what "no supported OPPs" and
-	 * "failed to load adreno gpu" looked like on the first boot that could
-	 * read the fuse.  Bit 0 is the only version there is: bin 0x00 and 0xf2
-	 * are the same table (see the catalog entry).
-	 *
-	 * opp-peak-kBps is the DDR bandwidth that level
-	 * votes for, read off the phone's own qcom,bus-table-ddr (0, 781250,
-	 * 2136718, 5285156, 6074218, 6671875, 8171875, 10687500, 12449218,
-	 * 14398437, 16500000, 18597656) through the level's qcom,bus-freq
-	 * index: 1150/1100/1050 MHz -> 11, 937/873 -> 10, 763 -> 8,
-	 * 688/643/510 -> 6, 362 -> 3, 264 -> 1. The vendor's qcom,bus-min/max
-	 * window per level is its boost range and has no mainline equivalent,
-	 * so only the level's own bandwidth appears here.
+	 * GPU frequencies, RPMh corners, ACD levels and DDR bandwidth follow
+	 * the factory KGSL power levels. Both supported speed bins use bit 0;
+	 * opp-supported-hw is required once the speed-bin fuse is readable.
 	 */
 	gpu_opp_table: opp-table {
 		compatible = "operating-points-v2-adreno", "operating-points-v2";
@@ -583,35 +464,13 @@
 };
 
 /*
- * The PMIC's RTC counter cannot be written from the AP -- with allow-set-time
- * the SPMI write to 0x6140/0x6146 comes back "transaction denied" (-EPERM from
- * the PMIC arbiter), so hwclock -w fails with "Operation not permitted".  The
- * vendor's stack does not write it either: Android keeps the wall clock in a
- * time_daemon offset.
- *
- * mainline's alternative, a four-byte nvmem offset cell, was measured on this
- * board and does not work: the counter arithmetic is right (the cell reads back
- * a plausible offset) but the low 16 bits of every write to the PMIC SDAM are
- * dropped, so the stored value 0x6adc46d1 comes back as 0x6adc0000 and the
- * clock lands five hours off.  So the offset is kept on the root filesystem
- * instead, by the m2582-clock boot hook, which is also where the measurement
- * lives (docs/notes/clock-and-reboot-1031.md).
- *
- * The counter itself is a real RTC: measured at 1 s/s while running and it
- * keeps counting through a power-off with the battery attached.
+ * The AP cannot write the PMIC RTC counter. SDAM offset writes lose
+ * the low 16 bits on this board, so m2582-clock keeps the offset on
+ * the root filesystem. The counter continues across power-off.
  */
 /*
- * SPMI address 6 is a PM8550VS on this board, not the PM8550VE that
- * sm8750-pmics.dtsi declares there for the rest of the family.  The phone's own
- * device tree says so twice: its qcom,pm8550vs@6 is enabled while its
- * qcom,pm8550ve@6 is status = "disabled", and the Bluetooth node's chip enable
- * is a GPIO of the VS instance.
- *
- * This has to come after that include: nodes at the same address merge, and for
- * a property both declare, the later one wins.  Only the properties that differ
- * are repeated -- the VS has six GPIOs where the VE has eight, and its GPIO
- * block is a different device id.  The second label on each node keeps the
- * included file's names working.
+ * USID 6 is PM8550VS, with six GPIOs, overriding the PM8550VE node
+ * in the shared PMIC include. Bluetooth enable uses this VS instance.
  */
 &spmi_bus {
 	pm8550vs_g: pm8550ve_g: pmic@6 {
@@ -635,14 +494,8 @@
 			gpio-ranges = <&pm8550vs_g_gpios 0 0 6>;
 
 			/*
-			 * Bluetooth enable.  The factory tree configures this pad
-			 * explicitly -- its bt_en state carries output-enable --
-			 * and that is what actually turns the output driver on
-			 * (PIN_CONFIG_OUTPUT_ENABLE, pinctrl-spmi-gpio.c:530-535).
-			 * gpio-ranges is decorative on a PMIC gpio (no
-			 * gpiochip->of_node), and without a named pinctrl state
-			 * the pad keeps its power-on default, so a consumer's
-			 * gpiod_set_value() would only move a register bit.
+			 * The factory enables the GPIO output driver through pinctrl;
+			 * changing its value alone does not enable the pad.
 			 */
 			bt_en_default: bt-en-default-state {
 				pins = "gpio4";
@@ -658,22 +511,8 @@
 };
 
 /*
- * PS_HOLD: the line the SoC holds high to keep its own rails up.  Writing 0 to
- * it makes the PMIC drop them, and what the PMIC does next -- stay off or start
- * again -- is decided by the PON's PBS block, which is why this node points at
- * the PMIC's PON.
- *
- * A restart that is a real power cycle is the only one after which the panel
- * comes back on this board (AGENTS.md rule 24): a warm reset leaves the display
- * dark with everything reporting healthy.  The driver programs the PBS for a
- * hard reset first, then releases PS_HOLD, and falls back to PSCI after 200 ms
- * if the board is still alive.
- *
- * 0x0c264000 is the MPM PS_HOLD register at the same place as on sc8280xp and
- * Lemans; this SoC's MPM block is at the same base (mpm2-sleep-counter at
- * 0xc221000 in the vendor tree).  Gated by m2582,feature so a bad mapping can
- * never be the reason a boot does not come back: with the production feature
- * list not naming "pshold", nothing here is probed and reboot stays PSCI.
+ * Program the PMIC PBS for a hard reset before releasing PS_HOLD.
+ * The panel needs this power cycle to recover reliably after reboot.
  */
 &soc {
 	/* Read-only LLCC identification for the optional display diagnostic. */
