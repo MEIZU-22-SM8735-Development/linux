@@ -39,6 +39,8 @@
  * problem and is documented below.
  */
 
+#include <dt-bindings/dma/qcom-gpi.h>
+
 &qupv3_1 {
 	i2c0: i2c@a80000 {
 		compatible = "qcom,geni-i2c";
@@ -59,6 +61,11 @@
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
 		clock-names = "se", "core";
+		dmas = <&gpi_dma1 0 0 QCOM_GPI_I2C>,
+		       <&gpi_dma1 1 0 QCOM_GPI_I2C>;
+		dma-names = "tx", "rx";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -73,6 +80,11 @@
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
 		clock-names = "se", "core";
+		dmas = <&gpi_dma1 0 1 QCOM_GPI_I2C>,
+		       <&gpi_dma1 1 1 QCOM_GPI_I2C>;
+		dma-names = "tx", "rx";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -87,6 +99,11 @@
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
 		clock-names = "se", "core";
+		dmas = <&gpi_dma1 0 2 QCOM_GPI_I2C>,
+		       <&gpi_dma1 1 2 QCOM_GPI_I2C>;
+		dma-names = "tx", "rx";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -101,6 +118,11 @@
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
 		clock-names = "se", "core";
+		dmas = <&gpi_dma1 0 3 QCOM_GPI_I2C>,
+		       <&gpi_dma1 1 3 QCOM_GPI_I2C>;
+		dma-names = "tx", "rx";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -114,15 +136,15 @@
 	 */
 
 	/*
-	 * SE5.  Also not what an earlier note here claimed: the aliases make
-	 * this i2c5 (i2c@a94000), not the Bluetooth UART, and the runtime tree
-	 * has a smart PA and a redriver on it.  No device is declared on it yet
-	 * -- this is the bus, not a promise that something is on it.
+	 * SE5: i2c5 (i2c@a94000), gpio12/gpio13 (qup1_se5_l0/l1).
+	 * The runtime tree carries two smart PAs (fs1945@34, fs1945@35) here.
 	 */
 	i2c5: i2c@a94000 {
 		compatible = "qcom,geni-i2c";
 		reg = <0 0x00a94000 0 0x4000>;
 		interrupts = <GIC_SPI 358 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&qup_i2c5_sda>, <&qup_i2c5_scl>;
 		clocks = <&gcc GCC_QUPV3_WRAP1_S5_CLK>,
 			 <&gcc GCC_QUPV3_WRAP1_CORE_CLK>;
 		clock-names = "se", "core";
@@ -131,6 +153,11 @@
 				<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
+		dmas = <&gpi_dma1 0 5 QCOM_GPI_I2C>,
+		       <&gpi_dma1 1 5 QCOM_GPI_I2C>;
+		dma-names = "tx", "rx";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
@@ -157,6 +184,11 @@
 				 &config_noc SLAVE_QUP_1 QCOM_ICC_TAG_ALWAYS>;
 		interconnect-names = "qup-core", "qup-config";
 		clock-names = "se", "core";
+		dmas = <&gpi_dma1 0 6 QCOM_GPI_I2C>,
+		       <&gpi_dma1 1 6 QCOM_GPI_I2C>;
+		dma-names = "tx", "rx";
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 };
@@ -215,6 +247,20 @@
 	qup_i2c0_scl: qup-i2c0-scl-state {
 		pins = "gpio53";
 		function = "qup1_se0_l1";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	qup_i2c5_sda: qup-i2c5-sda-state {
+		pins = "gpio12";
+		function = "qup1_se5_l0";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	qup_i2c5_scl: qup-i2c5-scl-state {
+		pins = "gpio13";
+		function = "qup1_se5_l1";
 		drive-strength = <2>;
 		bias-pull-up;
 	};
