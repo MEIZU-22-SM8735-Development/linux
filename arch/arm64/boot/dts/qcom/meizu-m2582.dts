@@ -430,21 +430,20 @@
 };
 
 &i2c0 { status = "okay"; };
+&i2c5 { status = "okay"; };
 
 /* SE6 stays disabled: enabling it panics the board, see above. */
 &i2c6 { status = "disabled"; };
 
 /*
- * The four buses that carry the board's I2C devices, from the vendor overlay
- * (see meizu-m2582-i2c.dtsi for how that overlay was identified and why every
- * constant in it could be cross-checked). Brought up one step at a time: the
- * controllers first, with no child devices declared, so a probe failure is
- * attributable to the bus and nothing above it. The devices follow once each
- * address has been seen answering on the wire.
+ * The wrap-2 I2C buses that belong to the AP (see meizu-m2582-i2c.dtsi).
+ * SE10 (i2c10 @0x888000, gpio56/57) is left disabled like in the vendor
+ * runtime DT because ADSP polls TOP_QUP_2_SE_2 and returns those pads to
+ * GPIO/pull-down on sleep.
  */
 &i2c8 { status = "okay"; };
 &i2c9 { status = "okay"; };
-&i2c10 { status = "okay"; };
+&i2c10 { status = "disabled"; };
 &i2c11 { status = "okay"; };
 
 /* Ordinary USB cable diagnostics: keep the unconnected UART disabled. */
